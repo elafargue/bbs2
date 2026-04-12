@@ -7,11 +7,13 @@ Per flask-vue-scaffold-conventions:
   - safe_emit() wraps all outbound emits
 
 The asyncio→Flask bridge is a daemon thread that drains bbs_engine.event_queue
-and emits SocketIO events to connected sysop clients.
+and emits SocketIO events to connected sysop clients.  It also persists every
+log line to the activity_log DB table so the log survives restarts.
 """
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -36,6 +38,29 @@ def safe_emit(event: str, data: Any, room: str | None = None) -> None:
             socketio.emit(event, data)
     except Exception:
         pass
+
+
+def _read_activity_log(db_path: str, n: int) -> list[str]:
+    """Return the last *n* activity log lines from the DB, oldest first."""
+    try:
+        with sqlite3.connect(str(db_path)) as db:
+            cur = db.execute(
+                "SELECT line FROM activity_log ORDER BY id DESC LIMIT ?", (n,)
+            )
+            rows = cur.fetchall()
+            return [r[0] for r in reversed(rows)]
+    except Exception:
+        logger.debug("Could not read activity_log from DB", exc_info=True)
+        return []
+
+
+def _persist_log_line(db_path: str, line: str) -> None:
+    """Insert a log line into the persistent activity_log table."""
+    try:
+        with sqlite3.connect(str(db_path)) as db:
+            db.execute("INSERT INTO activity_log (line) VALUES (?)", (line,))
+    except Exception:
+        logger.debug("Failed to persist log line to DB", exc_info=True)
 
 
 # ── Connection events ─────────────────────────────────────────────────────────
@@ -70,11 +95,17 @@ def on_join_admin(data):
         emit("bbs_status", {"online": False})
         return
 
+    # Load full persistent log history from DB; fall back to in-memory buffer
+    db_path = bbs_engine.cfg.db_path
+    log_lines = _read_activity_log(str(db_path), 2000)
+    if not log_lines:
+        log_lines = bbs_engine.recent_log_lines(500)
+
     # Send current state snapshot to the newly-joined sysop
     emit("admin_dashboard_init", {
         "users": bbs_engine.connected_users_snapshot(),
         "plugins": bbs_engine.plugin_stats_snapshot(),
-        "log": bbs_engine.recent_log_lines(100),
+        "log": log_lines,
         "bbs_callsign": bbs_engine.cfg.full_callsign,
     })
 
@@ -103,7 +134,7 @@ def start_bridge() -> None:
 
 
 def _bridge_loop() -> None:
-    """Drain the engine event queue and emit to sysop room."""
+    """Drain the engine event queue, emit to sysop room, and persist log lines."""
     import queue as stdlib_queue
 
     from server.app import bbs_engine
@@ -123,6 +154,7 @@ def _bridge_loop() -> None:
         etype = event.get("type")
         if etype == "log":
             safe_emit("bbs_log_line", {"line": event["line"]}, room=_SYSOP_ROOM)
+            _persist_log_line(str(bbs_engine.cfg.db_path), event["line"])
         elif etype == "user_connected":
             safe_emit("user_connected", event, room=_SYSOP_ROOM)
             # Also push updated full snapshot

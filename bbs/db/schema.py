@@ -91,6 +91,29 @@ CREATE TABLE IF NOT EXISTS read_receipts (
     PRIMARY KEY (user_id, message_id)
 );
 
+-- ── Activity log (persistent, indefinite) ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS activity_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    line        TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_actlog_time ON activity_log (created_at);
+
+-- ── Connection journal ────────────────────────────────────────────────────────
+-- One row per callsign; first_seen is set on INSERT only; last_seen and
+-- auth_level (highest level reached) are updated on each new connection.
+-- connected=1 means the station is currently online; reset to 0 on disconnect
+-- and on BBS startup (to clear any stale flags from a crash).
+CREATE TABLE IF NOT EXISTS connection_log (
+    callsign    TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    transport   TEXT    NOT NULL DEFAULT '',
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    auth_level  INTEGER NOT NULL DEFAULT 0,
+    connected   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_connlog_last ON connection_log (last_seen);
+
 -- ── Schema version ───────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS schema_version (
     version     INTEGER NOT NULL,
@@ -98,7 +121,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_VERSION = 2
+_CURRENT_VERSION = 4
 
 
 async def init_db(db_path: str) -> None:
@@ -109,7 +132,7 @@ async def init_db(db_path: str) -> None:
     import os
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         await db.executescript(_SCHEMA_SQL)
         await db.commit()
 
@@ -122,6 +145,11 @@ async def init_db(db_path: str) -> None:
 
         if current < _CURRENT_VERSION:
             await _run_migrations(db, current)
+
+        # Clear any stale connected=1 flags left by a previous crash or
+        # unclean shutdown before this session's stations reconnect.
+        await db.execute("UPDATE connection_log SET connected = 0 WHERE connected = 1")
+        await db.commit()
 
 
 async def _run_migrations(db: aiosqlite.Connection, from_version: int) -> None:
@@ -146,6 +174,37 @@ async def _run_migrations(db: aiosqlite.Connection, from_version: int) -> None:
             pass
         await db.commit()
         from_version = 2
+
+    if from_version < 3:
+        # Add connection_log table (new in v3).
+        try:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS connection_log (
+                    callsign    TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                    transport   TEXT    NOT NULL DEFAULT '',
+                    first_seen  INTEGER NOT NULL,
+                    last_seen   INTEGER NOT NULL,
+                    auth_level  INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_connlog_last ON connection_log (last_seen)"
+            )
+        except Exception:
+            pass
+        await db.commit()
+        from_version = 3
+
+    if from_version < 4:
+        # Add connected flag to connection_log (new in v4).
+        try:
+            await db.execute(
+                "ALTER TABLE connection_log ADD COLUMN connected INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        await db.commit()
+        from_version = 4
 
     await db.execute(
         "INSERT INTO schema_version (version) VALUES (?)", (_CURRENT_VERSION,)

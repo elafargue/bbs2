@@ -110,7 +110,7 @@ class _KISSVirtualWriter:
 class _KISSBaseTransport(Transport):
     """Shared logic for KISS serial and TCP transports."""
 
-    def __init__(self, bbs_callsign: str, kiss_port: int) -> None:
+    def __init__(self, bbs_callsign: str, kiss_port: int, cfg: dict[str, Any]) -> None:
         call, ssid = parse(bbs_callsign)
         self._local_addr = format_addr(call, ssid)
         self._kiss_port = kiss_port
@@ -119,6 +119,8 @@ class _KISSBaseTransport(Transport):
         self._session_tasks: dict[str, asyncio.Task[None]] = {}
         self._raw_writer: asyncio.StreamWriter | None = None
         self._on_connect: ConnectionCallback | None = None
+        self._beacon_text: str = cfg.get("beacon_text", "").strip()
+        self._beacon_interval: int = max(1, int(cfg.get("beacon_interval", 20))) * 60
 
     @abstractmethod
     async def _open_raw_streams(
@@ -133,6 +135,18 @@ class _KISSBaseTransport(Transport):
         reader, writer = await self._open_raw_streams()
         self._raw_writer = writer
         logger.info("%s transport connected", self.transport_id)
+
+        beacon_task: asyncio.Task[None] | None = None
+        if self._beacon_text:
+            beacon_task = asyncio.create_task(
+                self._beacon_loop(), name=f"{self.transport_id}:beacon"
+            )
+            logger.info(
+                "%s beacon enabled: every %d min — %s",
+                self.transport_id,
+                self._beacon_interval // 60,
+                self._beacon_text,
+            )
 
         buf = bytearray()
         try:
@@ -151,6 +165,8 @@ class _KISSBaseTransport(Transport):
         except Exception:
             logger.exception("%s transport read error", self.transport_id)
         finally:
+            if beacon_task:
+                beacon_task.cancel()
             await self.stop()
 
     async def _dispatch(self, frame: KISSFrame) -> None:
@@ -193,6 +209,26 @@ class _KISSBaseTransport(Transport):
             self._sessions.pop(src, None)
             self._session_tasks.pop(src, None)
             logger.info("KISS virtual session ended for %s", src)
+
+    def _send_beacon(self) -> None:
+        """Build and write a KISS UI beacon frame to QST (fire-and-forget write)."""
+        if not self._raw_writer or self._raw_writer.is_closing():
+            return
+        ax25 = _build_ax25_ui_frame(
+            self._local_addr, "QST", self._beacon_text.encode("ascii", errors="replace")
+        )
+        frame = build_kiss_frame(self._kiss_port, ax25)
+        self._raw_writer.write(frame)
+
+    async def _beacon_loop(self) -> None:
+        """Send a beacon immediately on start, then every beacon_interval seconds."""
+        try:
+            while self._running:
+                self._send_beacon()
+                logger.debug("%s beacon sent", self.transport_id)
+                await asyncio.sleep(self._beacon_interval)
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
         self._running = False
@@ -245,7 +281,7 @@ class KISSTCPTransport(_KISSBaseTransport):
     transport_id = "kiss_tcp"
 
     def __init__(self, cfg: dict[str, Any], bbs_callsign: str) -> None:
-        super().__init__(bbs_callsign, int(cfg.get("ax25_port", 0)))
+        super().__init__(bbs_callsign, int(cfg.get("ax25_port", 0)), cfg)
         self._host: str = cfg.get("host", "127.0.0.1")
         self._port: int = int(cfg.get("port", 8001))
 
@@ -262,7 +298,7 @@ class KISSSerialTransport(_KISSBaseTransport):
     transport_id = "kiss_serial"
 
     def __init__(self, cfg: dict[str, Any], bbs_callsign: str) -> None:
-        super().__init__(bbs_callsign, int(cfg.get("port", 0)))
+        super().__init__(bbs_callsign, int(cfg.get("port", 0)), cfg)
         self._device: str = cfg.get("device", "/dev/ttyACM0")
         self._baud: int = int(cfg.get("baud", 9600))
 

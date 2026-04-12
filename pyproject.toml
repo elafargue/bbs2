@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bbs2"
 version = "0.1.0"
-description = "Modular ham radio BBS for Linux AX.25 / KISS / NetROM"
-requires-python = ">=3.11"
+description = "Modular ham radio BBS for Linux AX.25 / KISS / AGWPE"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     # Async networking

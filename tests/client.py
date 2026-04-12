@@ -171,8 +171,8 @@ class BbsTestClient:
         await self.sendln(key)
 
     async def quit(self) -> None:
-        """Send Q to exit gracefully."""
-        await self.sendln("Q")
+        """Send B to exit gracefully."""
+        await self.sendln("B")
 
 
 # ---------------------------------------------------------------------------

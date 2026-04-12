@@ -41,6 +41,10 @@ class BBSConfig:
         return Path(self.database.get("path", "data/bbs.db"))
 
     @property
+    def connection_log_days(self) -> int:
+        return int(self.database.get("connection_log_days", 30))
+
+    @property
     def totp_time_step(self) -> int:
         return int(self.auth.get("totp_time_step", 30))
 

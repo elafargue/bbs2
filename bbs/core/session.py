@@ -27,6 +27,7 @@ import aiosqlite
 
 from bbs.core.auth import AuthLevel, AuthService, AuthState
 from bbs.core.terminal import Terminal
+from bbs.db.connections import upsert_connection
 
 if TYPE_CHECKING:
     from bbs.config import BBSConfig
@@ -72,6 +73,9 @@ class BBSSession:
         self.connected_at = time.time()
         self._last_activity = time.time()
 
+        # Per-session scratch space for plugins (keyed by plugin name)
+        self.plugin_state: dict = {}
+
         # Unique session ID for web dashboard / logs
         self.session_id = f"{conn.transport_id}:{conn.remote_addr}:{int(self.connected_at)}"
 
@@ -93,18 +97,40 @@ class BBSSession:
         Full session lifecycle.  Called by the engine as an asyncio Task.
         """
         db_path = str(self.cfg.db_path)
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(db_path, timeout=30) as db:
             db.row_factory = aiosqlite.Row
             self.db = db
 
+            _ax25_transports = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe")
+            _is_ax25 = self.conn.transport_id in _ax25_transports
             self.term = await Terminal.create(
                 self.conn.reader,
                 self.conn.writer,
+                echo=not _is_ax25,
+                # AX.25 TNCs typically run with LFADD ON, so sending \r\n
+                # produces a double newline.  Send \r only and let the TNC
+                # or terminal emulator supply the LF.
+                eol="\r" if _is_ax25 else "\r\n",
             )
 
             try:
                 await self._greet()
                 await self._identify()
+                # Record the connection as live as soon as the callsign is known.
+                if self.auth.callsign and self.cfg.connection_log_days != 0:
+                    try:
+                        await upsert_connection(
+                            str(self.cfg.db_path),
+                            callsign=self.auth.callsign,
+                            transport=self.conn.transport_id,
+                            connected_at=self.connected_at,
+                            auth_level=self.auth.level.value,
+                            connected=1,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to record connect for %s", self.auth.callsign
+                        )
                 if self.state != SessionState.DISCONNECTED:
                     self.state = SessionState.ACTIVE
                     await self._main_loop()
@@ -136,11 +162,10 @@ class BBSSession:
 
         TCP transport: no callsign embedded; ask the user.
         """
-        from bbs.ax25.address import callsign_only
-
-        if self.conn.transport_id in ("kernel_ax25", "kiss_tcp", "kiss_serial", "netrom"):
-            # Callsign comes from connection layer — already verified by kernel/TNC
-            callsign = callsign_only(self.remote_addr)
+        if self.conn.transport_id in ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe"):
+            # Callsign comes from connection layer — already verified by kernel/TNC.
+            # Keep the SSID so that W6ELA-7 and W6ELA-9 are distinct accounts.
+            callsign = self.remote_addr.upper().strip()
             self.auth, created = await self.auth_service.identify(
                 self.db, callsign, from_ax25=True
             )
@@ -180,14 +205,14 @@ class BBSSession:
             # Build menu from loaded plugins
             menu_items = self.plugin_registry.menu_items(self.auth.level)
             menu_items += [
-                ("A", "Auth (upgrade access)"),
-                ("Q", "Quit"),
+                ("A", "Auth"),
+                ("B", "Bye (disconnect)"),
                 ("?", "Help"),
             ]
 
             await self.term.send_menu(self.cfg.name, menu_items, prompt="> ")
             choice_raw = await self.term.readline(
-                max_len=4, echo=True, timeout=idle_timeout
+                max_len=4, timeout=idle_timeout
             )
             if not choice_raw:
                 # Timeout or EOF
@@ -197,7 +222,7 @@ class BBSSession:
             self.touch()
             choice = choice_raw.strip().upper()
 
-            if choice == "Q":
+            if choice in ("B", "BYE"):
                 break
             elif choice == "A":
                 await self._handle_auth()
@@ -244,7 +269,7 @@ class BBSSession:
             "     Required for posting messages and other write operations.",
             "     Your secret is set out-of-band by the sysop.",
             "",
-            "Q  - Quit / disconnect.",
+            "B  - Bye / disconnect.  (You may also type BYE)",
             "",
             "On AX.25 connections your callsign is identified automatically.",
             "On Telnet/TCP connections you must type your callsign at login.",

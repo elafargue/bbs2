@@ -24,6 +24,7 @@ from bbs.config import BBSConfig
 from bbs.core.auth import AuthService
 from bbs.core.plugin_registry import PluginRegistry
 from bbs.core.session import BBSSession, SessionState
+from bbs.db.connections import prune_old_connections, upsert_connection
 from bbs.db.schema import init_db
 from bbs.transport import build_transports
 from bbs.transport.base import Connection
@@ -60,17 +61,30 @@ class BBSEngine:
         # Recent log lines ring buffer (web dashboard initial load)
         self.log_buffer: deque[str] = deque(maxlen=LOG_BUFFER_SIZE)
 
-        # Shutdown event
-        self._stop_event = asyncio.Event()
+        # Created lazily inside run() so it binds to the correct asyncio loop.
+        # (Python 3.9 asyncio.Event() created before asyncio.run() binds to
+        # the deprecated default loop and causes "Future attached to a different
+        # loop" when awaited inside the real loop.)
+        self._stop_event: Optional[asyncio.Event] = None
 
     # ── Startup & shutdown ────────────────────────────────────────────────────
 
     async def run(self) -> None:
         """Start the engine; returns when stop() is called."""
+        # Create the stop event here so it is bound to the running loop
+        # (fixes Python 3.9 "Future attached to a different loop" error).
+        self._stop_event = asyncio.Event()
+
         logger.info("BBS engine starting — %s", self.cfg.full_callsign)
 
         # Initialise database
         await init_db(str(self.cfg.db_path))
+
+        # Prune stale connection log entries on startup
+        if self.cfg.connection_log_days > 0:
+            await prune_old_connections(
+                str(self.cfg.db_path), self.cfg.connection_log_days
+            )
 
         # Load plugins
         await self.plugin_registry.load_plugins()
@@ -112,7 +126,8 @@ class BBSEngine:
 
     def stop(self) -> None:
         """Thread-safe: request the engine to stop."""
-        self._stop_event.set()
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     # ── Connection callback ───────────────────────────────────────────────────
 
@@ -164,6 +179,19 @@ class BBSEngine:
         try:
             await session.run()
         finally:
+            # Record the connection in the journal (skip anonymous/unidentified).
+            if session.auth.callsign and self.cfg.connection_log_days != 0:
+                try:
+                    await upsert_connection(
+                        str(self.cfg.db_path),
+                        callsign=session.auth.callsign,
+                        transport=session.conn.transport_id,
+                        connected_at=session.connected_at,
+                        auth_level=session.auth.level.value,
+                        connected=0,
+                    )
+                except Exception:
+                    logger.exception("Failed to record connection for %s", session.auth.callsign)
             self._sessions.pop(session.session_id, None)
             self._session_tasks.pop(session.session_id, None)
             self._emit_event({
@@ -189,7 +217,7 @@ class BBSEngine:
 
     def _emit_log(self, message: str) -> None:
         """Append a log line to the ring buffer and put on the event queue."""
-        line = f"{time.strftime('%H:%M:%S')} {message}"
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
         self.log_buffer.append(line)
         self._emit_event({"type": "log", "line": line, "timestamp": time.time()})
 
@@ -210,7 +238,7 @@ class BBSEngine:
                 "idle_seconds": round(s.idle_seconds),
                 "connected_at": s.connected_at,
             }
-            for s in self._sessions.values()
+            for s in list(self._sessions.values())
         ]
 
     def plugin_stats_snapshot(self) -> list[dict[str, Any]]:

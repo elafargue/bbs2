@@ -53,7 +53,7 @@ def _make_test_config(db_path: str, tcp_port: int) -> BBSConfig:
             "kernel_ax25": {"enabled": False},
             "kiss_tcp":    {"enabled": False},
             "kiss_serial": {"enabled": False},
-            "netrom":      {"enabled": False},
+
         },
         database={"path": db_path},
         auth={
@@ -128,6 +128,10 @@ def bbs_server() -> Generator[_BbsServerHandle, None, None]:
                 async def _patched_run() -> None:
                     from bbs.db.schema import init_db
                     from bbs.transport import build_transports
+
+                    # Must be created here (inside the running loop) to avoid
+                    # "Future attached to a different loop" on Python 3.9
+                    engine._stop_event = asyncio.Event()
 
                     await init_db(str(cfg.db_path))
                     await engine.plugin_registry.load_plugins()

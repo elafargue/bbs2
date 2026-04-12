@@ -76,6 +76,6 @@ class TestMainMenu:
         assert "Unknown" in text or "unknown" in text
 
     async def test_quit_disconnects(self, logged_in_client: BbsTestClient):
-        await logged_in_client.sendln("Q")
+        await logged_in_client.sendln("B")
         text = await logged_in_client.wait_for("73")
         assert "73" in text

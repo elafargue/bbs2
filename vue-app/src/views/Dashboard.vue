@@ -14,14 +14,29 @@ const userHeaders = [
   { title: 'Idle (s)',   key: 'idle_seconds'},
 ]
 
-onMounted(() => {
+onMounted(async () => {
+  // Fetch initial state via REST so navigating back always shows fresh data.
+  // (admin_dashboard_init only fires once on initial page load, not on re-navigation.)
+  const [usersRes, pluginsRes, logRes, meRes] = await Promise.all([
+    fetch('/api/activity/users'),
+    fetch('/api/plugins'),
+    fetch('/api/activity?n=500'),
+    fetch('/api/admin/me'),
+  ])
+  if (usersRes.ok)  users.value    = await usersRes.json()
+  if (pluginsRes.ok) plugins.value = await pluginsRes.json()
+  if (logRes.ok)  { const d = await logRes.json(); logLines.value = d.lines || [] }
+  if (meRes.ok)   { const d = await meRes.json(); bbsCallsign.value = d.callsign || '' }
+
+  // Socket listeners keep data live after the initial fetch.
+  // admin_dashboard_init still fires on socket reconnects, so handle it too.
   socket.on('admin_dashboard_init', (data) => {
-    bbsCallsign.value = data.bbs_callsign || ''
-    users.value = data.users || []
-    plugins.value = data.plugins || []
-    logLines.value = data.log || []
+    if (data.bbs_callsign) bbsCallsign.value = data.bbs_callsign
+    if (data.users)   users.value    = data.users
+    if (data.plugins) plugins.value  = data.plugins
+    if (data.log)     logLines.value = data.log
   })
-  socket.on('users_snapshot', (snap) => { users.value = snap })
+  socket.on('users_snapshot',      (snap)  => { users.value   = snap  })
   socket.on('plugin_stats_update', (stats) => { plugins.value = stats })
   socket.on('bbs_log_line', (data) => {
     logLines.value.push(data.line)

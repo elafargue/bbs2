@@ -37,12 +37,25 @@ transports:
     enabled: false
     # axport name from /etc/ax25/axports
     axport: "ax0"
+    beacon_text: "W6ELA-5 BBS - Palo Alto"
+    beacon_interval: 20
+    beacon_path: ""   # e.g. "WIDE1-1,WIDE2-1" or "KD6XYZ-3,W6ABC"
 
-  # NetROM (AF_NETROM kernel sockets) — legacy, disabled by default
-  netrom:
+  # AGWPE / AGW Packet Engine (SV2AGW) TCP API — connects to a running AGWPE or
+  # compatible engine (e.g. Direwolf with AGW interface, UZ7HO Soundmodem).
+  agwpe:
     enabled: false
-    # NetROM alias shown to the network (max 6 chars, uppercase)
-    alias: "BBS"
+    host: "127.0.0.1"
+    # AGWPE default TCP port is 8000
+    port: 8000
+    # Radio port number inside AGWPE (0-based)
+    agw_port: 0
+    # Leave blank if AGWPE has no password set
+    password: ""
+    beacon_text: ""
+    beacon_dest: "BEACON"
+    beacon_interval: 20   # minutes
+    beacon_path: ""       # e.g. "WIDE1-1,WIDE2-1"
 
   # Plain TCP (for Telnet / local testing)
   tcp:
@@ -53,6 +66,8 @@ transports:
 database:
   # Path to SQLite database file
   path: "data/bbs.db"
+  # Number of days to keep connection journal entries (0 = keep forever)
+  connection_log_days: 30
 
 auth:
   # HMAC-SHA256 challenge-response: shared secret set per-user via web interface.
@@ -85,6 +100,11 @@ plugins:
     # Default rooms created on first run
     default_rooms:
       - { name: "main", description: "Main chat room" }
+
+  lastconn:
+    enabled: true
+    # Maximum rows shown in the plugin listing
+    limit: 200
 
 web:
   host: "127.0.0.1"

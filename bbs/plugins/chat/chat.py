@@ -10,7 +10,7 @@ someone sends a message the ChatRoom puts it on every other queue.
 Chat is intentionally minimal for 1200 bps:
   - Messages are short (max 160 chars).
   - Lines are printed one at a time; no full-screen updates.
-  - /WHO, /MSG, /JOIN, /QUIT commands.
+  - /WHO, /MSG, /JOIN, /ROOMS, /QUIT commands.
 
 Access: IDENTIFIED (just a valid callsign via AX.25 is enough to chat).
 """
@@ -142,7 +142,7 @@ class ChatPlugin(BBSPlugin):
             for line in history[-10:]:
                 await term.sendln(line)
             await term.sendln("--- end ---")
-        await term.sendln("Commands: /WHO  /MSG <call> <text>  /JOIN <room>  /QUIT")
+        await term.sendln("Commands: /WHO  /MSG <call> <text>  /JOIN <room>  /ROOMS /QUIT")
         await term.sendln()
 
         try:
@@ -177,7 +177,7 @@ class ChatPlugin(BBSPlugin):
         try:
             while True:
                 await term.send(f"{room.name}> ")
-                line = await term.readline(max_len=MAX_MSG_LEN, echo=True)
+                line = await term.readline(max_len=MAX_MSG_LEN, echo=False)
                 session.touch()
 
                 if not line:

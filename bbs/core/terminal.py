@@ -79,12 +79,16 @@ class Terminal:
         ansi: bool = False,
         width: int = 80,
         height: int = 24,
+        echo: bool = True,
+        eol: str = "\r\n",
     ) -> None:
         self._reader = reader
         self._writer = writer
         self.ansi = ansi
         self.width = width
         self.height = height
+        self._echo = echo
+        self._eol = eol
         self._buf = bytearray()
 
     # ── Detection ─────────────────────────────────────────────────────────────
@@ -96,9 +100,11 @@ class Terminal:
         writer,
         width: int = 80,
         height: int = 24,
+        echo: bool = True,
+        eol: str = "\r\n",
     ) -> "Terminal":
         """Return a plain ASCII Terminal (ANSI detection disabled for now)."""
-        return cls(reader, writer, ansi=False, width=width, height=height)
+        return cls(reader, writer, ansi=False, width=width, height=height, echo=echo, eol=eol)
 
     # ── Output ────────────────────────────────────────────────────────────────
 
@@ -116,8 +122,8 @@ class Terminal:
         self._buf.extend(self._encode(text))
 
     def writeln(self, text: str = "") -> None:
-        """Buffer *text* followed by CR+LF."""
-        self.write(text + "\r\n")
+        """Buffer *text* followed by the session line terminator (CR+LF or CR)."""
+        self.write(text + self._eol)
 
     async def flush(self) -> None:
         """Send all buffered output in MAX_CHUNK-byte chunks."""
@@ -261,17 +267,20 @@ class Terminal:
             return data.decode("ascii", errors="replace")
 
     async def readline(
-        self, max_len: int = 80, echo: bool = True, timeout: Optional[float] = None
+        self, max_len: int = 80, echo: Optional[bool] = None, timeout: Optional[float] = None
     ) -> str:
         """
         Read a line of input (terminated by CR or LF).
 
         *echo*: if True, echo printable characters back (needed for TCP/Telnet
         clients; AX.25 connected-mode clients typically handle echo at TNC level).
+        Pass None (default) to use the terminal's echo setting (set at creation).
         *max_len*: discard characters beyond this count.
         *timeout*: seconds; returns partial input on timeout.
         Returns the line without the line terminator.
         """
+        if echo is None:
+            echo = self._echo
         buf = []
         deadline = asyncio.get_event_loop().time() + timeout if timeout else None
 

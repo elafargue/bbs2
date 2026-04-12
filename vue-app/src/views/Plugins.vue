@@ -1,9 +1,11 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import BulletinAreas from './Bulletins.vue'
 
 const plugins = ref([])
 const loading = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
+const areasDialog = ref(false)
 
 async function loadPlugins() {
   loading.value = true
@@ -59,7 +61,6 @@ onMounted(loadPlugins)
               </v-card-title>
               <v-card-subtitle>{{ p.name }}</v-card-subtitle>
               <v-card-text>
-                <!-- Extra stats from plugin (e.g. rooms for chat) -->
                 <pre
                   v-if="Object.keys(p).filter(k => !['name','display_name','enabled'].includes(k)).length"
                   class="text-body-2"
@@ -74,12 +75,37 @@ onMounted(loadPlugins)
                 >
                   {{ p.enabled ? 'Disable' : 'Enable' }}
                 </v-btn>
+                <v-btn
+                  v-if="p.name === 'bulletins'"
+                  variant="tonal"
+                  color="primary"
+                  append-icon="mdi-bulletin-board"
+                  @click="areasDialog = true"
+                >
+                  Areas
+                </v-btn>
               </v-card-actions>
             </v-card>
           </v-col>
         </v-row>
       </v-card-text>
     </v-card>
+
+    <!-- Bulletin Areas modal -->
+    <v-dialog v-model="areasDialog" max-width="860" scrollable>
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start>mdi-bulletin-board</v-icon>
+          Bulletin Areas
+          <v-spacer />
+          <v-btn icon="mdi-close" variant="text" @click="areasDialog = false" />
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pa-4">
+          <BulletinAreas />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
 
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="3000">
       {{ snackbar.text }}

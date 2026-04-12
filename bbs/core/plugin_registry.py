@@ -117,6 +117,16 @@ class PluginRegistry:
         # 2. Entry-point plugins from installed packages
         classes.extend(self._scan_entry_point_plugins())
 
+        # Deduplicate: a class can appear more than once when a plugin package's
+        # __init__.py re-exports the class AND the inner module is also walked.
+        seen: set[type] = set()
+        unique: list[type[BBSPlugin]] = []
+        for cls in classes:
+            if cls not in seen:
+                seen.add(cls)
+                unique.append(cls)
+        classes = unique
+
         # 3. Instantiate and initialise
         plugin_cfg = self._cfg.plugins
         db_path = str(self._cfg.db_path)

@@ -23,7 +23,7 @@ class Connection:
     """
     Represents one live connection from a remote peer.
 
-    remote_addr:  Canonical "CALLSIGN-SSID" string for AX.25 / NetROM transports,
+    remote_addr:  Canonical "CALLSIGN-SSID" string for AX.25 transports,
                   or "host:port" for TCP.  Always a non-empty string.
     reader:       asyncio.StreamReader for data arriving from the peer.
     writer:       asyncio.StreamWriter for data to send to the peer.
