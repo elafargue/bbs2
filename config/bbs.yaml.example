@@ -1,0 +1,101 @@
+# Example BBS configuration — copy to bbs.yaml and edit before running
+
+bbs:
+  # Your station callsign (max 6 chars) and SSID (0-15)
+  callsign: "N0CALL"
+  ssid: 1
+  # Displayed in the login banner
+  name: "My Amateur Radio BBS"
+  sysop: "N0CALL"
+  location: "Anytown, USA"
+  # Maximum concurrent connected users (0 = unlimited)
+  max_users: 20
+  # Idle timeout in seconds before disconnecting a user (0 = disabled)
+  idle_timeout: 300
+
+transports:
+  # Enable one or more transports. The BBS listens on all enabled transports simultaneously.
+
+  # KISS over serial port (Dire Wolf /dev/ttyACM0 or hardware TNC)
+  kiss_serial:
+    enabled: false
+    device: "/dev/ttyACM0"
+    baud: 9600
+    # AX.25 port number inside KISS frames (0-15)
+    port: 0
+
+  # KISS over TCP socket (Dire Wolf default: 8001)
+  kiss_tcp:
+    enabled: true
+    host: "127.0.0.1"
+    port: 8001
+    # AX.25 port number inside KISS frames (0-15)
+    ax25_port: 0
+
+  # Linux kernel AX.25 (AF_AX25 sockets via axports / kissattach)
+  kernel_ax25:
+    enabled: false
+    # axport name from /etc/ax25/axports
+    axport: "ax0"
+
+  # NetROM (AF_NETROM kernel sockets) — legacy, disabled by default
+  netrom:
+    enabled: false
+    # NetROM alias shown to the network (max 6 chars, uppercase)
+    alias: "BBS"
+
+  # Plain TCP (for Telnet / local testing)
+  tcp:
+    enabled: true
+    host: "0.0.0.0"
+    port: 6300
+
+database:
+  # Path to SQLite database file
+  path: "data/bbs.db"
+
+auth:
+  # HMAC-SHA256 challenge-response: shared secret set per-user via web interface.
+  # Most features are accessible with just a callsign (which is carried in the AX.25
+  # connection); HMAC auth unlocks privileged operations (post, settings change, etc.)
+  # Nonce length in hex characters (must be even; 32 = 16 bytes of entropy)
+  nonce_hex_length: 32
+  # Failed auth attempts before lockout
+  max_attempts: 3
+  # Lockout duration in seconds
+  lockout_seconds: 900
+
+plugins:
+  bulletins:
+    enabled: true
+    # Maximum message body size in bytes (keep small for 1200bps)
+    max_body_bytes: 4096
+    # Maximum subject length in characters
+    max_subject_chars: 25
+    # Default areas created on first run
+    default_areas:
+      - { name: "GENERAL", description: "General discussion" }
+      - { name: "TECH",    description: "Technical topics" }
+      - { name: "DX",      description: "DX news and reports" }
+
+  chat:
+    enabled: true
+    # Lines of history kept in memory per room
+    history_lines: 50
+    # Default rooms created on first run
+    default_rooms:
+      - { name: "main", description: "Main chat room" }
+
+web:
+  host: "127.0.0.1"
+  port: 8080
+  # Change this before first run! (used for sysop web login only)
+  # The HMAC secrets for radio users are set separately per-user.
+  sysop_password_hash: ""   # leave blank; set via: bbs2 --set-sysop-password
+  # Secret key for Flask sessions — replace with a random string
+  secret_key: "CHANGE_ME_BEFORE_RUNNING"
+
+logging:
+  level: "INFO"     # DEBUG, INFO, WARNING, ERROR
+  # Optional file path; leave blank to log to stdout only
+  file: ""

@@ -1,0 +1,23 @@
+[Unit]
+Description=BBS2 Ham Radio BBS
+After=network.target
+
+[Service]
+Type=simple
+User=bbs
+Group=bbs
+WorkingDirectory=/opt/bbs2
+ExecStart=/opt/bbs2/venv/bin/bbs2 --config /opt/bbs2/config/bbs.yaml
+Restart=on-failure
+RestartSec=5
+
+# Allow AX.25 socket operations
+AmbientCapabilities=
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bbs2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+MANIFEST
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+.v/
+.venv/
+venv/
+env/
+
+# ── Pytest / coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ── Runtime data ──────────────────────────────────────────────────────────────
+data/
+# Keep example configs, ignore live ones
+config/bbs.yaml
+!config/bbs.yaml.example
+
+# ── Built frontend assets ─────────────────────────────────────────────────────
+# static/ is populated by `npm run build` — do not commit generated bundles
+static/assets/
+static/index.html
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/

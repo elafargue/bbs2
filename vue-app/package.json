@@ -1,0 +1,24 @@
+{
+  "name": "bbs2-admin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mdi/font": "^7.4.47",
+    "qrcode": "^1.5.4",
+    "socket.io-client": "^4.7.4",
+    "vue": "^3.4.0",
+    "vue-router": "^4.3.0",
+    "vuetify": "^3.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.0",
+    "vite-plugin-vuetify": "^2.0.3"
+  }
+}
