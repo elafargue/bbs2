@@ -25,6 +25,7 @@ from typing import Optional, TYPE_CHECKING
 
 import aiosqlite
 
+from bbs.ax25.address import callsign_only
 from bbs.core.auth import AuthLevel, AuthService, AuthState
 from bbs.core.terminal import Terminal
 from bbs.db.connections import upsert_connection
@@ -164,26 +165,36 @@ class BBSSession:
         """
         if self.conn.transport_id in ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe"):
             # Callsign comes from connection layer — already verified by kernel/TNC.
-            # Keep the SSID so that W6ELA-7 and W6ELA-9 are distinct accounts.
-            callsign = self.remote_addr.upper().strip()
+            # Strip the SSID: user accounts are keyed on the base callsign so that
+            # the same operator connecting via -7 or -3 gets the same record.
+            display_call = self.remote_addr.upper().strip()
+            try:
+                base_call = callsign_only(display_call)
+            except ValueError:
+                base_call = display_call
             self.auth, created = await self.auth_service.identify(
-                self.db, callsign, from_ax25=True
+                self.db, base_call, from_ax25=True
             )
-            await self.term.sendln(f"Welcome, {callsign}!")
+            await self.term.sendln(f"Welcome, {display_call}!")
             if created:
                 await self.term.sendln("(New account created — sysop approval pending for write access)")
         else:
             # TCP / unknown — ask for callsign
             await self.term.send("Callsign: ")
-            callsign = (await self.term.readline(max_len=10)).upper().strip()
-            if not callsign:
+            raw_call = (await self.term.readline(max_len=10)).upper().strip()
+            if not raw_call:
                 await self.term.sendln("No callsign entered. Goodbye.")
                 self.state = SessionState.DISCONNECTED
                 return
+            # Strip SSID for consistency with radio paths
+            try:
+                base_call = callsign_only(raw_call)
+            except ValueError:
+                base_call = raw_call
             self.auth, created = await self.auth_service.identify(
-                self.db, callsign, from_ax25=False
+                self.db, base_call, from_ax25=False
             )
-            await self.term.sendln(f"Welcome, {callsign}!")
+            await self.term.sendln(f"Welcome, {base_call}!")
             if created:
                 await self.term.sendln("(New account — sysop approval pending for write access)")
 
