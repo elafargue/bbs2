@@ -26,7 +26,9 @@ cp pyproject.toml "$INSTALL_DIR/"
 
 # 4. Create Python virtual environment
 python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip
+# Debian/Raspberry Pi OS venvs do not include pip by default — bootstrap it.
+"$INSTALL_DIR/venv/bin/python3" -m ensurepip --upgrade
+"$INSTALL_DIR/venv/bin/python3" -m pip install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -e "$INSTALL_DIR"
 
 # 5. Copy example config if no config exists

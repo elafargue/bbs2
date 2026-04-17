@@ -165,6 +165,7 @@ class ChatPlugin(BBSPlugin):
                 try:
                     line = await asyncio.wait_for(inbox.get(), timeout=0.5)
                     await term.sendln(line)
+                    await term.send(f"{room.name}> ")
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
