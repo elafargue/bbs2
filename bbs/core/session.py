@@ -276,14 +276,13 @@ class BBSSession:
             "--------",
             "Select a menu item by typing its letter and pressing ENTER.",
             "",
-            "A  - Authenticate: prove your callsign with HMAC challenge/response.",
-            "     Required for posting messages and other write operations.",
-            "     Your secret is set out-of-band by the sysop.",
+            "A  - Authenticate: prove your callsign with an OTP code.",
+            "     Required for sysop auth or authenticated messages.",
+            "     Your secret is set out-of-band by the sysop, reach out to them",
+            "     to request it.",
             "",
             "B  - Bye / disconnect.  (You may also type BYE)",
-            "",
-            "On AX.25 connections your callsign is identified automatically.",
-            "On Telnet/TCP connections you must type your callsign at login.",
+
         ]
         await self.term.paginate(lines)
 

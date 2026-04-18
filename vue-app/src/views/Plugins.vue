@@ -1,11 +1,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import BulletinAreas from './Bulletins.vue'
+import InfoEditor from './InfoEditor.vue'
 
 const plugins = ref([])
 const loading = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
 const areasDialog = ref(false)
+const infoDialog = ref(false)
 
 async function loadPlugins() {
   loading.value = true
@@ -84,6 +86,15 @@ onMounted(loadPlugins)
                 >
                   Areas
                 </v-btn>
+                <v-btn
+                  v-if="p.name === 'info'"
+                  variant="tonal"
+                  color="primary"
+                  append-icon="mdi-information-outline"
+                  @click="infoDialog = true"
+                >
+                  Edit Info
+                </v-btn>
               </v-card-actions>
             </v-card>
           </v-col>
@@ -103,6 +114,22 @@ onMounted(loadPlugins)
         <v-divider />
         <v-card-text class="pa-4">
           <BulletinAreas />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
+    <!-- BBS Info message editor modal -->
+    <v-dialog v-model="infoDialog" max-width="700" scrollable>
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start>mdi-information-outline</v-icon>
+          BBS Info Message
+          <v-spacer />
+          <v-btn icon="mdi-close" variant="text" @click="infoDialog = false" />
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pa-4">
+          <InfoEditor />
         </v-card-text>
       </v-card>
     </v-dialog>

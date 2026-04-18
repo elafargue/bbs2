@@ -106,6 +106,12 @@ plugins:
     # Maximum rows shown in the plugin listing
     limit: 200
 
+  info:
+    enabled: true
+    # Optional seed message – used only when the database row is still empty.
+    # Once the sysop edits the message via the web UI this value is ignored.
+    message: ""
+
 web:
   host: "127.0.0.1"
   port: 8080
