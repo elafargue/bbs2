@@ -4,22 +4,20 @@ bbs/core/terminal.py — Lightweight terminal renderer for network sessions.
 Design goals
 ------------
 • No curses — curses requires a local TTY; BBS sessions come over radio or TCP.
-• Auto-detect ANSI capability: send VT100 Device Attributes query at connect;
-  if no response within timeout → ASCII-only mode.
-• ANSI mode: 8-color palette, bold/underline/reverse only.  No 256-color or
-  24-bit (bandwidth waste at 1200 bps).
+• Explicit color modes: ASCII-only, classic ANSI 16-color, or truecolor.
 • Buffered output: writes are accumulated and flushed in chunks ≤ MAX_CHUNK
-  bytes so the radio layer isn't flooded with tiny packets.
+    bytes so the radio layer isn't flooded with tiny packets.
 • Paging: paginate() inserts a "[MORE]" prompt every page_height lines and
-  waits for SPACE/ENTER/Q.
+    waits for SPACE/ENTER/Q.
 • Line-at-a-time input: readline() handles both CR and LF line endings,
-  echoes characters (for TCP; AX.25 connected-mode handles its own echo),
-  and respects a maximum line length.
+    echoes characters (for TCP; AX.25 connected-mode handles its own echo),
+    and respects a maximum line length.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -27,15 +25,12 @@ logger = logging.getLogger(__name__)
 # Maximum bytes per write flush — keeps RF frames manageable
 MAX_CHUNK = 256
 
-# Seconds to wait for VT100 DA response before falling back to ASCII
-ANSI_DETECT_TIMEOUT = 3.0
-
 # ── ANSI escape helpers ────────────────────────────────────────────────────────
 
 ESC = "\x1b"
 CSI = f"{ESC}["
 
-# Colours (foreground: 30-37, background: 40-47)
+# Colours (foreground: 30-37/90-97, background: 40-47/100-107)
 BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE = range(8)
 
 RESET = f"{CSI}0m"
@@ -44,12 +39,42 @@ UNDERLINE = f"{CSI}4m"
 REVERSE = f"{CSI}7m"
 
 
+class ColorMode(str, Enum):
+    OFF = "off"
+    ANSI16 = "ansi16"
+    TRUECOLOR = "truecolor"
+
+
+def normalize_color_mode(color_mode: str | ColorMode | None) -> ColorMode:
+    if isinstance(color_mode, ColorMode):
+        return color_mode
+    value = str(color_mode or ColorMode.OFF.value).strip().lower()
+    try:
+        return ColorMode(value)
+    except ValueError:
+        return ColorMode.OFF
+
+
 def fg(color: int) -> str:
-    return f"{CSI}{30 + color}m"
+    if not 0 <= color <= 15:
+        raise ValueError("ANSI color index must be between 0 and 15")
+    base = 30 if color < 8 else 90
+    return f"{CSI}{base + (color % 8)}m"
 
 
 def bg(color: int) -> str:
-    return f"{CSI}{40 + color}m"
+    if not 0 <= color <= 15:
+        raise ValueError("ANSI color index must be between 0 and 15")
+    base = 40 if color < 8 else 100
+    return f"{CSI}{base + (color % 8)}m"
+
+
+def fg_rgb(red: int, green: int, blue: int) -> str:
+    return f"{CSI}38;2;{red};{green};{blue}m"
+
+
+def bg_rgb(red: int, green: int, blue: int) -> str:
+    return f"{CSI}48;2;{red};{green};{blue}m"
 
 
 def move_to(row: int, col: int) -> str:
@@ -76,20 +101,33 @@ class Terminal:
         self,
         reader: asyncio.StreamReader,
         writer,  # asyncio.StreamWriter or duck-typed equivalent
-        ansi: bool = False,
+        color_mode: str | ColorMode = ColorMode.OFF,
         width: int = 80,
         height: int = 24,
         echo: bool = True,
+        must_echo: bool = False,
         eol: str = "\r\n",
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self.ansi = ansi
+        self.color_mode = normalize_color_mode(color_mode)
         self.width = width
         self.height = height
         self._echo = echo
+        self._must_echo = must_echo  # True for web sessions: can't be suppressed by callers
         self._eol = eol
         self._buf = bytearray()
+
+    @property
+    def ansi(self) -> bool:
+        return self.color_mode is not ColorMode.OFF
+
+    @property
+    def supports_truecolor(self) -> bool:
+        return self.color_mode is ColorMode.TRUECOLOR
+
+    def set_color_mode(self, color_mode: str | ColorMode) -> None:
+        self.color_mode = normalize_color_mode(color_mode)
 
     # ── Detection ─────────────────────────────────────────────────────────────
 
@@ -98,24 +136,96 @@ class Terminal:
         cls,
         reader: asyncio.StreamReader,
         writer,
+        color_mode: str | ColorMode = ColorMode.OFF,
         width: int = 80,
         height: int = 24,
         echo: bool = True,
+        must_echo: bool = False,
         eol: str = "\r\n",
     ) -> "Terminal":
-        """Return a plain ASCII Terminal (ANSI detection disabled for now)."""
-        return cls(reader, writer, ansi=False, width=width, height=height, echo=echo, eol=eol)
+        """Return a Terminal using the requested color mode."""
+        return cls(
+            reader,
+            writer,
+            color_mode=color_mode,
+            width=width,
+            height=height,
+            echo=echo,
+            must_echo=must_echo,
+            eol=eol,
+        )
 
     # ── Output ────────────────────────────────────────────────────────────────
 
     def _encode(self, text: str) -> bytes:
         """Encode text to bytes, stripping ANSI codes if in ASCII mode."""
-        if not self.ansi:
+        if self.color_mode is ColorMode.OFF:
             # Strip ESC sequences
             import re
             text = re.sub(r"\x1b\[[^A-Za-z]*[A-Za-z]", "", text)
             text = re.sub(r"\x1b.", "", text)
         return text.encode("ascii", errors="replace")
+
+    def _key_style(self, key: str) -> str:
+        if self.supports_truecolor:
+            return f"[{BOLD}{fg_rgb(110, 223, 255)}{key}{RESET}]"
+        if self.ansi:
+            return f"[{BOLD}{fg(14)}{key}{RESET}]"
+        return f"[{key}]"
+
+    def style(self, text: str, tone: str = "accent", *, bold: bool = False) -> str:
+        if not text or not self.ansi:
+            return text
+
+        if self.supports_truecolor:
+            palette = {
+                "accent": fg_rgb(110, 223, 255),
+                "meta": fg_rgb(170, 195, 220),
+                "success": fg_rgb(118, 214, 130),
+                "warning": fg_rgb(241, 198, 92),
+                "error": fg_rgb(239, 122, 122),
+            }
+        else:
+            palette = {
+                "accent": fg(14),
+                "meta": fg(13),
+                "success": fg(10),
+                "warning": fg(11),
+                "error": fg(9),
+            }
+
+        prefix = palette.get(tone, "")
+        if bold:
+            prefix += BOLD
+        return f"{prefix}{text}{RESET}" if prefix else text
+
+    def label(self, text: str, tone: str = "accent") -> str:
+        return self.style(text, tone, bold=True)
+
+    def prompt(self, text: str) -> str:
+        return self.style(text, "accent", bold=True)
+
+    def note(self, text: str) -> str:
+        return self.style(text, "meta")
+
+    def ok(self, text: str) -> str:
+        return self.style(text, "success", bold=True)
+
+    def warn(self, text: str) -> str:
+        return self.style(text, "warning", bold=True)
+
+    def error(self, text: str) -> str:
+        return self.style(text, "error", bold=True)
+
+    def field(self, label: str, value: str, tone: str = "accent") -> str:
+        return f"{self.label(label, tone)} {value}"
+
+    def _more_style(self) -> str:
+        if self.supports_truecolor:
+            return f"{BOLD}{bg_rgb(34, 47, 62)}{fg_rgb(245, 248, 252)}[MORE]{RESET} "
+        if self.ansi:
+            return f"{BOLD}{bg(BLUE)}{fg(15)}[MORE]{RESET} "
+        return "[MORE] "
 
     def write(self, text: str) -> None:
         """Buffer *text* for transmission (does not flush immediately)."""
@@ -149,9 +259,17 @@ class Terminal:
         await self.send(f"{BOLD}{text}{RESET}")
 
     async def send_header(self, text: str) -> None:
-        """Bold + reverse-video header line, padded to width."""
+        """Styled header line, padded to width."""
         padded = text.center(self.width)
-        await self.send(f"{REVERSE}{BOLD}{padded}{RESET}\r\n")
+        if self.supports_truecolor:
+            await self.send(
+                f"{BOLD}{bg_rgb(24, 48, 78)}{fg_rgb(245, 248, 252)}{padded}{RESET}{self._eol}"
+            )
+            return
+        if self.ansi:
+            await self.send(f"{BOLD}{bg(BLUE)}{fg(15)}{padded}{RESET}{self._eol}")
+            return
+        await self.sendln(padded)
 
     async def send_separator(self, char: str = "-") -> None:
         await self.sendln(char * self.width)
@@ -184,8 +302,8 @@ class Terminal:
             lkey, ldesc = litem
             rkey, rdesc = ritem
             if self.ansi:
-                lcell = f"[{BOLD}{fg(CYAN)}{lkey}{RESET}] {ldesc}"
-                rcell = f"[{BOLD}{fg(CYAN)}{rkey}{RESET}] {rdesc}" if rkey else ""
+                lcell = f"{self._key_style(lkey)} {ldesc}"
+                rcell = f"{self._key_style(rkey)} {rdesc}" if rkey else ""
             else:
                 lcell = f"[{lkey}] {ldesc}"
                 rcell = f"[{rkey}] {rdesc}" if rkey else ""
@@ -209,9 +327,7 @@ class Terminal:
             count += 1
             if count >= ph:
                 await self.flush()
-                await self.send(
-                    f"{REVERSE}[MORE]{RESET} " if self.ansi else "[MORE] "
-                )
+                await self.send(self._more_style())
                 ch = await self.readchar()
                 await self.sendln()
                 if ch.upper() == "Q":
@@ -281,6 +397,8 @@ class Terminal:
         """
         if echo is None:
             echo = self._echo
+        if self._must_echo:
+            echo = True
         buf = []
         deadline = asyncio.get_event_loop().time() + timeout if timeout else None
 

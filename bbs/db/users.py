@@ -13,6 +13,14 @@ from typing import Optional
 import aiosqlite
 
 
+VALID_COLOR_MODES = {"off", "ansi16", "truecolor"}
+
+
+def normalize_color_mode(color_mode: str | None) -> str:
+    value = str(color_mode or "off").strip().lower()
+    return value if value in VALID_COLOR_MODES else "off"
+
+
 @dataclass
 class User:
     id: int
@@ -26,6 +34,7 @@ class User:
     hotp_counter: int
     auth_failures: int
     locked_until: Optional[int]
+    color_mode: str
     created_at: int
     last_seen: Optional[int]
 
@@ -53,6 +62,7 @@ def _row_to_user(row: aiosqlite.Row) -> User:
         hotp_counter=row["hotp_counter"] or 0,
         auth_failures=row["auth_failures"],
         locked_until=row["locked_until"],
+        color_mode=normalize_color_mode(row["color_mode"]),
         created_at=row["created_at"],
         last_seen=row["last_seen"],
     )
@@ -213,5 +223,13 @@ async def update_profile(
     await db.execute(
         "UPDATE users SET name = ?, qth = ? WHERE id = ?",
         (name.strip(), qth.strip(), user_id),
+    )
+    await db.commit()
+
+
+async def set_color_mode(db: aiosqlite.Connection, user_id: int, color_mode: str) -> None:
+    await db.execute(
+        "UPDATE users SET color_mode = ? WHERE id = ?",
+        (normalize_color_mode(color_mode), user_id),
     )
     await db.commit()

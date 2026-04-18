@@ -13,6 +13,7 @@ log line to the activity_log DB table so the log survives restarts.
 from __future__ import annotations
 
 import logging
+import queue as stdlib_queue
 import sqlite3
 import threading
 import time
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _SYSOP_ROOM = "sysop"
 _bridge_thread: threading.Thread | None = None
+
+# Per web-terminal session state: sid → {reader, output_queue, drain_thread}
+_web_sessions: dict[str, dict] = {}
 
 
 def safe_emit(event: str, data: Any, room: str | None = None) -> None:
@@ -73,6 +77,7 @@ def on_ws_connect():
 @socketio.on("disconnect")
 def on_ws_disconnect():
     logger.debug("WebSocket client disconnected: %s", request.sid)
+    _cleanup_web_session(request.sid)
 
 
 # ── Sysop room join/leave ─────────────────────────────────────────────────────
@@ -115,7 +120,6 @@ def on_leave_admin(_data):
     leave_room(_SYSOP_ROOM)
 
 
-# ── Asyncio → SocketIO bridge ─────────────────────────────────────────────────
 
 def start_bridge() -> None:
     """
@@ -176,3 +180,137 @@ def _bridge_loop() -> None:
                 bbs_engine.plugin_stats_snapshot(),
                 room=_SYSOP_ROOM,
             )
+
+
+# ── Web terminal handlers ─────────────────────────────────────────────────────
+
+@socketio.on("web_terminal_connect")
+def on_web_terminal_connect(_data):
+    """
+    Sysop requests a new BBS session in the browser terminal.
+    Creates a synthetic Connection wired via queues, starts the BBS session
+    as an asyncio task, and launches a drain thread to push output to xterm.js.
+    """
+    from flask import session as flask_session
+    if not flask_session.get("sysop"):
+        emit("web_terminal_error", {"message": "Not authorized"})
+        return
+
+    sid = request.sid
+
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        emit("web_terminal_error", {"message": "BBS engine not running"})
+        return
+
+    if sid in _web_sessions:
+        emit("web_terminal_error", {"message": "Terminal session already active"})
+        return
+
+    output_queue: stdlib_queue.Queue = stdlib_queue.Queue()  # unbounded
+
+    try:
+        reader = bbs_engine.start_web_session(sid, output_queue)
+    except Exception as exc:
+        logger.exception("Failed to start web terminal session for %s", sid)
+        emit("web_terminal_error", {"message": f"Failed to start session: {exc}"})
+        return
+
+    drain_thread = threading.Thread(
+        target=_drain_web_output,
+        args=(sid, output_queue),
+        daemon=True,
+        name=f"web-drain:{sid[:8]}",
+    )
+    drain_thread.start()
+
+    _web_sessions[sid] = {
+        "reader": reader,
+        "output_queue": output_queue,
+        "drain_thread": drain_thread,
+    }
+    emit("web_terminal_ready", {})
+
+
+@socketio.on("web_terminal_input")
+def on_web_terminal_input(data):
+    """Forward browser keystrokes into the BBS session's asyncio StreamReader."""
+    sid = request.sid
+    state = _web_sessions.get(sid)
+    if not state:
+        return
+
+    raw = data.get("data", "")
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="replace")
+    if not raw:
+        return
+
+    from server.app import bbs_engine
+    if bbs_engine is not None:
+        bbs_engine.feed_web_input(state["reader"], raw)
+
+
+@socketio.on("web_terminal_resize")
+def on_web_terminal_resize(data):
+    """Update terminal dimensions when the browser window is resized."""
+    sid = request.sid
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        return
+    try:
+        cols = max(10, int(data.get("cols", 80)))
+        rows = max(4, int(data.get("rows", 24)))
+    except (TypeError, ValueError):
+        return
+    bbs_engine.resize_web_session(sid, cols, rows)
+
+
+@socketio.on("web_terminal_disconnect")
+def on_web_terminal_disconnect(_data):
+    """Sysop closed the terminal tab / clicked Disconnect."""
+    _cleanup_web_session(request.sid)
+
+
+# ── Web terminal helpers ──────────────────────────────────────────────────────
+
+def _cleanup_web_session(sid: str) -> None:
+    """
+    Close the BBS session for *sid* if one exists.
+    Safe to call even if no web session is active for that sid.
+    """
+    state = _web_sessions.pop(sid, None)
+    if not state:
+        return
+    from server.app import bbs_engine
+    if bbs_engine is not None:
+        bbs_engine.close_web_input(state["reader"])
+
+
+def _drain_web_output(
+    sid: str,
+    output_queue: "stdlib_queue.Queue[bytes | None]",
+) -> None:
+    """
+    Background thread: drain BBS output from *output_queue* and emit
+    'web_terminal_output' Socket.IO events to the specific browser client.
+    Exits when a None sentinel is received (session ended).
+    """
+    while True:
+        try:
+            data = output_queue.get(timeout=1.0)
+        except stdlib_queue.Empty:
+            continue
+
+        if data is None:
+            # Session ended — notify browser and exit thread.
+            safe_emit("web_terminal_closed", {}, room=sid)
+            _web_sessions.pop(sid, None)
+            break
+
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            text = data.decode("latin-1", errors="replace")
+        safe_emit("web_terminal_output", {"data": text}, room=sid)
+

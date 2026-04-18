@@ -19,6 +19,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 import queue as stdlib_queue
+from concurrent.futures import Future as ConcurrentFuture
 
 from bbs.config import BBSConfig
 from bbs.core.auth import AuthService
@@ -67,6 +68,12 @@ class BBSEngine:
         # loop" when awaited inside the real loop.)
         self._stop_event: Optional[asyncio.Event] = None
 
+        # Set once run() starts; used to schedule work from Flask threads.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Maps Socket.IO SID → BBS session_id for web terminal sessions.
+        self._web_session_map: dict[str, str] = {}
+
     # ── Startup & shutdown ────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -74,6 +81,7 @@ class BBSEngine:
         # Create the stop event here so it is bound to the running loop
         # (fixes Python 3.9 "Future attached to a different loop" error).
         self._stop_event = asyncio.Event()
+        self._loop = asyncio.get_running_loop()
 
         logger.info("BBS engine starting — %s", self.cfg.full_callsign)
 
@@ -246,3 +254,99 @@ class BBSEngine:
 
     def recent_log_lines(self, n: int = 100) -> list[str]:
         return list(self.log_buffer)[-n:]
+
+    # ── Web terminal API (called from Flask-SocketIO threads) ─────────────────
+
+    async def _create_and_run_web_session(
+        self,
+        sid: str,
+        output_queue: "stdlib_queue.Queue[bytes | None]",
+    ) -> asyncio.StreamReader:
+        """
+        Run inside the asyncio event loop.  Creates a synthetic Connection for
+        a web terminal, registers it, and fires off the session as a new task.
+        Returns the StreamReader so callers can feed keystrokes into it.
+        """
+        from bbs.transport.web import WebWriter
+
+        reader = asyncio.StreamReader()
+        writer = WebWriter(output_queue)
+        conn = Connection(
+            remote_addr=f"ws:{sid[:8]}",
+            reader=reader,
+            writer=writer,
+            transport_id="web",
+        )
+
+        if self.cfg.max_users > 0 and len(self._sessions) >= self.cfg.max_users:
+            writer.write(b"\r\nSorry, the BBS is full. Try again later.\r\n")
+            output_queue.put_nowait(None)  # stop drain thread
+            return reader
+
+        session = BBSSession(
+            conn=conn,
+            cfg=self.cfg,
+            auth_service=self.auth_service,
+            plugin_registry=self.plugin_registry,
+        )
+        self._sessions[session.session_id] = session
+        self._web_session_map[sid] = session.session_id
+
+        task = asyncio.create_task(
+            self._run_web_session_task(session, sid, output_queue),
+            name=f"web-session:{sid[:8]}",
+        )
+        self._session_tasks[session.session_id] = task
+        return reader
+
+    async def _run_web_session_task(
+        self,
+        session: BBSSession,
+        sid: str,
+        output_queue: "stdlib_queue.Queue[bytes | None]",
+    ) -> None:
+        """Wrapper task: run a web session then signal the drain thread."""
+        try:
+            await self._run_session(session)
+        finally:
+            self._web_session_map.pop(sid, None)
+            output_queue.put_nowait(None)  # sentinel → drain thread exits
+
+    def start_web_session(
+        self,
+        sid: str,
+        output_queue: "stdlib_queue.Queue[bytes | None]",
+    ) -> asyncio.StreamReader:
+        """
+        Thread-safe.  Start a web BBS session and return the reader that
+        callers use to feed keystrokes.  Blocks until the asyncio setup is
+        complete (fast; the session itself runs as a background task).
+        """
+        if self._loop is None:
+            raise RuntimeError("BBSEngine not running")
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_and_run_web_session(sid, output_queue), self._loop
+        )
+        return future.result(timeout=5.0)
+
+    def feed_web_input(self, reader: asyncio.StreamReader, data: bytes) -> None:
+        """Thread-safe.  Push bytes from the browser into the session's reader."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(reader.feed_data, data)
+
+    def close_web_input(self, reader: asyncio.StreamReader) -> None:
+        """Thread-safe.  Send EOF to the session reader, ending the session."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(reader.feed_eof)
+
+    def resize_web_session(self, sid: str, cols: int, rows: int) -> None:
+        """
+        Thread-safe.  Update terminal dimensions for a running web session.
+        Simple attribute writes are safe under the CPython GIL.
+        """
+        session_id = self._web_session_map.get(sid)
+        if session_id:
+            session = self._sessions.get(session_id)
+            if session and hasattr(session, "term"):
+                session.term.width = cols
+                session.term.height = rows

@@ -133,16 +133,20 @@ class ChatPlugin(BBSPlugin):
         current_room = default_room
         inbox = current_room.join(callsign)
 
-        await term.sendln(f"Entered chat room: {current_room.name}")
-        await term.sendln(f"Users here: {', '.join(current_room.who())}")
+        await term.sendln(
+            f"{term.label('Entered chat room:', 'meta')} {term.style(current_room.name, 'accent', bold=True)}"
+        )
+        await term.sendln(term.field("Users here:", ", ".join(current_room.who()), "meta"))
         # Show recent history
         history = current_room.get_history()
         if history:
-            await term.sendln("--- recent ---")
+            await term.sendln(term.note("--- recent ---"))
             for line in history[-10:]:
                 await term.sendln(line)
-            await term.sendln("--- end ---")
-        await term.sendln("Commands: /WHO  /MSG <call> <text>  /JOIN <room>  /ROOMS /QUIT")
+            await term.sendln(term.note("--- end ---"))
+        await term.sendln(
+            f"{term.label('Commands:', 'meta')} /WHO  /MSG <call> <text>  /JOIN <room>  /ROOMS /QUIT"
+        )
         await term.sendln()
 
         try:
@@ -165,7 +169,7 @@ class ChatPlugin(BBSPlugin):
                 try:
                     line = await asyncio.wait_for(inbox.get(), timeout=0.5)
                     await term.sendln(line)
-                    await term.send(f"{room.name}> ")
+                    await term.send(term.prompt(f"{room.name}> "))
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -177,7 +181,7 @@ class ChatPlugin(BBSPlugin):
 
         try:
             while True:
-                await term.send(f"{room.name}> ")
+                await term.send(term.prompt(f"{room.name}> "))
                 line = await term.readline(max_len=MAX_MSG_LEN, echo=False)
                 session.touch()
 
@@ -192,31 +196,38 @@ class ChatPlugin(BBSPlugin):
                         break
                     elif cmd == "/WHO":
                         members = room.who()
-                        await term.sendln(f"Users in {room.name}: {', '.join(members)}")
+                        await term.sendln(
+                            term.field(f"Users in {room.name}:", ", ".join(members), "meta")
+                        )
                     elif cmd == "/MSG":
                         if len(cmd_parts) < 3:
-                            await term.sendln("Usage: /MSG <callsign> <message>")
+                            await term.sendln(term.warn("Usage: /MSG <callsign> <message>"))
                         else:
                             dest = cmd_parts[1].upper()
                             text = cmd_parts[2]
                             if not room.private_msg(callsign, dest, text):
-                                await term.sendln(f"{dest} is not in this room.")
+                                await term.sendln(term.warn(f"{dest} is not in this room."))
                     elif cmd == "/JOIN":
                         if len(cmd_parts) < 2:
-                            await term.sendln("Usage: /JOIN <room>")
+                            await term.sendln(term.warn("Usage: /JOIN <room>"))
                         else:
                             new_name = cmd_parts[1].lower()
                             new_room = get_or_create_room(new_name)
                             room.leave(callsign)
                             room = new_room
                             inbox = room.join(callsign)
-                            await term.sendln(f"Joined room: {room.name}")
-                            await term.sendln(f"Users here: {', '.join(room.who())}")
+                            await term.sendln(
+                                f"{term.ok('Joined room:')} {term.style(room.name, 'accent', bold=True)}"
+                            )
+                            await term.sendln(term.field("Users here:", ", ".join(room.who()), "meta"))
                     elif cmd == "/ROOMS":
                         for r in _rooms.values():
-                            await term.sendln(f"  {r.name:<12} {r.member_count} user(s)  {r.description}")
+                            await term.sendln(
+                                f"  {term.style(f'{r.name:<12}', 'accent', bold=True)} "
+                                f"{term.note(f'{r.member_count} user(s)')}  {r.description}"
+                            )
                     else:
-                        await term.sendln("Unknown command. Try /WHO /MSG /JOIN /ROOMS /QUIT")
+                        await term.sendln(term.warn("Unknown command. Try /WHO /MSG /JOIN /ROOMS /QUIT"))
                 else:
                     room.broadcast(callsign, line)
         finally:

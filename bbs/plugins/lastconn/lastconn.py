@@ -47,13 +47,13 @@ class LastConnectionsPlugin(BBSPlugin):
         )
 
         if not rows:
-            await term.sendln("No connections recorded yet.")
+            await term.sendln(term.note("No connections recorded yet."))
             await term.sendln()
             return
 
         header = f"LAST CONNECTIONS  (past {days} days, {len(rows)} stations)"
-        await term.sendln(header)
-        await term.sendln("-" * min(len(header), term.width))
+        await term.sendln(term.label(header, "meta"))
+        await term.sendln(term.note("-" * min(len(header), term.width)))
 
         lines = []
         col_call = 9
@@ -69,7 +69,13 @@ class LastConnectionsPlugin(BBSPlugin):
             )
             trn = str(row["transport"]).ljust(col_trn)[:col_trn]
             lvl = _AUTH_LABELS.get(row["auth_level"], "?")
-            lines.append(f"{call} {first} {last} {trn} {lvl}")
+            if row.get("connected"):
+                last_disp = term.ok(last)
+                call_disp = term.style(call, "accent", bold=True)
+            else:
+                last_disp = term.note(last)
+                call_disp = call
+            lines.append(f"{call_disp} {term.note(first)} {last_disp} {trn} {lvl}")
 
         # Column header
         col_hdr = (
@@ -78,8 +84,8 @@ class LastConnectionsPlugin(BBSPlugin):
             f"{'LAST SEEN':<{col_ts}} "
             f"{'TRANSPORT':<{col_trn}} AUTH"
         )
-        await term.sendln(col_hdr)
-        await term.sendln("-" * min(len(col_hdr), term.width))
+        await term.sendln(term.label(col_hdr, "meta"))
+        await term.sendln(term.note("-" * min(len(col_hdr), term.width)))
         await term.flush()
 
         await term.paginate(lines)

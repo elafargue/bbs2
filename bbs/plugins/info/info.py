@@ -67,8 +67,10 @@ class InfoPlugin(BBSPlugin):
         message = (row[0] if row else "")
 
         if not message:
-            await term.sendln("No BBS info message has been configured yet.")
+            await term.sendln(term.note("No BBS info message has been configured yet."))
         else:
+            await term.sendln(term.label("BBS INFO", "meta"))
+            await term.sendln(term.note("--------"))
             await term.paginate(message.splitlines())
 
         if not session.auth.is_sysop:
@@ -76,7 +78,7 @@ class InfoPlugin(BBSPlugin):
 
         # Sysop: offer to edit
         await term.sendln("")
-        await term.send("Edit info message? [Y/N]: ")
+        await term.send(term.prompt("Edit info message? [Y/N]: "))
         choice = (await term.readline(max_len=2, timeout=60)).upper().strip()
         if choice != "Y":
             return
@@ -88,9 +90,9 @@ class InfoPlugin(BBSPlugin):
         term = session.term
         db = session.db
 
-        await term.sendln("Enter new info message.")
-        await term.sendln("Type each line and press ENTER.  Type '/EX' to finish,")
-        await term.sendln("or '/ABORT' on the first line to cancel.")
+        await term.sendln(term.label("Enter new info message.", "meta"))
+        await term.sendln(term.note("Type each line and press ENTER.  Type '/EX' to finish,"))
+        await term.sendln(term.note("or '/ABORT' on the first line to cancel."))
         await term.sendln("")
 
         lines: list[str] = []
@@ -98,7 +100,7 @@ class InfoPlugin(BBSPlugin):
             await term.send(f"{len(lines) + 1:2}: ")
             line = await term.readline(max_len=200, timeout=120)
             if len(lines) == 0 and line.upper().strip() == "/ABORT":
-                await term.sendln("Aborted — no changes made.")
+                await term.sendln(term.note("Aborted — no changes made."))
                 return
             if line.upper().strip() == "/EX":
                 break
@@ -107,7 +109,7 @@ class InfoPlugin(BBSPlugin):
         new_message = "\n".join(lines)
         await db.execute("UPDATE bbs_info SET message = ? WHERE id = 1", (new_message,))
         await db.commit()
-        await term.sendln("Info message updated.")
+        await term.sendln(term.ok("Info message updated."))
 
     def get_stats(self) -> dict[str, Any]:
         return {

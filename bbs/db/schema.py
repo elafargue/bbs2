@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS users (
     -- Failed auth attempt tracking
     auth_failures   INTEGER NOT NULL DEFAULT 0,
     locked_until    INTEGER,                       -- Unix timestamp or NULL
+    -- Terminal presentation preference
+    color_mode      TEXT    NOT NULL DEFAULT 'off',
     -- Timestamps
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     last_seen       INTEGER
@@ -121,7 +123,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_VERSION = 4
+_CURRENT_VERSION = 5
 
 
 async def init_db(db_path: str) -> None:
@@ -205,6 +207,16 @@ async def _run_migrations(db: aiosqlite.Connection, from_version: int) -> None:
             pass
         await db.commit()
         from_version = 4
+
+    if from_version < 5:
+        try:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'off'"
+            )
+        except Exception:
+            pass
+        await db.commit()
+        from_version = 5
 
     await db.execute(
         "INSERT INTO schema_version (version) VALUES (?)", (_CURRENT_VERSION,)

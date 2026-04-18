@@ -256,10 +256,18 @@ class BulletinsPlugin(BBSPlugin):
             return await cur.fetchall()
 
     async def _show_areas_index(self, term: Any, areas: list) -> None:
-        lines = ["", "  #   NAME        DEFAULT  DESCRIPTION", "  " + "-" * 50]
+        lines = [
+            "",
+            term.label("  #   NAME        DEFAULT  DESCRIPTION", "meta"),
+            term.note("  " + "-" * 50),
+        ]
         for i, a in enumerate(areas, 1):
             dflt = "*" if a["is_default"] else " "
-            lines.append(f"  {i:2}.  {a['name']:<10}  [{dflt}]    {a['description']}")
+            name_padded = f"{a['name']:<10}"
+            lines.append(
+                f"  {i:2}.  {term.style(name_padded, 'accent', bold=True)}  "
+                f"[{term.style(dflt, 'warning', bold=True) if dflt == '*' else ' '}]    {a['description']}"
+            )
         lines.append("")
         await term.paginate(lines)
 
@@ -272,13 +280,13 @@ class BulletinsPlugin(BBSPlugin):
             return
         import re as _re
         if not _re.match(r'^[A-Z0-9][A-Z0-9\-]{0,19}$', name):
-            await term.sendln("Invalid name — use uppercase letters, digits, hyphens only.")
+            await term.sendln(term.warn("Invalid name — use uppercase letters, digits, hyphens only."))
             return
         await term.send("Description: ")
         desc = (await term.readline(max_len=80)).strip()
         await term.send(f"Create area '{name}'? [Y/N]: ")
         if (await term.readline(max_len=2)).upper().strip() != "Y":
-            await term.sendln("Cancelled.")
+            await term.sendln(term.note("Cancelled."))
             return
         try:
             await db.execute(
@@ -286,9 +294,9 @@ class BulletinsPlugin(BBSPlugin):
                 (name, desc),
             )
             await db.commit()
-            await term.sendln(f"Area '{name}' created.")
+            await term.sendln(term.ok(f"Area '{name}' created."))
         except Exception as exc:
-            await term.sendln(f"Error: {exc}")
+            await term.sendln(f"{term.error('Error:')} {exc}")
 
     async def _sysop_edit_area(self, session: "BBSSession", numarg: Optional[str]) -> None:
         term = session.term
@@ -305,10 +313,12 @@ class BulletinsPlugin(BBSPlugin):
             return
         idx = int(numarg) - 1
         if idx < 0 or idx >= len(areas):
-            await term.sendln("Invalid selection.")
+            await term.sendln(term.warn("Invalid selection."))
             return
         area = areas[idx]
-        await term.sendln(f"Editing '{area['name']}' — press ENTER to keep current value.")
+        await term.sendln(
+            f"{term.label('Editing', 'meta')} '{area['name']}' — press ENTER to keep current value."
+        )
         await term.send(f"Name [{area['name']}]: ")
         new_name = (await term.readline(max_len=20)).upper().strip() or area["name"]
         await term.send(f"Description [{area['description']}]: ")
@@ -318,7 +328,7 @@ class BulletinsPlugin(BBSPlugin):
             (new_name, new_desc, area["id"]),
         )
         await db.commit()
-        await term.sendln(f"Area updated.")
+        await term.sendln(term.ok("Area updated."))
 
     async def _sysop_kill_area(self, session: "BBSSession", numarg: Optional[str]) -> None:
         term = session.term
@@ -335,17 +345,17 @@ class BulletinsPlugin(BBSPlugin):
             return
         idx = int(numarg) - 1
         if idx < 0 or idx >= len(areas):
-            await term.sendln("Invalid selection.")
+            await term.sendln(term.warn("Invalid selection."))
             return
         area = areas[idx]
         await term.send(f"Delete '{area['name']}' and ALL its messages? [Y/N]: ")
         if (await term.readline(max_len=2)).upper().strip() != "Y":
-            await term.sendln("Cancelled.")
+            await term.sendln(term.note("Cancelled."))
             return
         await db.execute("PRAGMA foreign_keys=ON")
         await db.execute("DELETE FROM bulletin_areas WHERE id=?", (area["id"],))
         await db.commit()
-        await term.sendln(f"Area '{area['name']}' deleted.")
+        await term.sendln(term.ok(f"Area '{area['name']}' deleted."))
 
     async def _sysop_set_default(self, session: "BBSSession", numarg: Optional[str]) -> None:
         term = session.term
@@ -370,13 +380,13 @@ class BulletinsPlugin(BBSPlugin):
             return
         idx = int(numarg) - 1
         if idx < 0 or idx >= len(areas):
-            await term.sendln("Invalid selection.")
+            await term.sendln(term.warn("Invalid selection."))
             return
         area = areas[idx]
         await db.execute("UPDATE bulletin_areas SET is_default=0")
         await db.execute("UPDATE bulletin_areas SET is_default=1 WHERE id=?", (area["id"],))
         await db.commit()
-        await term.sendln(f"'{area['name']}' is now the default area.")
+        await term.sendln(term.ok(f"'{area['name']}' is now the default area."))
 
     # ── List areas ────────────────────────────────────────────────────────────
 
@@ -396,19 +406,22 @@ class BulletinsPlugin(BBSPlugin):
             await term.sendln("No bulletin areas defined.")
             return None, ""
 
-        lines = ["", "BULLETIN AREAS", "-" * 40]
+        lines = ["", term.label("BULLETIN AREAS", "meta"), term.note("-" * 40)]
         for i, row in enumerate(areas, 1):
-            lines.append(f"  {i:2}. {row['name']:<10} {row['description']}")
+            name_padded = f"{row['name']:<10}"
+            lines.append(
+                f"  {i:2}. {term.style(name_padded, 'accent', bold=True)} {row['description']}"
+            )
         lines += ["", "Enter area number (or ENTER to cancel): "]
         await term.paginate(lines[:-1])
-        await term.send(lines[-1])
+        await term.send(term.prompt(lines[-1]))
 
         choice_str = (await term.readline(max_len=4)).strip()
         if not choice_str.isdigit():
             return None, ""
         idx = int(choice_str) - 1
         if idx < 0 or idx >= len(areas):
-            await term.sendln("Invalid selection.")
+            await term.sendln(term.warn("Invalid selection."))
             return None, ""
 
         selected = areas[idx]
@@ -434,7 +447,12 @@ class BulletinsPlugin(BBSPlugin):
     ) -> None:
         hdr = f"{'#':<5} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
         sep = "-" * len(hdr)
-        lines = ["", f"{area_name} — {len(messages)} message(s)", hdr, sep]
+        lines = [
+            "",
+            f"{term.label(area_name, 'meta')} {term.note(f'— {len(messages)} message(s)')}",
+            term.label(hdr, 'meta'),
+            term.note(sep),
+        ]
         for m in messages:
             to = str(m["to_call"]).upper()
             st = "P" if any(c.isdigit() for c in to) else "B"
@@ -442,8 +460,16 @@ class BulletinsPlugin(BBSPlugin):
             date = time.strftime("%m/%d/%Y %H:%M:%S", time.localtime(m["created_at"]))
             subj = str(m["subject"])[:self._max_subject]
             from_disp = m["from_call"] + ("*" if m["authenticated"] else "")
+            num_str   = f"{m['msg_number']:<5}"
+            st_str    = f"{st:<2}"
+            from_str  = f"{from_disp:<9}"
+            date_str  = f"{date:<20}"
+            is_auth   = bool(m["authenticated"])
             lines.append(
-                f"{m['msg_number']:<5} {st:<2} {size:<6} {to:<7} {from_disp:<9} {date:<20} {subj}"
+                f"{term.style(num_str, 'accent', bold=True)} "
+                f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
+                f"{size:<6} {to:<7} {term.style(from_str, 'accent' if is_auth else 'meta', bold=is_auth)} "
+                f"{term.note(date_str)} {subj}"
             )
         lines.append("")
         await term.paginate(lines)
@@ -457,10 +483,10 @@ class BulletinsPlugin(BBSPlugin):
         while True:
             messages = await self._fetch_messages(session.db, area_id)
             if not messages:
-                await term.sendln(f"No messages in {area_name}.")
+                await term.sendln(term.note(f"No messages in {area_name}."))
                 return
             await self._show_message_index(term, area_name, messages)
-            await term.send("R# / D# / ENTER to return:")
+            await term.send(term.prompt("R# / D# / ENTER to return: "))
             raw = (await term.readline(max_len=8)).upper().strip()
             if not raw:
                 return
@@ -495,13 +521,13 @@ class BulletinsPlugin(BBSPlugin):
             messages = await self._fetch_messages(session.db, area_id)
         target = next((m for m in messages if m["msg_number"] == msg_num), None)
         if not target:
-            await term.sendln("Message not found.")
+            await term.sendln(term.warn("Message not found."))
             return
         await self._display_message_body(session, target)
 
         # Compact post-read prompt — no need to redisplay the full menu
         while True:
-            await term.send("L / R# / D# or ENTER: ")
+            await term.send(term.prompt("L / R# / D# or ENTER: "))
             raw = (await term.readline(max_len=8)).upper().strip()
             if not raw:
                 return
@@ -511,7 +537,7 @@ class BulletinsPlugin(BBSPlugin):
                 if messages:
                     await self._show_message_index(term, area_name, messages)
                 else:
-                    await term.sendln(f"No messages in {area_name}.")
+                    await term.sendln(term.note(f"No messages in {area_name}."))
             elif cmd == "R":
                 if not narg or not narg.isdigit():
                     await term.send("Message#: ")
@@ -522,7 +548,7 @@ class BulletinsPlugin(BBSPlugin):
                     if t:
                         await self._display_message_body(session, t)
                     else:
-                        await term.sendln("Message not found.")
+                        await term.sendln(term.warn("Message not found."))
             elif cmd == "D":
                 await self._delete_message(session, area_id, narg)
                 messages = await self._fetch_messages(session.db, area_id)
@@ -537,9 +563,13 @@ class BulletinsPlugin(BBSPlugin):
         auth_mark = "*" if target["authenticated"] else ""
         msg_lines = [
             "",
-            f"From: {target['from_call']}{auth_mark}  To: {target['to_call']}  Date: {ts}",
-            f"Subj: {target['subject']}",
-            "-" * 60,
+            (
+                f"{term.label('From:', 'meta')} {term.style(str(target['from_call']) + auth_mark, 'accent', bold=bool(auth_mark))}  "
+                f"{term.label('To:', 'meta')} {target['to_call']}  "
+                f"{term.label('Date:', 'meta')} {ts}"
+            ),
+            f"{term.label('Subj:', 'meta')} {term.style(str(target['subject']), 'accent', bold=True)}",
+            term.note("-" * 60),
         ]
         msg_lines += str(target["body"]).splitlines()
         msg_lines.append("")
@@ -572,7 +602,7 @@ class BulletinsPlugin(BBSPlugin):
         via_radio = session.conn.transport_id in _RADIO_TRANSPORTS
         if not (via_radio and session.auth.is_identified) and not session.auth.is_authenticated:
             await term.sendln(
-                "AUTH required to post. Type 'A' at main menu to authenticate."
+                term.warn("AUTH required to post. Type 'A' at main menu to authenticate.")
             )
             return
         is_authenticated_post = session.auth.is_authenticated
@@ -587,7 +617,7 @@ class BulletinsPlugin(BBSPlugin):
         await term.send(f"Subject ({self._max_subject} chars max): ")
         subject = (await term.readline(max_len=self._max_subject)).strip()
         if not subject:
-            await term.sendln("Cancelled.")
+            await term.sendln(term.note("Cancelled."))
             return
 
         # Gather To: (default ALL)
@@ -595,8 +625,8 @@ class BulletinsPlugin(BBSPlugin):
         to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
 
         # Gather body — /EX on its own line ends input (classic BBS convention)
-        await term.sendln(f"Enter message body ({self._max_body} bytes max).")
-        await term.sendln("Type /EX on a line by itself when done:")
+        await term.sendln(term.label(f"Enter message body ({self._max_body} bytes max).", 'meta'))
+        await term.sendln(term.note("Type /EX on a line by itself when done:"))
         body_lines = []
         total_bytes = 0
         while True:
@@ -606,7 +636,7 @@ class BulletinsPlugin(BBSPlugin):
                 break
             total_bytes += len(line) + 1
             if total_bytes > self._max_body:
-                await term.sendln("[Body limit reached]")
+                await term.sendln(term.warn("[Body limit reached]"))
                 break
             body_lines.append(line)
 
@@ -616,7 +646,7 @@ class BulletinsPlugin(BBSPlugin):
         await term.send("Post message? [Y/N]: ")
         confirm = (await term.readline(max_len=2)).upper().strip()
         if confirm != "Y":
-            await term.sendln("Cancelled.")
+            await term.sendln(term.note("Cancelled."))
             return
 
         db.row_factory = aiosqlite.Row
@@ -636,7 +666,7 @@ class BulletinsPlugin(BBSPlugin):
              1 if is_authenticated_post else 0),
         )
         await db.commit()
-        await term.sendln(f"Message #{next_num} posted to {area_name}.")
+        await term.sendln(term.ok(f"Message #{next_num} posted to {area_name}."))
 
     # ── Delete message ────────────────────────────────────────────────────────
 
@@ -647,7 +677,7 @@ class BulletinsPlugin(BBSPlugin):
         db = session.db
 
         if not session.auth.is_authenticated:
-            await term.sendln("AUTH required to delete messages.")
+            await term.sendln(term.warn("AUTH required to delete messages."))
             return
 
         if not numarg or not numarg.isdigit():
@@ -665,7 +695,7 @@ class BulletinsPlugin(BBSPlugin):
             row = await cur.fetchone()
 
         if not row:
-            await term.sendln("Message not found.")
+            await term.sendln(term.warn("Message not found."))
             return
 
         # Only own message or sysop
@@ -673,14 +703,14 @@ class BulletinsPlugin(BBSPlugin):
             row["from_call"].upper() != session.auth.callsign.upper()
             and not session.auth.is_sysop
         ):
-            await term.sendln("You can only delete your own messages.")
+            await term.sendln(term.warn("You can only delete your own messages."))
             return
 
         await db.execute(
             "UPDATE bulletin_messages SET deleted=1 WHERE id=?", (row["id"],)
         )
         await db.commit()
-        await term.sendln(f"Message #{msg_num} deleted.")
+        await term.sendln(term.ok(f"Message #{msg_num} deleted."))
 
     # ── Web stats ─────────────────────────────────────────────────────────────
 
