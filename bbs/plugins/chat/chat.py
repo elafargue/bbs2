@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Callable, Awaitable, Optional, TYPE_CHECKING
 
 import aiosqlite
 
@@ -31,7 +31,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_MSG_LEN = 160
-HISTORY_LINES = 50  # overridden by config
+HISTORY_LINES = 20  # overridden by config
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_history (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    room  TEXT    NOT NULL,
+    ts    INTEGER NOT NULL,
+    line  TEXT    NOT NULL
+);
+"""
 
 
 class ChatRoom:
@@ -44,6 +53,9 @@ class ChatRoom:
         self._members: dict[str, asyncio.Queue[str]] = {}
         self._history: list[str] = []
         self._history_size = HISTORY_LINES
+        # Optional async callback: (line: str) -> Awaitable[None]
+        # Set by ChatPlugin after initialize(); fires on every broadcast.
+        self._persist_cb: Optional[Callable[[str], Awaitable[None]]] = None
 
     def join(self, callsign: str) -> asyncio.Queue[str]:
         q: asyncio.Queue[str] = asyncio.Queue()
@@ -83,6 +95,13 @@ class ChatRoom:
         self._history.append(line)
         if len(self._history) > self._history_size:
             self._history.pop(0)
+        # Persist asynchronously if a callback is registered.
+        if self._persist_cb is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._persist_cb(line))
+            except RuntimeError:
+                pass  # no running loop (e.g. during tests that don't use the plugin)
         for call, q in self._members.items():
             if exclude and call == exclude.upper():
                 continue
@@ -118,15 +137,102 @@ class ChatPlugin(BBSPlugin):
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
         await super().initialize(cfg, db_path)
         global HISTORY_LINES
-        HISTORY_LINES = cfg.get("history_lines", 50)
+        HISTORY_LINES = cfg.get("history_lines", 20)
 
         default_rooms = cfg.get("default_rooms", [{"name": "main", "description": "Main chat room"}])
         for room_cfg in default_rooms:
             get_or_create_room(room_cfg["name"], room_cfg.get("description", ""))
 
+        # Create schema and restore persisted history into each room.
+        async with aiosqlite.connect(db_path, timeout=30) as db:
+            await db.executescript(_SCHEMA)
+            await db.commit()
+            for room in _rooms.values():
+                room._history_size = HISTORY_LINES
+                async with db.execute(
+                    """
+                    SELECT line FROM (
+                        SELECT id, line FROM chat_history WHERE room=?
+                        ORDER BY id DESC LIMIT ?
+                    ) ORDER BY id ASC
+                    """,
+                    (room.name, HISTORY_LINES),
+                ) as cur:
+                    rows = await cur.fetchall()
+                room._history = [r[0] for r in rows]
+                room._persist_cb = self._make_persist_cb(room.name)
+
+    def _make_persist_cb(self, room_name: str) -> Callable[[str], Awaitable[None]]:
+        """Return an async callable that persists one chat line for *room_name*."""
+        async def _persist(line: str) -> None:
+            try:
+                async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                    await db.execute(
+                        "INSERT INTO chat_history (room, ts, line) VALUES (?, ?, ?)",
+                        (room_name, int(time.time()), line),
+                    )
+                    # Trim to the configured limit.
+                    await db.execute(
+                        """
+                        DELETE FROM chat_history
+                        WHERE room = ? AND id NOT IN (
+                            SELECT id FROM chat_history
+                            WHERE room = ?
+                            ORDER BY id DESC
+                            LIMIT ?
+                        )
+                        """,
+                        (room_name, room_name, HISTORY_LINES),
+                    )
+                    await db.commit()
+            except Exception:
+                logger.exception("chat: failed to persist message for room %s", room_name)
+        return _persist
+
+    async def _delete_message(
+        self, room_name: str, msg_id: int
+    ) -> Optional[str]:
+        """Delete a message from DB and in-memory history.  Returns the deleted
+        line text, or None if the ID was not found in that room."""
+        if not self._db_path:
+            return None
+        async with aiosqlite.connect(self._db_path, timeout=30) as db:
+            async with db.execute(
+                "SELECT line FROM chat_history WHERE id=? AND room=?",
+                (msg_id, room_name),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                return None
+            line_text: str = row[0]
+            await db.execute("DELETE FROM chat_history WHERE id=?", (msg_id,))
+            await db.commit()
+        room = _rooms.get(room_name)
+        if room and line_text in room._history:
+            room._history.remove(line_text)
+        return line_text
+
+    async def _delete_room(self, room_name: str) -> bool:
+        """Delete a chat room — removes all DB history and the in-memory room.
+        Returns True if the room existed."""
+        if not self._db_path:
+            return False
+        async with aiosqlite.connect(self._db_path, timeout=30) as db:
+            await db.execute("DELETE FROM chat_history WHERE room=?", (room_name,))
+            await db.commit()
+        room = _rooms.pop(room_name, None)
+        if room is None:
+            return False
+        room._broadcast(
+            f"*** Room {room_name} has been deleted by the sysop. Use /JOIN to switch rooms. ***",
+            exclude=None,
+        )
+        return True
+
     async def handle_session(self, session: "BBSSession") -> None:
         term = session.term
         callsign = session.auth.callsign
+        is_sysop = session.auth.is_sysop
 
         # Join default room
         default_room = next(iter(_rooms.values())) if _rooms else get_or_create_room("main")
@@ -137,20 +243,42 @@ class ChatPlugin(BBSPlugin):
             f"{term.label('Entered chat room:', 'meta')} {term.style(current_room.name, 'accent', bold=True)}"
         )
         await term.sendln(term.field("Users here:", ", ".join(current_room.who()), "meta"))
-        # Show recent history
-        history = current_room.get_history()
-        if history:
+        # Show recent history — sysop sees message IDs so they can /DEL them
+        if self._db_path:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                async with db.execute(
+                    """
+                    SELECT id, line FROM (
+                        SELECT id, line FROM chat_history WHERE room=?
+                        ORDER BY id DESC LIMIT ?
+                    ) ORDER BY id ASC
+                    """,
+                    (current_room.name, HISTORY_LINES),
+                ) as cur:
+                    db_history = await cur.fetchall()
+        else:
+            db_history = []
+        plain_history = current_room.get_history()
+        if db_history or plain_history:
             await term.sendln(term.note("--- recent ---"))
-            for line in history[-10:]:
-                await term.sendln(line)
+            if db_history:
+                for row_id, line in db_history:
+                    if is_sysop:
+                        await term.sendln(f"{term.note(f'[{row_id}]')} {line}")
+                    else:
+                        await term.sendln(line)
+            else:
+                for line in plain_history[-10:]:
+                    await term.sendln(line)
             await term.sendln(term.note("--- end ---"))
-        await term.sendln(
-            f"{term.label('Commands:', 'meta')} /WHO  /MSG <call> <text>  /JOIN <room>  /ROOMS /QUIT"
-        )
+        cmds = "/WHO  /MSG <call> <text>  /JOIN <room>  /ROOMS /QUIT"
+        if is_sysop:
+            cmds += "  /HIST  /DEL <id>  /DELROOM <room>"
+        await term.sendln(f"{term.label('Commands:', 'meta')} {cmds}")
         await term.sendln()
 
         try:
-            await self._chat_loop(session, current_room, inbox, callsign)
+            await self._chat_loop(session, current_room, inbox, callsign, is_sysop)
         finally:
             current_room.leave(callsign)
 
@@ -160,6 +288,7 @@ class ChatPlugin(BBSPlugin):
         room: ChatRoom,
         inbox: asyncio.Queue[str],
         callsign: str,
+        is_sysop: bool = False,
     ) -> None:
         term = session.term
 
@@ -213,6 +342,10 @@ class ChatPlugin(BBSPlugin):
                         else:
                             new_name = cmd_parts[1].lower()
                             new_room = get_or_create_room(new_name)
+                            # Wire up persistence for dynamically created rooms.
+                            if new_room._persist_cb is None and self._db_path:
+                                new_room._history_size = HISTORY_LINES
+                                new_room._persist_cb = self._make_persist_cb(new_room.name)
                             room.leave(callsign)
                             room = new_room
                             inbox = room.join(callsign)
@@ -226,6 +359,47 @@ class ChatPlugin(BBSPlugin):
                                 f"  {term.style(f'{r.name:<12}', 'accent', bold=True)} "
                                 f"{term.note(f'{r.member_count} user(s)')}  {r.description}"
                             )
+                    elif cmd == "/HIST" and is_sysop:
+                        if self._db_path:
+                            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                                async with db.execute(
+                                    """
+                                    SELECT id, line FROM (
+                                        SELECT id, line FROM chat_history WHERE room=?
+                                        ORDER BY id DESC LIMIT ?
+                                    ) ORDER BY id ASC
+                                    """,
+                                    (room.name, HISTORY_LINES),
+                                ) as cur:
+                                    rows = await cur.fetchall()
+                            await term.sendln(term.note("--- history ---"))
+                            for row_id, line in rows:
+                                await term.sendln(f"{term.note(f'[{row_id}]')} {line}")
+                            await term.sendln(term.note("--- end ---"))
+                        else:
+                            await term.sendln(term.warn("No DB path configured."))
+                    elif cmd == "/DEL" and is_sysop:
+                        if len(cmd_parts) < 2 or not cmd_parts[1].isdigit():
+                            await term.sendln(term.warn("Usage: /DEL <message-id>"))
+                        else:
+                            deleted = await self._delete_message(room.name, int(cmd_parts[1]))
+                            if deleted is None:
+                                await term.sendln(term.warn(f"Message #{cmd_parts[1]} not found in this room."))
+                            else:
+                                await term.sendln(term.ok(f"Message #{cmd_parts[1]} deleted."))
+                    elif cmd == "/DELROOM" and is_sysop:
+                        if len(cmd_parts) < 2:
+                            await term.sendln(term.warn("Usage: /DELROOM <room-name>"))
+                        else:
+                            target = cmd_parts[1].lower()
+                            if target == room.name:
+                                await term.sendln(term.warn("Cannot delete the room you are currently in. Use /JOIN first."))
+                            else:
+                                ok = await self._delete_room(target)
+                                if ok:
+                                    await term.sendln(term.ok(f"Room '{target}' deleted."))
+                                else:
+                                    await term.sendln(term.warn(f"Room '{target}' not found."))
                     else:
                         await term.sendln(term.warn("Unknown command. Try /WHO /MSG /JOIN /ROOMS /QUIT"))
                 else:

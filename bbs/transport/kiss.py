@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from abc import abstractmethod
 from typing import Any
 
@@ -172,6 +173,15 @@ class _KISSBaseTransport(Transport):
     async def _dispatch(self, frame: KISSFrame) -> None:
         """Route an incoming UI frame to the appropriate virtual session."""
         assert self._raw_writer is not None
+
+        # Frames not addressed to the BBS callsign — heard but not for us.
+        if frame.dest_call.upper() != self._local_addr.upper():
+            if self._heard_observer is not None:
+                await self._heard_observer(
+                    frame.src_call, frame.dest_call, frame.via, int(time.time()), self.transport_id
+                )
+            return
+
         src = frame.src_call
 
         if src not in self._sessions:

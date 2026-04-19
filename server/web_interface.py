@@ -15,6 +15,8 @@ import server.routes.plugins     # noqa: F401
 import server.routes.activity    # noqa: F401
 import server.routes.bulletins   # noqa: F401
 import server.routes.info        # noqa: F401
+import server.routes.heard       # noqa: F401
+import server.routes.chat        # noqa: F401
 import server.websocket.handlers # noqa: F401
 
 from server.app import app, socketio

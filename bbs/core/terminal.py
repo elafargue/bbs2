@@ -173,6 +173,13 @@ class Terminal:
             return f"[{BOLD}{fg(14)}{key}{RESET}]"
         return f"[{key}]"
 
+    @staticmethod
+    def _visible_len(text: str) -> int:
+        """Return the printable length of *text*, ignoring ANSI escape codes."""
+        import re
+        plain = re.sub(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b.", "", text)
+        return len(plain)
+
     def style(self, text: str, tone: str = "accent", *, bold: bool = False) -> str:
         if not text or not self.ansi:
             return text
@@ -183,6 +190,7 @@ class Terminal:
                 "meta": fg_rgb(170, 195, 220),
                 "success": fg_rgb(118, 214, 130),
                 "warning": fg_rgb(241, 198, 92),
+                "orange": fg_rgb(210, 140, 60),
                 "error": fg_rgb(239, 122, 122),
             }
         else:
@@ -191,6 +199,9 @@ class Terminal:
                 "meta": fg(13),
                 "success": fg(10),
                 "warning": fg(11),
+                "orange": fg(3),   # ANSI dark yellow — reads as orange on most terminals
+                "warning": fg(11),
+                "orange": fg(3),   # ANSI dark yellow — reads as orange on most terminals
                 "error": fg(9),
             }
 
@@ -307,7 +318,9 @@ class Terminal:
             else:
                 lcell = f"[{lkey}] {ldesc}"
                 rcell = f"[{rkey}] {rdesc}" if rkey else ""
-            self.writeln(f"  {lcell:<{col_w}}  {rcell}")
+            # Pad lcell to col_w *visible* characters; ANSI codes must not count.
+            pad = max(0, col_w - self._visible_len(lcell))
+            self.writeln(f"  {lcell}{' ' * pad}  {rcell}")
 
         await self.sendln()
         await self.send(prompt)

@@ -361,7 +361,7 @@ class BBSSession:
             "",
             "CO - Color output mode: Off, ANSI 16-color, or truecolor.",
             "",
-            "B  - Bye / disconnect.  (You may also type BYE)",
+            "B  - Bye / disconnect.",
 
         ]
         await self.term.paginate(lines)

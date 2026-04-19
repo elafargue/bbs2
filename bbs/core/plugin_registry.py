@@ -220,6 +220,10 @@ class PluginRegistry:
                 items.append((p.menu_key, p.display_name))
         return items
 
+    def get(self, name: str) -> Optional[BBSPlugin]:
+        """Return the plugin with the given *name*, or None if not registered."""
+        return self._plugins.get(name)
+
     def toggle(self, plugin_name: str, enabled: bool) -> bool:
         """Enable or disable a plugin at runtime.  Returns False if not found."""
         if plugin_name not in self._plugins:

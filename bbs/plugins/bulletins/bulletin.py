@@ -143,7 +143,10 @@ class BulletinsPlugin(BBSPlugin):
 
         while True:
             if current_area_id:
-                unread = await _count_unread(db, current_area_id, session.auth.user_id)
+                unread = await _count_unread(
+                    db, current_area_id, session.auth.user_id,
+                    callsign=session.auth.callsign, is_sysop=session.auth.is_sysop,
+                )
                 area_label = f"{current_area_name} ({unread} new)"
             else:
                 area_label = "(no area selected)"
@@ -154,6 +157,7 @@ class BulletinsPlugin(BBSPlugin):
                 ("R#", "Read message number #"),
                 ("S",   "Send message"),
                 ("Q",   "Back to main menu"),
+                ("?",   "Help"),
             ]
             if current_area_id:
                 items.insert(4, ("D#", "Delete message number #"))
@@ -194,6 +198,57 @@ class BulletinsPlugin(BBSPlugin):
                     await term.sendln("Sysop access required.")
                 else:
                     await self._sysop_areas(session)
+            elif choice == "?":
+                await self._show_help(session)
+
+    # ── Help ─────────────────────────────────────────────────────────────────
+
+    async def _show_help(self, session: "BBSSession") -> None:
+        term = session.term
+        auth = session.auth
+
+        # Describe the current user's auth level
+        if auth.is_sysop:
+            level_desc = term.ok("SYSOP")
+        elif auth.is_authenticated:
+            level_desc = term.ok("AUTHENTICATED")
+        elif auth.is_identified:
+            level_desc = term.style("IDENTIFIED", "orange", bold=True)
+        else:
+            level_desc = term.warn("ANONYMOUS")
+
+        lines = [
+            "",
+            term.label("BULLETINS — HELP", "meta"),
+            term.note("-" * 40),
+            "",
+            term.field("Your access level:", level_desc, "meta"),
+            "",
+            term.label("IDENTIFIED  (callsign verified via AX.25 or login)", "meta"),
+            f"  {term.ok('YES')}  Browse areas              (A)",
+            f"  {term.ok('YES')}  List messages             (L)",
+            f"  {term.ok('YES')}  Read public messages      (R#)",
+            f"  {term.ok('YES')}  Read private messages addressed to you",
+            f"  {term.warn('NO ')}  Post messages",
+            f"  {term.warn('NO ')}  Delete messages",
+            "",
+            term.label("AUTHENTICATED  (IDENTIFIED + OTP challenge passed — type A)", "meta"),
+            f"  {term.ok('YES')}  Everything above",
+            f"  {term.ok('YES')}  Post messages             (S)",
+            f"        Authenticated posts show {term.style('CALLSIGN*', 'success', bold=True)} in listings",
+            f"  {term.ok('YES')}  Delete your own messages  (D#)",
+            "",
+            term.label("PRIVATE MESSAGES", "meta"),
+            "  Address a message to a specific callsign instead of ALL.",
+            "  Only the sender and the recipient can see it.",
+            f"  {term.warn('NOTE')} Sysop can always see all messages.",
+            "",
+            term.label("SYSOP", "meta"),
+            f"  {term.ok('YES')}  Delete any message",
+            f"  {term.ok('YES')}  Manage areas              (SA)",
+            "",
+        ]
+        await term.paginate(lines)
 
     # ── Default area lookup ───────────────────────────────────────────────────
 
@@ -430,16 +485,34 @@ class BulletinsPlugin(BBSPlugin):
     # ── Fetch messages ────────────────────────────────────────────────────────
 
     async def _fetch_messages(
-        self, db: "aiosqlite.Connection", area_id: int
+        self,
+        db: "aiosqlite.Connection",
+        area_id: int,
+        callsign: str = "",
+        is_sysop: bool = False,
     ) -> list:
+        """Return messages visible to *callsign*.
+
+        Public messages (to_call='ALL') are always returned.  Private messages
+        (any other to_call) are returned only when *callsign* matches the
+        sender or recipient, or when *is_sysop* is True.
+        """
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """SELECT id, msg_number, subject, from_call, to_call, body, created_at, authenticated
-               FROM bulletin_messages
-               WHERE area_id=? AND deleted=0
-               ORDER BY created_at DESC""",
-            (area_id,),
-        ) as cur:
+        select = (
+            "SELECT id, msg_number, subject, from_call, to_call, body, created_at, authenticated"
+            " FROM bulletin_messages"
+        )
+        if is_sysop or not callsign:
+            sql = f"{select} WHERE area_id=? AND deleted=0 ORDER BY created_at DESC"
+            params: tuple = (area_id,)
+        else:
+            sql = (
+                f"{select} WHERE area_id=? AND deleted=0"
+                "   AND (to_call='ALL' OR from_call=? OR to_call=?)"
+                " ORDER BY created_at DESC"
+            )
+            params = (area_id, callsign, callsign)
+        async with db.execute(sql, params) as cur:
             return await cur.fetchall()
 
     async def _show_message_index(
@@ -465,10 +538,11 @@ class BulletinsPlugin(BBSPlugin):
             from_str  = f"{from_disp:<9}"
             date_str  = f"{date:<20}"
             is_auth   = bool(m["authenticated"])
+            from_tone = "success" if is_auth else "orange"
             lines.append(
                 f"{term.style(num_str, 'accent', bold=True)} "
                 f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
-                f"{size:<6} {to:<7} {term.style(from_str, 'accent' if is_auth else 'meta', bold=is_auth)} "
+                f"{size:<6} {to:<7} {term.style(from_str, from_tone, bold=True)} "
                 f"{term.note(date_str)} {subj}"
             )
         lines.append("")
@@ -481,7 +555,9 @@ class BulletinsPlugin(BBSPlugin):
     ) -> None:
         term = session.term
         while True:
-            messages = await self._fetch_messages(session.db, area_id)
+            messages = await self._fetch_messages(
+                session.db, area_id, session.auth.callsign, session.auth.is_sysop
+            )
             if not messages:
                 await term.sendln(term.note(f"No messages in {area_name}."))
                 return
@@ -518,7 +594,9 @@ class BulletinsPlugin(BBSPlugin):
             return
         msg_num = int(numarg)
         if messages is None:
-            messages = await self._fetch_messages(session.db, area_id)
+            messages = await self._fetch_messages(
+                session.db, area_id, session.auth.callsign, session.auth.is_sysop
+            )
         target = next((m for m in messages if m["msg_number"] == msg_num), None)
         if not target:
             await term.sendln(term.warn("Message not found."))
@@ -533,7 +611,9 @@ class BulletinsPlugin(BBSPlugin):
                 return
             cmd, narg = _parse_cmd(raw)
             if cmd == "L":
-                messages = await self._fetch_messages(session.db, area_id)
+                messages = await self._fetch_messages(
+                    session.db, area_id, session.auth.callsign, session.auth.is_sysop
+                )
                 if messages:
                     await self._show_message_index(term, area_name, messages)
                 else:
@@ -543,7 +623,9 @@ class BulletinsPlugin(BBSPlugin):
                     await term.send("Message#: ")
                     narg = (await term.readline(max_len=6)).strip()
                 if narg and narg.isdigit():
-                    messages = await self._fetch_messages(session.db, area_id)
+                    messages = await self._fetch_messages(
+                        session.db, area_id, session.auth.callsign, session.auth.is_sysop
+                    )
                     t = next((m for m in messages if m["msg_number"] == int(narg)), None)
                     if t:
                         await self._display_message_body(session, t)
@@ -551,7 +633,9 @@ class BulletinsPlugin(BBSPlugin):
                         await term.sendln(term.warn("Message not found."))
             elif cmd == "D":
                 await self._delete_message(session, area_id, narg)
-                messages = await self._fetch_messages(session.db, area_id)
+                messages = await self._fetch_messages(
+                    session.db, area_id, session.auth.callsign, session.auth.is_sysop
+                )
             else:
                 return
 
@@ -561,10 +645,11 @@ class BulletinsPlugin(BBSPlugin):
         term = session.term
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(target["created_at"]))
         auth_mark = "*" if target["authenticated"] else ""
+        from_tone = "success" if target["authenticated"] else "orange"
         msg_lines = [
             "",
             (
-                f"{term.label('From:', 'meta')} {term.style(str(target['from_call']) + auth_mark, 'accent', bold=bool(auth_mark))}  "
+                f"{term.label('From:', 'meta')} {term.style(str(target['from_call']) + auth_mark, from_tone, bold=True)}  "
                 f"{term.label('To:', 'meta')} {target['to_call']}  "
                 f"{term.label('Date:', 'meta')} {ts}"
             ),
@@ -595,12 +680,11 @@ class BulletinsPlugin(BBSPlugin):
     ) -> None:
         term = session.term
         db = session.db
-
-        # Auth check — radio transports trust the callsign from the AX.25 header
-        # so IDENTIFIED is sufficient; TCP users must have passed OTP (AUTHENTICATED).
-        _RADIO_TRANSPORTS = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe")
-        via_radio = session.conn.transport_id in _RADIO_TRANSPORTS
-        if not (via_radio and session.auth.is_identified) and not session.auth.is_authenticated:
+        # Auth check — radio and web transports trust the caller's identity already;
+        # TCP/Telnet users must have passed OTP (AUTHENTICATED) to post.
+        _TRUSTED_TRANSPORTS = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "web")
+        via_trusted = session.conn.transport_id in _TRUSTED_TRANSPORTS
+        if not (via_trusted and session.auth.is_identified) and not session.auth.is_authenticated:
             await term.sendln(
                 term.warn("AUTH required to post. Type 'A' at main menu to authenticate.")
             )
@@ -732,21 +816,36 @@ def _parse_cmd(raw: str) -> tuple[str, Optional[str]]:
     return m.group(1), m.group(2)
 
 async def _count_unread(
-    db: aiosqlite.Connection, area_id: int, user_id: Optional[int]
+    db: aiosqlite.Connection,
+    area_id: int,
+    user_id: Optional[int],
+    callsign: Optional[str] = None,
+    is_sysop: bool = False,
 ) -> int:
+    """Count messages not yet read by *user_id*, applying the same visibility
+    rules as :meth:`BulletinsPlugin._fetch_messages`.
+    """
+    if is_sysop or not callsign:
+        vis_sql = ""
+        vis_args: tuple = ()
+    else:
+        vis_sql = "AND (m.to_call='ALL' OR m.from_call=? OR m.to_call=?)"
+        vis_args = (callsign, callsign)
+
     if not user_id:
         async with db.execute(
-            "SELECT COUNT(*) FROM bulletin_messages WHERE area_id=? AND deleted=0",
-            (area_id,),
+            f"SELECT COUNT(*) FROM bulletin_messages m"
+            f" WHERE m.area_id=? AND m.deleted=0 {vis_sql}",
+            (area_id,) + vis_args,
         ) as cur:
             row = await cur.fetchone()
         return int(row[0]) if row else 0
 
     async with db.execute(
-        """SELECT COUNT(*) FROM bulletin_messages m
+        f"""SELECT COUNT(*) FROM bulletin_messages m
            LEFT JOIN read_receipts r ON r.message_id=m.id AND r.user_id=?
-           WHERE m.area_id=? AND m.deleted=0 AND r.message_id IS NULL""",
-        (user_id, area_id),
+           WHERE m.area_id=? AND m.deleted=0 AND r.message_id IS NULL {vis_sql}""",
+        (user_id, area_id) + vis_args,
     ) as cur:
         row = await cur.fetchone()
     return int(row[0]) if row else 0

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional
 
 
 @dataclass
@@ -52,12 +52,25 @@ class Connection:
 # Type alias: callback the engine registers to receive new connections.
 ConnectionCallback = Callable[[Connection], Awaitable[None]]
 
+# Type alias: callback fired by transports when a frame is heard but NOT
+# addressed to the BBS callsign.
+# Arguments: src_call, dest_call, via (digipeater path), unix_ts, transport_id.
+HeardFrameCallback = Callable[[str, str, list[str], int, str], Awaitable[None]]
+
 
 class Transport(ABC):
     """Base class for all BBS transports."""
 
     #: Short identifier used in logs and config keys.
     transport_id: str = "base"
+
+    #: Optional observer for frames not addressed to this station.
+    #: Set via set_heard_observer(); None if disabled.
+    _heard_observer: Optional[HeardFrameCallback] = None
+
+    def set_heard_observer(self, cb: HeardFrameCallback) -> None:
+        """Register *cb* as the callback for overheard (non-BBS) frames."""
+        self._heard_observer = cb
 
     @abstractmethod
     async def start(self, on_connect: ConnectionCallback) -> None:

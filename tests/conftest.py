@@ -76,6 +76,10 @@ def _make_test_config(db_path: str, tcp_port: int) -> BBSConfig:
                 "default_rooms": [{"name": "main", "description": "Main chat room"}],
                 "history_lines": 10,
             },
+            "heard": {
+                "enabled": True,
+                "max_age_hours": 24,
+            },
         },
         web={
             "host": "127.0.0.1",

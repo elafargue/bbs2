@@ -102,6 +102,15 @@ class BBSEngine:
         if not transports:
             logger.warning("No transports enabled! Check bbs.yaml.")
 
+        # Wire heard-station observer onto supporting transports
+        heard_plugin = self.plugin_registry.get("heard")
+        if heard_plugin is not None and heard_plugin.enabled:
+            for t in transports:
+                t.set_heard_observer(heard_plugin.on_heard)  # type: ignore[attr-defined]
+            logger.info(
+                "Heard-station observer registered on %d transport(s)", len(transports)
+            )
+
         transport_tasks = [
             asyncio.create_task(t.start(self._on_connection), name=f"transport:{t.transport_id}")
             for t in transports

@@ -8,7 +8,8 @@ module is never imported; the kernel handles all framing.
 We only need enough decoding to:
   1. Strip the KISS framing (FEND / FESC bytes).
   2. Extract the source callsign from the AX.25 address field.
-  3. Extract the information (payload) field.
+  3. Extract the digipeater path (via) with has-been-repeated (*) markers.
+  4. Extract the information (payload) field.
 
 We do NOT implement the full AX.25 connected-mode state machine here —
 the kernel handles that or Dire Wolf handles connected mode when operating
@@ -17,7 +18,7 @@ in UI (connectionless) frame mode only.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bbs.ax25.address import format_addr
 
@@ -37,13 +38,18 @@ _ADDR_BYTES = 7
 
 @dataclass
 class KISSFrame:
-    """Decoded KISS frame."""
-    port: int          # KISS TNC port (0-15)
+    """Decoded KISS (or raw AX.25) frame."""
+    port: int          # KISS TNC port (0-15); 0 for frames decoded from AGWPE
     dest_call: str     # Destination callsign ("W1AW-0")
     src_call: str      # Source callsign ("N0CALL-3")
     is_ui: bool        # True if UI frame (connectionless)
     pid: int           # Protocol ID (0xF0 = no layer 3)
     payload: bytes     # Information field bytes
+    via: list[str] = field(default_factory=list)
+    # Digipeater path in transmission order.
+    # Each entry is "CALL-SSID" or "CALL-SSID*" where "*" means the
+    # has-been-repeated (H) bit is set — i.e. that digi already forwarded it.
+    # Example: ["WIDE1-1*", "KD6XYZ-3*", "WIDE2-1"] (last digi not yet repeated)
 
 
 def kiss_unescape(data: bytes) -> bytes:
@@ -99,6 +105,72 @@ def _decode_callsign(addr_field: bytes) -> tuple[str, int]:
     return callsign, ssid
 
 
+def _decode_ax25(ax25: bytes, port: int = 0) -> KISSFrame | None:
+    """
+    Decode a raw AX.25 frame (no KISS wrapper).
+
+    Parses a variable-length address field: each 7-byte address ends when
+    bit 0 of its SSID byte is set.  For digipeater entries, bit 7 of the
+    SSID byte is the H (has-been-repeated) flag, shown as "*" in monitor
+    output.
+    """
+    # Minimum: dest(7) + src(7) + control(1) = 15 bytes
+    if len(ax25) < 15:
+        return None
+
+    dest_call, dest_ssid = _decode_callsign(ax25[0:7])
+    src_call, src_ssid = _decode_callsign(ax25[7:14])
+
+    # Walk the digipeater path.  Bit 0 of a SSID byte marks the last address.
+    via: list[str] = []
+    offset = 14  # byte index right after the src address field
+    if not (ax25[13] & 0x01):  # src is not the last address — digipeaters follow
+        while offset + _ADDR_BYTES <= len(ax25):
+            digi_field = ax25[offset : offset + _ADDR_BYTES]
+            digi_call, digi_ssid = _decode_callsign(digi_field)
+            h_bit = bool(digi_field[6] & 0x80)   # has-been-repeated
+            is_last = bool(digi_field[6] & 0x01)  # end of address field
+            if digi_call:
+                via.append(format_addr(digi_call, digi_ssid) + ("*" if h_bit else ""))
+            offset += _ADDR_BYTES
+            if is_last:
+                break
+
+    if offset >= len(ax25):
+        return None
+
+    control = ax25[offset]
+    # UI frame: control = 0x03 (P/F bit = 0); 0x13 with P/F set is also valid.
+    is_ui = (control & 0xEF) == 0x03
+
+    if is_ui:
+        if len(ax25) < offset + 2:
+            return None
+        pid = ax25[offset + 1]
+        payload = ax25[offset + 2 :]
+    else:
+        pid = 0
+        payload = ax25[offset + 1 :]
+
+    return KISSFrame(
+        port=port,
+        dest_call=format_addr(dest_call, dest_ssid),
+        src_call=format_addr(src_call, src_ssid),
+        is_ui=is_ui,
+        pid=pid,
+        payload=payload,
+        via=via,
+    )
+
+
+def decode_ax25_frame(ax25: bytes) -> KISSFrame | None:
+    """
+    Decode a raw AX.25 frame (no KISS framing).
+    Used by the AGWPE transport for raw 'K' monitoring frames.
+    """
+    return _decode_ax25(ax25)
+
+
 def decode_frame(raw: bytes) -> KISSFrame | None:
     """
     Decode a raw KISS frame (already stripped of leading/trailing FEND).
@@ -114,36 +186,7 @@ def decode_frame(raw: bytes) -> KISSFrame | None:
         return None
 
     ax25 = kiss_unescape(raw[1:])
-
-    # Minimum AX.25 frame: dest(7) + src(7) + control(1) = 15 bytes
-    if len(ax25) < 15:
-        return None
-
-    dest_call, dest_ssid = _decode_callsign(ax25[0:7])
-    src_call, src_ssid = _decode_callsign(ax25[7:14])
-
-    control = ax25[14]
-    # UI frame: control = 0x03
-    is_ui = (control == 0x03)
-
-    # If UI frame there is a PID byte after control
-    if is_ui:
-        if len(ax25) < 16:
-            return None
-        pid = ax25[15]
-        payload = ax25[16:]
-    else:
-        pid = 0
-        payload = ax25[15:]
-
-    return KISSFrame(
-        port=port,
-        dest_call=format_addr(dest_call, dest_ssid),
-        src_call=format_addr(src_call, src_ssid),
-        is_ui=is_ui,
-        pid=pid,
-        payload=payload,
-    )
+    return _decode_ax25(ax25, port)
 
 
 def split_kiss_frames(buf: bytearray) -> tuple[list[bytes], bytearray]:

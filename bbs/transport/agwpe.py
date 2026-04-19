@@ -29,6 +29,9 @@ Protocol reference: http://www.sv2agw.com/downloads/develop.zip
   'd' (0x64) — Disconnect
                Receive: CallFrom = remote  →  send: CallFrom = our call, CallTo = remote
   'T' (0x54) — Send unproto (UI) frame — used for periodic beacons
+  'm' (0x6D) — Enable monitoring of all received frames
+  'U' (0x55) — Monitored UI frame (AGWPE monitor format, e.g.:
+               "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN* <UI pid=F0 ...>")
 
 ── Design notes ─────────────────────────────────────────────────────────────
 One TCP connection is maintained to AGWPE.  Multiple simultaneous AX.25
@@ -51,7 +54,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from typing import Any, Optional
+
+import re
 
 from bbs.ax25.address import format_addr, parse
 from bbs.transport.base import Connection, ConnectionCallback, Transport
@@ -65,6 +71,19 @@ _HEADER_SIZE = struct.calcsize(_HEADER_FMT)   # 36 bytes
 assert _HEADER_SIZE == 36, "AGWPE header must be 36 bytes"
 
 _PID_NO_L3 = 0xF0  # no layer-3 protocol
+
+# AGWPE 'U' monitor string format:
+#   "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN*,KBERR <UI pid=F0 ...>"
+# Via section is absent for direct (non-digipeated) frames.
+_MONITOR_VIA_RE = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
+
+
+def _parse_via(monitor_text: str) -> list[str]:
+    """Extract digipeater path from an AGWPE 'U' monitor string."""
+    m = _MONITOR_VIA_RE.search(monitor_text)
+    if not m:
+        return []
+    return [v.strip() for v in m.group(1).split(",") if v.strip()]
 
 
 def _encode_call(callsign: str) -> bytes:
@@ -364,6 +383,12 @@ class AGWPETransport(Transport):
                 )
                 if self._registered is not None:
                     self._registered.set()
+                # Enable frame monitoring so 'U' (UI) frames arrive with
+                # source, dest, and via path already parsed in TNC2 format.
+                if self._heard_observer is not None:
+                    writer.write(_build_frame(self._agw_port, "m", "", ""))
+                    await writer.drain()
+                    logger.info("agwpe: monitoring enabled for heard-station tracking")
             else:
                 logger.warning(
                     "agwpe: callsign registration FAILED for %s on port %d",
@@ -406,7 +431,28 @@ class AGWPETransport(Transport):
             else:
                 logger.debug("agwpe: 'd' for unknown session %s", call_from)
 
-        # All other frame types (version info, port info, monitoring, etc.) are
+        elif kind == "U":
+            # Monitored UI frame — AGWPE already parsed src/dest into the header;
+            # extract the via path from the TNC2 monitor string in the payload.
+            if self._heard_observer is None:
+                return
+            if call_from.upper() == self._local_call.upper():
+                return  # our own transmitted frame echoed back
+            via: list[str] = []
+            if payload:
+                try:
+                    via = _parse_via(payload.decode("ascii", errors="replace"))
+                except Exception:
+                    pass
+            await self._heard_observer(
+                call_from,
+                call_to,
+                via,
+                int(time.time()),
+                self.transport_id,
+            )
+
+        # All other frame types (version info, port info, etc.) are
         # silently ignored — the BBS has no use for them.
 
     # ── Session runner ────────────────────────────────────────────────────────

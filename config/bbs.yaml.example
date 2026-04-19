@@ -96,7 +96,7 @@ plugins:
   chat:
     enabled: true
     # Lines of history kept in memory per room
-    history_lines: 50
+    history_lines: 20
     # Default rooms created on first run
     default_rooms:
       - { name: "main", description: "Main chat room" }
@@ -111,6 +111,11 @@ plugins:
     # Optional seed message – used only when the database row is still empty.
     # Once the sysop edits the message via the web UI this value is ignored.
     message: ""
+
+  heard:
+    enabled: true
+    # Maximum rows shown in the listing
+    limit: 200
 
 web:
   host: "127.0.0.1"

@@ -2,12 +2,16 @@
 import { ref, onMounted } from 'vue'
 import BulletinAreas from './Bulletins.vue'
 import InfoEditor from './InfoEditor.vue'
+import HeardConfig from './HeardConfig.vue'
+import ChatRooms from './ChatRooms.vue'
 
 const plugins = ref([])
 const loading = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
 const areasDialog = ref(false)
 const infoDialog = ref(false)
+const heardDialog = ref(false)
+const chatDialog = ref(false)
 
 async function loadPlugins() {
   loading.value = true
@@ -95,6 +99,24 @@ onMounted(loadPlugins)
                 >
                   Edit Info
                 </v-btn>
+                <v-btn
+                  v-if="p.name === 'heard'"
+                  variant="tonal"
+                  color="primary"
+                  append-icon="mdi-radio-tower"
+                  @click="heardDialog = true"
+                >
+                  Heard Log
+                </v-btn>
+                <v-btn
+                  v-if="p.name === 'chat'"
+                  variant="tonal"
+                  color="primary"
+                  append-icon="mdi-forum"
+                  @click="chatDialog = true"
+                >
+                  Rooms
+                </v-btn>
               </v-card-actions>
             </v-card>
           </v-col>
@@ -130,6 +152,38 @@ onMounted(loadPlugins)
         <v-divider />
         <v-card-text class="pa-4">
           <InfoEditor />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
+    <!-- Heard Stations log + config modal -->
+    <v-dialog v-model="heardDialog" :max-width="'95vw'" scrollable>
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start>mdi-radio-tower</v-icon>
+          Heard Stations
+          <v-spacer />
+          <v-btn icon="mdi-close" variant="text" @click="heardDialog = false" />
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pa-4">
+          <HeardConfig />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
+    <!-- Chat rooms management modal -->
+    <v-dialog v-model="chatDialog" max-width="900" scrollable>
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start>mdi-forum</v-icon>
+          Chat Rooms
+          <v-spacer />
+          <v-btn icon="mdi-close" variant="text" @click="chatDialog = false" />
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pa-4">
+          <ChatRooms />
         </v-card-text>
       </v-card>
     </v-dialog>
