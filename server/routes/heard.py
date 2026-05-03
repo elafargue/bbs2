@@ -13,6 +13,7 @@ import sqlite3
 
 from flask import jsonify, request, session
 
+from bbs.plugins.heard.graph import confirmed_edges
 from server.app import app
 
 
@@ -38,10 +39,24 @@ def heard_list():
     if not db:
         return jsonify({"error": "BBS engine not running"}), 503
     try:
+        import time as _time
         limit = min(int(request.args.get("limit", 500)), 2000)
+        try:
+            row = db.execute(
+                "SELECT value FROM heard_settings WHERE key = 'max_age_hours'"
+            ).fetchone()
+            max_age_hours = int(row[0]) if row else 24
+        except sqlite3.OperationalError:
+            max_age_hours = 24
+        cutoff = (
+            int(_time.time()) - max_age_hours * 3600
+            if max_age_hours > 0
+            else 0
+        )
         cur = db.execute(
             """
-            SELECT callsign, dest, transport, via, first_heard, last_heard, count
+            SELECT callsign, dest, transport, via, first_heard, last_heard, count,
+                   lat, lon, comment, source
             FROM heard_stations
             ORDER BY last_heard DESC
             LIMIT ?
@@ -49,7 +64,12 @@ def heard_list():
             (limit,),
         )
         cols = [d[0] for d in cur.description]
-        return jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+        rows = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["expired"] = bool(d["source"] == "heard" and d["last_heard"] < cutoff)
+            rows.append(d)
+        return jsonify(rows)
     except sqlite3.OperationalError:
         return jsonify([])
     finally:
@@ -101,6 +121,80 @@ def heard_clear():
         db.execute("DELETE FROM heard_paths")
         db.commit()
         return jsonify({"removed": removed})
+    finally:
+        db.close()
+
+
+@app.route("/api/heard/<callsign>", methods=["PUT"])
+def heard_update(callsign: str):
+    """Update lat, lon, and comment for a heard station (matched by callsign + transport)."""
+    err = _require_sysop()
+    if err:
+        return err
+    callsign = callsign.strip().upper()
+    data      = request.get_json(silent=True) or {}
+    transport = str(data.get("transport", "")).strip()
+    lat       = data.get("lat")
+    lon       = data.get("lon")
+    comment   = str(data.get("comment", ""))
+
+    if lat is not None:
+        try:
+            lat = float(lat)
+            if not (-90.0 <= lat <= 90.0):
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({"error": "lat must be a number between -90 and 90"}), 400
+    if lon is not None:
+        try:
+            lon = float(lon)
+            if not (-180.0 <= lon <= 180.0):
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({"error": "lon must be a number between -180 and 180"}), 400
+
+    db = _sync_db()
+    if not db:
+        return jsonify({"error": "BBS engine not running"}), 503
+    try:
+        cur = db.execute(
+            """
+            UPDATE heard_stations
+               SET lat = ?, lon = ?, comment = ?
+             WHERE callsign = ? AND transport = ?
+            """,
+            (lat, lon, comment, callsign, transport),
+        )
+        if cur.rowcount == 0:
+            return jsonify({"error": "Station not found"}), 404
+        db.commit()
+        return jsonify({"ok": True})
+    except sqlite3.OperationalError as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        db.close()
+
+
+@app.route("/api/heard/<callsign>", methods=["DELETE"])
+def heard_delete_station(callsign: str):
+    """Delete all heard_stations and heard_paths rows for a callsign (sysop only)."""
+    err = _require_sysop()
+    if err:
+        return err
+    callsign = callsign.strip().upper()
+    db = _sync_db()
+    if not db:
+        return jsonify({"error": "BBS engine not running"}), 503
+    try:
+        cur = db.execute("DELETE FROM heard_stations WHERE callsign = ?", (callsign,))
+        removed = cur.rowcount
+        db.execute("DELETE FROM heard_paths WHERE callsign = ?", (callsign,))
+        db.commit()
+        if removed == 0:
+            return jsonify({"error": "Station not found"}), 404
+        return jsonify({"ok": True, "removed": removed})
+    except sqlite3.OperationalError as exc:
+        return jsonify({"error": str(exc)}), 500
     finally:
         db.close()
 
@@ -170,30 +264,6 @@ def heard_settings_put():
 
 # ── Network graph ─────────────────────────────────────────────────────────────
 
-def _confirmed_edges(src: str, via: str, bbs_call: str) -> list[tuple[str, str]]:
-    """
-    Extract confirmed (source, dest) hop pairs from a via path string.
-
-    A digipeater sets the H-bit (*) only after it has relayed the frame.
-    So all hops up to and including the last '*' are confirmed; everything
-    after the last '*' is speculative and discarded.
-
-    Empty via (direct) → single edge: src → bbs.
-    """
-    if not via:
-        return [(src, bbs_call)]
-    hops = [h.strip() for h in via.split(",") if h.strip()]
-    last_star = max(
-        (i for i, h in enumerate(hops) if h.endswith("*")),
-        default=-1,
-    )
-    if last_star < 0:
-        # No digi has set its H-bit yet — cannot confirm any relay hop.
-        return []
-    confirmed = [h.rstrip("*") for h in hops[: last_star + 1]]
-    chain = [src] + confirmed + [bbs_call]
-    return [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
-
 
 @app.route("/api/heard/graph", methods=["GET"])
 def heard_graph():
@@ -252,7 +322,7 @@ def heard_graph():
 
         stations.add(src)
 
-        edges = _confirmed_edges(src, via_str, bbs_call)
+        edges = confirmed_edges(src, via_str, bbs_call)
         for a, b in edges:
             # All intermediate nodes (not the source, not the BBS) are digis.
             if a not in (src, bbs_call):

@@ -10,8 +10,8 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from bbs.plugins.heard.graph import confirmed_edges as _confirmed_edges
 from bbs.plugins.heard.heard import HeardPlugin
-from server.routes.heard import _confirmed_edges
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +128,8 @@ class TestHeardGraph:
     async def test_graph_endpoint_requires_sysop(self, bbs_server):
         """Unauthenticated request must return 401 — verified by checking the
         helper function is importable and the route is registered."""
-        from server.routes.heard import _confirmed_edges
-        assert callable(_confirmed_edges)
+        from bbs.plugins.heard.graph import confirmed_edges
+        assert callable(confirmed_edges)
 
     async def test_direct_station_edge(self):
         plugin = await _make_plugin_with_data()

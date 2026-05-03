@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import NetworkGraph from '../components/NetworkGraph.vue'
+import HeardGeoMap  from '../components/HeardGeoMap.vue'
 
 const stations    = ref([])
 const maxAge      = ref(24)
@@ -16,6 +17,16 @@ const pathsDialog  = ref(false)
 const pathsCall    = ref('')
 const pathsRows    = ref([])
 const pathsLoading = ref(false)
+
+// Edit station (lat / lon / comment)
+const editDialog = ref(false)
+const editItem   = ref({ callsign: '', transport: '', lat: '', lon: '', comment: '' })
+const editSaving = ref(false)
+
+// Delete station
+const deleteDialog   = ref(false)
+const deleteCallsign = ref('')
+const deleting       = ref(false)
 
 // Network graph
 const graphData    = ref(null)
@@ -95,6 +106,64 @@ async function showPaths(callsign) {
   pathsLoading.value = false
 }
 
+function openEdit(item) {
+  editItem.value = {
+    callsign:    item.callsign,
+    transport:   item.transport,
+    source:      item.source,
+    first_heard: item.first_heard,
+    last_heard:  item.last_heard,
+    count:       item.count,
+    lat:         item.lat != null ? String(item.lat) : '',
+    lon:         item.lon != null ? String(item.lon) : '',
+    comment:     item.comment ?? '',
+  }
+  editDialog.value = true
+}
+
+async function saveEdit() {
+  editSaving.value = true
+  const { callsign, transport } = editItem.value
+  const lat     = editItem.value.lat !== '' ? Number(editItem.value.lat) : null
+  const lon     = editItem.value.lon !== '' ? Number(editItem.value.lon) : null
+  const comment = editItem.value.comment
+  const res = await fetch(`/api/heard/${encodeURIComponent(callsign)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transport, lat, lon, comment }),
+  })
+  const data = await res.json()
+  snackbar.value = {
+    show: true,
+    text: res.ok ? 'Station updated.' : (data.error ?? 'Save failed.'),
+    color: res.ok ? 'success' : 'error',
+  }
+  editSaving.value = false
+  if (res.ok) {
+    editDialog.value = false
+    await load()
+  }
+}
+
+async function deleteStation() {
+  deleting.value = true
+  deleteDialog.value = false
+  const res = await fetch(`/api/heard/${encodeURIComponent(deleteCallsign.value)}`, {
+    method: 'DELETE',
+  })
+  const data = await res.json()
+  snackbar.value = {
+    show: true,
+    text: res.ok ? `Deleted ${deleteCallsign.value}.` : (data.error ?? 'Delete failed.'),
+    color: res.ok ? 'success' : 'error',
+  }
+  deleting.value = false
+  if (res.ok) {
+    await load()
+    graphData.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -135,14 +204,15 @@ onMounted(load)
         >
           Clear all
         </v-btn>
-        <v-btn icon="mdi-refresh" variant="text" :loading="loading || graphLoading" @click="activeTab === 'network' ? loadGraph() : load()" />
+        <v-btn icon="mdi-refresh" variant="text" :loading="loading || graphLoading" @click="['network','map'].includes(activeTab) ? loadGraph() : load()" />
       </v-col>
     </v-row>
 
-    <!-- Tabs: Log / Network -->
+    <!-- Tabs: Log / Network / Map -->
     <v-tabs v-model="activeTab" density="compact" class="mb-2">
       <v-tab value="log"     prepend-icon="mdi-table">Log</v-tab>
       <v-tab value="network" prepend-icon="mdi-graph" @click="!graphData && loadGraph()">Network</v-tab>
+      <v-tab value="map"     prepend-icon="mdi-map"   @click="!graphData && loadGraph()">Map</v-tab>
     </v-tabs>
 
     <v-window v-model="activeTab">
@@ -152,34 +222,90 @@ onMounted(load)
           :headers="[
             { title: 'Callsign',    key: 'callsign',    sortable: true },
             { title: 'Dest',        key: 'dest',        sortable: true },
-            { title: 'Transport',   key: 'transport',   sortable: true },
             { title: 'Via (last)',  key: 'via',         sortable: true },
+            { title: 'Comment',    key: 'comment',     sortable: true },
             { title: 'Last Heard',  key: 'last_heard',  sortable: true },
-            { title: 'First Heard', key: 'first_heard', sortable: true },
             { title: 'Count',       key: 'count',       sortable: true },
-            { title: 'Paths',       key: 'actions',     sortable: false },
+            { title: '',            key: 'actions',     sortable: false },
           ]"
           :items="stations"
           :loading="loading"
+          :row-props="({ item }) => item.expired ? { class: 'text-medium-emphasis' } : {}"
           density="compact"
           hover
         >
-          <template #item.last_heard="{ item }">{{ fmtTs(item.last_heard) }}</template>
-          <template #item.first_heard="{ item }">{{ fmtTs(item.first_heard) }}</template>
+          <template #item.callsign="{ item }">
+            <span :class="item.transport === '' && item.source !== 'heard' ? 'text-medium-emphasis' : ''">{{ item.callsign }}</span>
+            <v-chip
+              v-if="item.transport === '' && item.source !== 'heard'"
+              size="x-small"
+              variant="outlined"
+              class="ml-1"
+              color="blue-grey"
+            >relay</v-chip>
+            <v-chip
+              v-if="item.transport === '' && item.source === 'heard'"
+              size="x-small"
+              variant="outlined"
+              class="ml-1"
+              color="success"
+            >digi</v-chip>
+          </template>
+          <template #item.last_heard="{ item }">
+            <span v-if="item.source === 'heard' || item.last_heard">{{ fmtTs(item.last_heard) }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
+          <template #item.first_heard="{ item }">
+            <span v-if="item.transport !== '' || item.source === 'heard'">{{ fmtTs(item.first_heard) }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
           <template #item.via="{ item }">
-            <span v-if="item.via" class="text-mono">{{ item.via }}</span>
+            <span v-if="item.transport === '' && item.source !== 'heard'" class="text-disabled">—</span>
+            <span v-else-if="item.transport === '' && item.source === 'heard'" class="text-disabled">direct</span>
+            <span v-else-if="item.via" class="text-mono">{{ item.via }}</span>
             <span v-else class="text-disabled">direct</span>
+          </template>
+          <template #item.lat="{ item }">
+            <span v-if="item.lat != null">{{ Number(item.lat).toFixed(4) }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
+          <template #item.lon="{ item }">
+            <span v-if="item.lon != null">{{ Number(item.lon).toFixed(4) }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
+          <template #item.comment="{ item }">
+            <span v-if="item.comment">{{ item.comment }}</span>
+            <span v-else class="text-disabled">—</span>
           </template>
           <template #item.actions="{ item }">
             <v-btn
+              v-if="item.source === 'heard'"
               size="small"
               variant="text"
               icon="mdi-map-marker-path"
               :title="`Paths for ${item.callsign}`"
               @click="showPaths(item.callsign)"
             />
+            <v-btn
+              size="small"
+              variant="text"
+              icon="mdi-pencil"
+              :title="`Edit ${item.callsign}`"
+              @click="openEdit(item)"
+            />
+            <v-btn
+              size="small"
+              variant="text"
+              icon="mdi-delete"
+              color="error"
+              :title="`Delete ${item.callsign}`"
+              @click="deleteCallsign = item.callsign; deleteDialog = true"
+            />
           </template>
         </v-data-table>
+        <div class="mt-2 text-caption text-medium-emphasis">
+          Grayed-out stations are outside the current max-age window but are retained in the database.
+        </div>
       </v-window-item>
 
       <!-- Network tab -->
@@ -200,7 +326,107 @@ onMounted(load)
         </div>
         <NetworkGraph :graph-data="graphData" :loading="graphLoading" />
       </v-window-item>
+
+      <!-- Map tab (geographic) -->
+      <v-window-item value="map">
+        <div class="mb-2 d-flex align-center ga-2">
+          <span class="text-caption text-medium-emphasis">
+            Stations are plotted at their stored coordinates.
+            RF hop edges are drawn when both endpoints have coordinates.
+            Faded markers are outside the current max-age window.
+          </span>
+          <v-spacer />
+          <v-btn
+            size="small"
+            variant="tonal"
+            prepend-icon="mdi-refresh"
+            :loading="graphLoading || loading"
+            @click="Promise.all([load(), loadGraph()])"
+          >Refresh</v-btn>
+        </div>
+        <HeardGeoMap :stations="stations" :graph-data="graphData" :loading="graphLoading || loading" />
+      </v-window-item>
     </v-window>
+
+    <!-- Edit station dialog -->
+    <v-dialog v-model="editDialog" max-width="480">
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start>mdi-pencil</v-icon>
+          Edit {{ editItem.callsign }}
+          <span v-if="editItem.transport" class="text-caption text-medium-emphasis ml-2">({{ editItem.transport }})</span>
+          <span v-else class="text-caption text-medium-emphasis ml-2">(relay node)</span>
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pt-4">
+          <!-- Read-only info -->
+          <v-row dense class="mb-2 text-body-2">
+            <v-col cols="4" class="text-medium-emphasis">Transport</v-col>
+            <v-col cols="8">{{ editItem.transport || '—' }}</v-col>
+            <v-col cols="4" class="text-medium-emphasis">First heard</v-col>
+            <v-col cols="8">{{ (editItem.transport !== '' || editItem.source === 'heard') ? fmtTs(editItem.first_heard) : '—' }}</v-col>
+            <v-col cols="4" class="text-medium-emphasis">Last heard</v-col>
+            <v-col cols="8">{{ editItem.last_heard ? fmtTs(editItem.last_heard) : '—' }}</v-col>
+            <v-col cols="4" class="text-medium-emphasis">Count</v-col>
+            <v-col cols="8">{{ editItem.count }}</v-col>
+          </v-row>
+          <v-divider class="mb-3" />
+          <v-row dense>
+            <v-col cols="6">
+              <v-text-field
+                v-model="editItem.lat"
+                label="Latitude"
+                hint="Decimal degrees, e.g. 34.0522"
+                persistent-hint
+                clearable
+                density="compact"
+              />
+            </v-col>
+            <v-col cols="6">
+              <v-text-field
+                v-model="editItem.lon"
+                label="Longitude"
+                hint="Decimal degrees, e.g. -118.2437"
+                persistent-hint
+                clearable
+                density="compact"
+              />
+            </v-col>
+            <v-col cols="12" class="mt-2">
+              <v-text-field
+                v-model="editItem.comment"
+                label="Comment"
+                hint="Optional note about this station"
+                persistent-hint
+                density="compact"
+              />
+            </v-col>
+          </v-row>
+        </v-card-text>
+        <v-card-actions class="justify-end">
+          <v-btn variant="text" @click="editDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="tonal" :loading="editSaving" @click="saveEdit">Save</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Delete station dialog -->
+    <v-dialog v-model="deleteDialog" max-width="420">
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <v-icon start color="error">mdi-delete</v-icon>
+          Delete {{ deleteCallsign }}?
+        </v-card-title>
+        <v-card-text>
+          This will permanently remove <strong>{{ deleteCallsign }}</strong> and all its path history from the database.
+          Any saved coordinates or comments will be lost.
+        </v-card-text>
+        <v-card-actions class="justify-end">
+          <v-btn variant="text" @click="deleteDialog = false">Cancel</v-btn>
+          <v-btn color="error" variant="tonal" :loading="deleting" @click="deleteStation">Delete</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <!-- Confirm clear dialog -->
     <v-dialog v-model="clearDialog" max-width="400">

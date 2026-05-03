@@ -21,6 +21,7 @@ import aiosqlite
 
 from bbs.core.auth import AuthLevel
 from bbs.core.plugin_registry import BBSPlugin
+from bbs.plugins.heard.graph import confirmed_edges
 
 if TYPE_CHECKING:
     from bbs.core.session import BBSSession
@@ -35,6 +36,10 @@ CREATE TABLE IF NOT EXISTS heard_stations (
     first_heard INTEGER NOT NULL,
     last_heard  INTEGER NOT NULL,
     count       INTEGER NOT NULL DEFAULT 1,
+    lat         REAL,
+    lon         REAL,
+    comment     TEXT    NOT NULL DEFAULT '',
+    source      TEXT    NOT NULL DEFAULT 'heard',
     PRIMARY KEY (callsign, transport)
 );
 CREATE TABLE IF NOT EXISTS heard_paths (
@@ -54,11 +59,6 @@ CREATE TABLE IF NOT EXISTS heard_settings (
 """
 
 _DEFAULT_MAX_AGE_HOURS = 24
-
-
-def _fmt_ts(ts: int) -> str:
-    """Format a Unix timestamp as a compact local datetime string."""
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 def _merge_via(stored: str, incoming: str) -> str:
@@ -99,32 +99,6 @@ def _merge_via(stored: str, incoming: str) -> str:
 
 
 # ── ASCII network map helpers ─────────────────────────────────────────────────
-
-def _map_confirmed_edges(src: str, via: str, bbs_call: str) -> list[tuple[str, str]]:
-    """
-    Extract confirmed (source → dest) hop pairs from a via path string.
-
-    Mirrors the same logic in server/routes/heard.py to avoid a circular
-    import.  A digi sets the H-bit (*) only after it has relayed the frame,
-    so all hops up to and including the last '*' are confirmed; everything
-    after the last '*' is speculative and discarded.
-
-    Empty via → direct reception → single edge (src, bbs_call).
-    No '*' in via → we cannot confirm any relay → empty list.
-    """
-    if not via:
-        return [(src, bbs_call)]
-    hops = [h.strip() for h in via.split(",") if h.strip()]
-    last_star = max(
-        (i for i, h in enumerate(hops) if h.endswith("*")),
-        default=-1,
-    )
-    if last_star < 0:
-        return []
-    confirmed = [h.rstrip("*") for h in hops[: last_star + 1]]
-    chain = [src] + confirmed + [bbs_call]
-    return [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
-
 
 def _render_ascii_map(
     bbs_call: str,
@@ -281,6 +255,49 @@ class HeardPlugin(BBSPlugin):
                         UNIQUE (callsign, transport, via_base)
                     )
                 """)
+            # Seed via-path digipeaters into heard_stations if not already present.
+            # These nodes are only seen relaying frames, never as the source callsign;
+            # they get source='via' and transport='' so the sysop can annotate them
+            # (add lat/lon/comment) even though they are never heard directly.
+            # Re-seed relay digipeaters from heard_paths using the same 3-tier
+            # logic as on_heard(): last-starred digi → source='heard';
+            # earlier starred digi → source='via'; speculative → source='via'.
+            #
+            # Use a real upsert so that:
+            #   - Rows that don't exist yet are created.
+            #   - Existing 'via' rows are upgraded to 'heard' if the tier says so.
+            #   - 'heard' rows are never downgraded back to 'via'.
+            #   - lat/lon/comment (user annotations) are never touched.
+            async with db.execute(
+                "SELECT callsign, via, last_seen FROM heard_paths WHERE via_base != ''"
+            ) as _cur:
+                _via_rows = await _cur.fetchall()
+            for _src, _via_str, _last_seen in _via_rows:
+                _hops = [h.strip() for h in _via_str.split(",") if h.strip()]
+                _last_star = max(
+                    (j for j, h in enumerate(_hops) if h.endswith("*")),
+                    default=-1,
+                )
+                for _i, _hop in enumerate(_hops):
+                    _digi = _hop.rstrip("*").strip().upper()
+                    if not _digi or _digi == _src.upper():
+                        continue
+                    _src_val = 'heard' if (_last_star >= 0 and _i == _last_star) else 'via'
+                    await db.execute(
+                        """
+                        INSERT INTO heard_stations
+                            (callsign, dest, transport, via,
+                             first_heard, last_heard, count, source)
+                        VALUES (?, '', '', '', ?, ?, 0, ?)
+                        ON CONFLICT(callsign, transport) DO UPDATE SET
+                            last_heard = MAX(last_heard, excluded.last_heard),
+                            source     = CASE
+                                WHEN excluded.source = 'heard' THEN 'heard'
+                                ELSE source
+                            END
+                        """,
+                        (_digi, _last_seen, _last_seen, _src_val),
+                    )
             # Seed max_age_hours from YAML config only if not already stored.
             default = int(cfg.get("max_age_hours", _DEFAULT_MAX_AGE_HOURS))
             await db.execute(
@@ -310,15 +327,14 @@ class HeardPlugin(BBSPlugin):
         self._max_age_hours = hours
 
     async def _prune(self) -> int:
-        """Delete entries older than max_age_hours.  Returns the number removed."""
+        """Delete path entries older than max_age_hours.
+        Station records are retained in the database indefinitely.
+        Returns the number of path entries removed."""
         if self._max_age_hours <= 0:
             return 0
         cutoff = int(time.time()) - self._max_age_hours * 3600
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
             cur = await db.execute(
-                "DELETE FROM heard_stations WHERE last_heard < ?", (cutoff,)
-            )
-            await db.execute(
                 "DELETE FROM heard_paths WHERE last_seen < ?", (cutoff,)
             )
             await db.commit()
@@ -344,27 +360,76 @@ class HeardPlugin(BBSPlugin):
         via_base  = ",".join(v.rstrip("*") for v in via)  # normalised for digi rows
 
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
-            # ── heard_stations: OR the * flags for the most-recent path ──────
-            row = await (
-                await db.execute(
-                    "SELECT via FROM heard_stations WHERE callsign=? AND transport=?",
-                    (src_up, transport),
-                )
-            ).fetchone()
-            merged_via = _merge_via(row[0] if row else "", via_str)
+            # ── heard_stations: upsert source station ─────────────────────────
             await db.execute(
                 """
                 INSERT INTO heard_stations
-                    (callsign, dest, transport, via, first_heard, last_heard, count)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                    (callsign, dest, transport, via, first_heard, last_heard, count, source)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 'heard')
                 ON CONFLICT(callsign, transport) DO UPDATE SET
                     last_heard = excluded.last_heard,
                     count      = count + 1,
                     dest       = excluded.dest,
-                    via        = ?
+                    via        = excluded.via,
+                    source     = 'heard'
                 """,
-                (src_up, dest_up, transport, via_str, ts, ts, merged_via),
+                (src_up, dest_up, transport, via_str, ts, ts),
             )
+            # Auto-seed relay digipeaters from the via path.
+            # Three tiers based on position relative to the last H-bit (*):
+            #   i == last_star_idx: BBS received RF directly from this digi.
+            #                       Update last_heard, mark source='heard'.
+            #   i <  last_star_idx: Confirmed intermediate relay (active, but
+            #                       BBS didn't hear it directly).  Update last_heard.
+            #   i >  last_star_idx: Speculative hop (H-bit not yet set).  Only
+            #                       seed the row; do not update last_heard.
+            _last_star = max(
+                (j for j, v in enumerate(via) if v.endswith("*")),
+                default=-1,
+            )
+            for _i, _part in enumerate(via):
+                _digi = _part.rstrip("*").strip().upper()
+                if not _digi or _digi == src_up:
+                    continue
+                if _i > _last_star:
+                    # Speculative — only ensure the row exists.
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO heard_stations
+                            (callsign, dest, transport, via,
+                             first_heard, last_heard, count, source)
+                        VALUES (?, '', '', '', ?, ?, 0, 'via')
+                        """,
+                        (_digi, ts, ts),
+                    )
+                elif _i == _last_star:
+                    # Directly heard: BBS received the RF signal from this node.
+                    await db.execute(
+                        """
+                        INSERT INTO heard_stations
+                            (callsign, dest, transport, via,
+                             first_heard, last_heard, count, source)
+                        VALUES (?, '', '', '', ?, ?, 0, 'heard')
+                        ON CONFLICT(callsign, transport) DO UPDATE SET
+                            last_heard = MAX(last_heard, excluded.last_heard),
+                            source     = 'heard'
+                        """,
+                        (_digi, ts, ts),
+                    )
+                else:
+                    # Confirmed intermediate relay: was active, but not the
+                    # immediate RF source.  Keep source='via', bump last_heard.
+                    await db.execute(
+                        """
+                        INSERT INTO heard_stations
+                            (callsign, dest, transport, via,
+                             first_heard, last_heard, count, source)
+                        VALUES (?, '', '', '', ?, ?, 0, 'via')
+                        ON CONFLICT(callsign, transport) DO UPDATE SET
+                            last_heard = MAX(last_heard, excluded.last_heard)
+                        """,
+                        (_digi, ts, ts),
+                    )
             # ── heard_paths: direct receptions → via_base=""; relayed → base ─
             if is_direct:
                 # Record as a direct-path row (via_base="") so the display can
@@ -440,7 +505,7 @@ class HeardPlugin(BBSPlugin):
         for callsign, via in relayed_rows:
             src = callsign.upper()
             source_nodes.add(src)
-            for edge in _map_confirmed_edges(src, via, bbs_call):
+            for edge in confirmed_edges(src, via, bbs_call):
                 edge_count[edge] += 1
 
         # Digis = non-BBS nodes that appear as a hop target in any confirmed path
@@ -486,11 +551,15 @@ class HeardPlugin(BBSPlugin):
 
     # ── BBS session handler ───────────────────────────────────────────────────
 
-    async def _station_count(self) -> int:
-        """Return the number of rows currently in heard_stations."""
+    async def _station_count(self, cutoff: int = 0) -> int:
+        """Return the number of active (non-expired) directly-heard stations."""
         try:
             async with aiosqlite.connect(self._db_path, timeout=30) as db:
-                async with db.execute("SELECT COUNT(*) FROM heard_stations") as cur:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM heard_stations"
+                    " WHERE source = 'heard' AND transport != '' AND last_heard >= ?",
+                    (cutoff,),
+                ) as cur:
                     row = await cur.fetchone()
             return int(row[0]) if row else 0
         except Exception:
@@ -500,6 +569,11 @@ class HeardPlugin(BBSPlugin):
         term = session.term
         self._max_age_hours = await self._load_max_age()
         await self._prune()
+        cutoff = (
+            int(time.time()) - self._max_age_hours * 3600
+            if self._max_age_hours > 0
+            else 0
+        )
 
         limit    = int(self._cfg.get("limit", 200))
         is_sysop = session.auth.is_sysop
@@ -509,7 +583,7 @@ class HeardPlugin(BBSPlugin):
 
         while True:
             # ── Count for menu label ─────────────────────────────────────────
-            count     = await self._station_count()
+            count     = await self._station_count(cutoff)
             age_label = (
                 f"{self._max_age_hours}h window"
                 if self._max_age_hours > 0
@@ -575,10 +649,11 @@ class HeardPlugin(BBSPlugin):
                                    AND hp.via_base != ''
                                  ORDER BY hp.last_seen DESC LIMIT 1) AS best_digi_via
                         FROM heard_stations hs
+                        WHERE hs.source = 'heard' AND hs.transport != '' AND hs.last_heard >= ?
                         ORDER BY hs.last_heard DESC
                         LIMIT ?
                         """,
-                        (limit,),
+                        (cutoff, limit),
                     ) as cur:
                         rows = await cur.fetchall()
 

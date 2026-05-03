@@ -298,7 +298,8 @@ class TestOnHeard:
 # ---------------------------------------------------------------------------
 
 class TestPrune:
-    async def test_prune_removes_old_entries(self):
+    async def test_prune_retains_old_station_entries(self):
+        """Stations are never deleted by _prune(); only heard_paths entries are."""
         plugin = await _make_plugin(max_age_hours=1)
         old_ts = int(time.time()) - 7200   # 2 hours ago
         new_ts = int(time.time())
@@ -306,6 +307,7 @@ class TestPrune:
         await plugin.on_heard("W1NEW", "APRS", [], new_ts, "agwpe")
 
         removed = await plugin._prune()
+        # _prune() deletes the old heard_paths entry for W1OLD, but keeps the station.
         assert removed == 1
 
         async with aiosqlite.connect(plugin._db_path) as db:
@@ -313,7 +315,7 @@ class TestPrune:
                 "SELECT callsign FROM heard_stations"
             )).fetchall()]
         assert "W1NEW" in calls
-        assert "W1OLD" not in calls
+        assert "W1OLD" in calls  # station record is retained
 
     async def test_prune_zero_max_age_keeps_all(self):
         plugin = await _make_plugin(max_age_hours=0)

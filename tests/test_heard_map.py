@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 from bbs.core.terminal import Terminal, ColorMode
+from bbs.plugins.heard.graph import confirmed_edges as _map_confirmed_edges
 from bbs.plugins.heard.heard import (
     HeardPlugin,
-    _map_confirmed_edges,
     _render_ascii_map,
 )
 

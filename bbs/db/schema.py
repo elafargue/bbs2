@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_VERSION = 5
+_CURRENT_VERSION = 7
 
 
 async def init_db(db_path: str) -> None:
@@ -217,6 +217,29 @@ async def _run_migrations(db: aiosqlite.Connection, from_version: int) -> None:
             pass
         await db.commit()
         from_version = 5
+
+    if from_version < 6:
+        for stmt in (
+            "ALTER TABLE heard_stations ADD COLUMN lat     REAL",
+            "ALTER TABLE heard_stations ADD COLUMN lon     REAL",
+            "ALTER TABLE heard_stations ADD COLUMN comment TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                await db.execute(stmt)
+            except Exception:
+                pass  # column already exists
+        await db.commit()
+        from_version = 6
+
+    if from_version < 7:
+        try:
+            await db.execute(
+                "ALTER TABLE heard_stations ADD COLUMN source TEXT NOT NULL DEFAULT 'heard'"
+            )
+        except Exception:
+            pass  # column already exists
+        await db.commit()
+        from_version = 7
 
     await db.execute(
         "INSERT INTO schema_version (version) VALUES (?)", (_CURRENT_VERSION,)
