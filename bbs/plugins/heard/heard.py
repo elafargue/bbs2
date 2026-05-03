@@ -290,7 +290,6 @@ class HeardPlugin(BBSPlugin):
                              first_heard, last_heard, count, source)
                         VALUES (?, '', '', '', ?, ?, 0, ?)
                         ON CONFLICT(callsign, transport) DO UPDATE SET
-                            last_heard = MAX(last_heard, excluded.last_heard),
                             source     = CASE
                                 WHEN excluded.source = 'heard' THEN 'heard'
                                 ELSE source
@@ -578,9 +577,6 @@ class HeardPlugin(BBSPlugin):
         limit    = int(self._cfg.get("limit", 200))
         is_sysop = session.auth.is_sysop
 
-        # Action requested this iteration; None = show menu only.
-        action: str | None = None
-
         while True:
             # ── Count for menu label ─────────────────────────────────────────
             count     = await self._station_count(cutoff)
@@ -602,18 +598,14 @@ class HeardPlugin(BBSPlugin):
             if is_sysop:
                 menu.insert(0, ("C", f"Configure (max age: {self._max_age_hours}h)"))
 
-            if action is None:
-                # First iteration or post-map: just show the menu.
-                await term.send_menu("HEARD STATIONS", menu)
-                action = (await term.readline(max_len=4, timeout=120)).strip().upper()
+            action = await term.prompt_menu("HEARD STATIONS", menu, max_len=4, timeout=120)
 
             # ── Dispatch ────────────────────────────────────────────────────
-            if action == "Q" or not action:
+            if action == "Q":
                 break
 
             if action == "C" and is_sysop:
                 await self._configure(session)
-                action = None
                 continue
 
             if action in ("M", "MS"):
@@ -625,7 +617,6 @@ class HeardPlugin(BBSPlugin):
                     term=term,
                 )
                 await term.paginate(map_lines)
-                action = None
                 continue
 
             if action in ("H", "HS"):
@@ -724,9 +715,6 @@ class HeardPlugin(BBSPlugin):
                         )
                     await term.paginate(lines)
 
-            # After any listing/map, go back to menu-only next iteration
-            action = None
-
         await term.sendln()
 
     async def _clear(self) -> int:
@@ -746,14 +734,14 @@ class HeardPlugin(BBSPlugin):
                 f"Current max age: {term.style(str(self._max_age_hours), 'accent')} hours  "
                 f"(0 = keep forever)"
             )
-            await term.send_menu(
+            choice = await term.prompt_menu(
                 "CONFIGURE",
                 [("A", f"Set max age (current: {self._max_age_hours}h)"),
                  ("X", "Clear all heard entries"),
                  ("Q", "Back")],
+                max_len=4, timeout=60,
             )
-            choice = (await term.readline(max_len=4, timeout=60)).strip().upper()
-            if choice == "Q" or not choice:
+            if choice == "Q":
                 break
             elif choice == "A":
                 await term.send("New max age in hours (Enter to cancel): ")

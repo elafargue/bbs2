@@ -404,7 +404,8 @@ class TestHeardMenu:
         await logged_in_client.wait_for(HEARD_PROMPT)
         await logged_in_client.sendln("Q")
         text = await logged_in_client.wait_for(">")
-        assert "[B]" in text or "Bye" in text
+        # Full menu: "[B] Bye (disconnect)"; compact menu: "..., B, ..."
+        assert "[B]" in text or "Bye" in text or ", B," in text
 
 
 class TestNonSysopAccess:

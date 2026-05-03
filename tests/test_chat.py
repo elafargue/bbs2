@@ -41,8 +41,8 @@ class TestChatCommands:
         await logged_in_client.wait_for("main>")
         await logged_in_client.sendln("/QUIT")
         text = await logged_in_client.wait_for(">")
-        # Back at main menu — should see the menu items
-        assert "[B]" in text or "[C]" in text or "[Q]" in text
+        # Back at main menu — full menu: "[B]"/"[C]"; compact menu: "..., C, ..."
+        assert "[B]" in text or "[C]" in text or "[Q]" in text or ", C," in text or ", B," in text
 
     async def test_unknown_slash_command(self, logged_in_client: BbsTestClient):
         await logged_in_client.sendln("C")

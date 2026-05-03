@@ -79,3 +79,78 @@ class TestMainMenu:
         await logged_in_client.sendln("B")
         text = await logged_in_client.wait_for("73")
         assert "73" in text
+
+
+class TestMenuBandwidthMode:
+    """First display is full; subsequent displays are compact; bare Enter redraws full."""
+
+    async def test_first_display_is_full_menu(self, bbs_server: _BbsServerHandle):
+        """After login the full menu must show item descriptions."""
+        async with BbsTestClient(bbs_server.host, bbs_server.port) as client:
+            text = await client.do_login("W1TMBD1")
+            # Full menu contains descriptions like "Bulletins" or "Chat"
+            assert "Bulletins" in text or "Chat" in text
+
+    async def test_second_display_is_compact(self, logged_in_client: BbsTestClient):
+        """After the first menu, returning from a command should show the
+        compact (keys-only) menu."""
+        # Send an unknown command to cycle back to the menu prompt
+        await logged_in_client.sendln("Z")
+        text = await logged_in_client.wait_for(">")
+        # Compact menu: descriptions like "Bulletins" or "Chat" should NOT appear,
+        # but the keys should be present in the comma-separated list.
+        assert "Bulletins" not in text
+        assert "Chat" not in text
+        assert "B" in text and "C" in text
+
+    async def test_bare_enter_redraws_full_menu(self, logged_in_client: BbsTestClient):
+        """Pressing Enter (empty input) at the compact menu redraws the full menu."""
+        # Cycle past the first (full) menu
+        await logged_in_client.sendln("Z")
+        await logged_in_client.wait_for(">")
+        # Now on compact menu — send bare Enter
+        await logged_in_client.sendln("")
+        text = await logged_in_client.wait_for(">")
+        # Full menu has item descriptions
+        assert "Bulletins" in text or "Chat" in text
+
+    async def test_bare_enter_does_not_disconnect(self, logged_in_client: BbsTestClient):
+        """Pressing Enter must never disconnect the user."""
+        await logged_in_client.sendln("")
+        # If disconnected we would never get the prompt back
+        text = await logged_in_client.wait_for(">")
+        assert ">" in text
+
+    async def test_plugin_first_entry_is_full_menu(self, logged_in_client: BbsTestClient):
+        """Entering a plugin for the first time shows the full menu."""
+        await logged_in_client.sendln("BU")
+        text = await logged_in_client.wait_for("choice:")
+        # Full plugin menu must contain descriptions
+        assert "Areas" in text or "List messages" in text or "Send" in text
+
+    async def test_plugin_second_loop_is_compact(self, logged_in_client: BbsTestClient):
+        """Within a plugin visit, the second menu display is compact."""
+        await logged_in_client.sendln("BU")
+        await logged_in_client.wait_for("choice:")  # consume full menu
+        # Send unknown command so plugin loops back to its menu
+        await logged_in_client.sendln("Z")
+        text = await logged_in_client.wait_for("choice:")
+        # Compact: descriptions gone, keys present
+        assert "List messages" not in text
+        assert "Areas" not in text
+        # Keys like A, L, S, Q should be in the comma list
+        assert "A" in text and "Q" in text
+
+    async def test_plugin_reentry_is_full_menu(self, logged_in_client: BbsTestClient):
+        """Re-entering a plugin after returning to main menu shows the full menu again."""
+        # First visit
+        await logged_in_client.sendln("BU")
+        await logged_in_client.wait_for("choice:")
+        # Exit plugin back to main menu
+        await logged_in_client.sendln("Q")
+        await logged_in_client.wait_for(">")
+        # Re-enter
+        await logged_in_client.sendln("BU")
+        text = await logged_in_client.wait_for("choice:")
+        # Should be full again
+        assert "Areas" in text or "List messages" in text or "Send" in text

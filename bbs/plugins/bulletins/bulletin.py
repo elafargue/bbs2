@@ -163,9 +163,7 @@ class BulletinsPlugin(BBSPlugin):
                 items.insert(4, ("D#", "Delete message number #"))
             if session.auth.is_sysop:
                 items.insert(-1, ("SA", "Sysop: manage areas"))
-            await term.send_menu("BULLETINS", items)
-
-            raw = (await term.readline(max_len=8)).upper().strip()
+            raw = await term.prompt_menu("BULLETINS", items)
             choice, numarg = _parse_cmd(raw)
 
             if choice == "Q":
@@ -185,7 +183,7 @@ class BulletinsPlugin(BBSPlugin):
                 if not current_area_id:
                     await term.sendln("Select an area first (A).")
                 else:
-                    await self._do_read(session, current_area_id, current_area_name, numarg)
+                    await self._do_read(session, current_area_id, numarg)
             elif choice == "S":
                 await self._post_message(session, current_area_id, current_area_name)
             elif choice == "D":
@@ -286,8 +284,7 @@ class BulletinsPlugin(BBSPlugin):
                 ("D #", "Set area # as default"),
                 ("Q",   "Back"),
             ]
-            await term.send_menu("SYSOP: AREAS", items)
-            raw = (await term.readline(max_len=8)).upper().strip()
+            raw = await term.prompt_menu("SYSOP: AREAS", items)
             cmd, numarg = _parse_cmd(raw)
             if cmd == "Q":
                 break
@@ -554,27 +551,13 @@ class BulletinsPlugin(BBSPlugin):
         self, session: "BBSSession", area_id: int, area_name: str
     ) -> None:
         term = session.term
-        while True:
-            messages = await self._fetch_messages(
-                session.db, area_id, session.auth.callsign, session.auth.is_sysop
-            )
-            if not messages:
-                await term.sendln(term.note(f"No messages in {area_name}."))
-                return
-            await self._show_message_index(term, area_name, messages)
-            await term.send(term.prompt("R# / D# / ENTER to return: "))
-            raw = (await term.readline(max_len=8)).upper().strip()
-            if not raw:
-                return
-            cmd, numarg = _parse_cmd(raw)
-            if cmd == "R":
-                await self._do_read(session, area_id, area_name, numarg, messages=messages)
-                return  # post-read prompt handles further navigation
-            elif cmd == "D":
-                await self._delete_message(session, area_id, numarg)
-                # loop → refresh list
-            else:
-                return
+        messages = await self._fetch_messages(
+            session.db, area_id, session.auth.callsign, session.auth.is_sysop
+        )
+        if not messages:
+            await term.sendln(term.note(f"No messages in {area_name}."))
+            return
+        await self._show_message_index(term, area_name, messages)
 
     # ── Read a single message ─────────────────────────────────────────────────
 
@@ -582,9 +565,7 @@ class BulletinsPlugin(BBSPlugin):
         self,
         session: "BBSSession",
         area_id: int,
-        area_name: str,
         numarg: Optional[str],
-        messages: Optional[list] = None,
     ) -> None:
         term = session.term
         if not numarg or not numarg.isdigit():
@@ -593,51 +574,14 @@ class BulletinsPlugin(BBSPlugin):
         if not numarg.isdigit():
             return
         msg_num = int(numarg)
-        if messages is None:
-            messages = await self._fetch_messages(
-                session.db, area_id, session.auth.callsign, session.auth.is_sysop
-            )
+        messages = await self._fetch_messages(
+            session.db, area_id, session.auth.callsign, session.auth.is_sysop
+        )
         target = next((m for m in messages if m["msg_number"] == msg_num), None)
         if not target:
             await term.sendln(term.warn("Message not found."))
             return
         await self._display_message_body(session, target)
-
-        # Compact post-read prompt — no need to redisplay the full menu
-        while True:
-            await term.send(term.prompt("L / R# / D# or ENTER: "))
-            raw = (await term.readline(max_len=8)).upper().strip()
-            if not raw:
-                return
-            cmd, narg = _parse_cmd(raw)
-            if cmd == "L":
-                messages = await self._fetch_messages(
-                    session.db, area_id, session.auth.callsign, session.auth.is_sysop
-                )
-                if messages:
-                    await self._show_message_index(term, area_name, messages)
-                else:
-                    await term.sendln(term.note(f"No messages in {area_name}."))
-            elif cmd == "R":
-                if not narg or not narg.isdigit():
-                    await term.send("Message#: ")
-                    narg = (await term.readline(max_len=6)).strip()
-                if narg and narg.isdigit():
-                    messages = await self._fetch_messages(
-                        session.db, area_id, session.auth.callsign, session.auth.is_sysop
-                    )
-                    t = next((m for m in messages if m["msg_number"] == int(narg)), None)
-                    if t:
-                        await self._display_message_body(session, t)
-                    else:
-                        await term.sendln(term.warn("Message not found."))
-            elif cmd == "D":
-                await self._delete_message(session, area_id, narg)
-                messages = await self._fetch_messages(
-                    session.db, area_id, session.auth.callsign, session.auth.is_sysop
-                )
-            else:
-                return
 
     async def _display_message_body(
         self, session: "BBSSession", target: Any

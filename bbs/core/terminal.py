@@ -16,6 +16,7 @@ Design goals
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from enum import Enum
 from typing import Optional
@@ -117,6 +118,8 @@ class Terminal:
         self._must_echo = must_echo  # True for web sessions: can't be suppressed by callers
         self._eol = eol
         self._buf = bytearray()
+        # Tracks which menu titles have already been shown full in this session.
+        self._shown_menus: set[str] = set()
 
     @property
     def ansi(self) -> bool:
@@ -287,43 +290,115 @@ class Terminal:
 
     # ── Menus ─────────────────────────────────────────────────────────────────
 
+    def reset_menu_state(self, title: str | None = None) -> None:
+        """
+        Mark a menu title (or all menus if *title* is None) as unseen so the
+        next call to send_menu will display the full version again.
+        """
+        if title is None:
+            self._shown_menus.clear()
+        else:
+            self._shown_menus.discard(title)
+
+    @contextlib.contextmanager
+    def menu_scope(self):
+        """
+        Sync context manager for plugin sub-menu isolation.
+
+        On entry the shown-menus set is cleared so every plugin call starts
+        with a fresh full-menu display.  On exit the pre-entry state is
+        restored, preserving whatever the caller (e.g. the main session loop)
+        had already recorded.
+        """
+        saved = frozenset(self._shown_menus)
+        self._shown_menus.clear()
+        try:
+            yield
+        finally:
+            self._shown_menus = set(saved)
+
     async def send_menu(
-        self, title: str, items: list[tuple[str, str]], prompt: str = "Enter choice: "
+        self,
+        title: str,
+        items: list[tuple[str, str]],
+        prompt: str = "Enter choice: ",
+        *,
+        enter_hint: bool = False,
     ) -> None:
         """
-        Display a compact menu and prompt.
+        Display a menu and prompt, choosing full or compact format automatically.
+
+        The first time a given *title* is seen in this terminal session the full
+        two-column layout is rendered.  On every subsequent call the compact
+        (keys-only) form is used instead.  Pass ``enter_hint=True`` when the
+        caller treats empty input as a redraw request so the hint is shown.
 
         items: list of (key, description) e.g. [("B", "Bulletins"), ("C", "Chat")]
         """
-        await self.sendln()
-        if self.ansi:
-            await self.send_header(f" {title} ")
-        else:
-            await self.sendln(f"=== {title} ===")
-
-        # Two-column layout to save screen lines at 1200 bps
-        half = (len(items) + 1) // 2
-        left = items[:half]
-        right = items[half:]
-        col_w = self.width // 2 - 2
-
-        for i, (litem, ritem) in enumerate(
-            zip(left, right + [("", "")] * (half - len(right)))
-        ):
-            lkey, ldesc = litem
-            rkey, rdesc = ritem
+        if title not in self._shown_menus:
+            # ── Full menu ────────────────────────────────────────────────────
+            await self.sendln()
             if self.ansi:
-                lcell = f"{self._key_style(lkey)} {ldesc}"
-                rcell = f"{self._key_style(rkey)} {rdesc}" if rkey else ""
+                await self.send_header(f" {title} ")
             else:
-                lcell = f"[{lkey}] {ldesc}"
-                rcell = f"[{rkey}] {rdesc}" if rkey else ""
-            # Pad lcell to col_w *visible* characters; ANSI codes must not count.
-            pad = max(0, col_w - self._visible_len(lcell))
-            self.writeln(f"  {lcell}{' ' * pad}  {rcell}")
+                await self.sendln(f"=== {title} ===")
 
-        await self.sendln()
-        await self.send(prompt)
+            # Two-column layout to save screen lines at 1200 bps
+            half = (len(items) + 1) // 2
+            left = items[:half]
+            right = items[half:]
+            col_w = self.width // 2 - 2
+
+            for litem, ritem in zip(left, right + [("", "")] * (half - len(right))):
+                lkey, ldesc = litem
+                rkey, rdesc = ritem
+                if self.ansi:
+                    lcell = f"{self._key_style(lkey)} {ldesc}"
+                    rcell = f"{self._key_style(rkey)} {rdesc}" if rkey else ""
+                else:
+                    lcell = f"[{lkey}] {ldesc}"
+                    rcell = f"[{rkey}] {rdesc}" if rkey else ""
+                pad = max(0, col_w - self._visible_len(lcell))
+                self.writeln(f"  {lcell}{' ' * pad}  {rcell}")
+
+            await self.sendln()
+            await self.send(prompt)
+            self._shown_menus.add(title)
+        else:
+            # ── Compact menu ─────────────────────────────────────────────────
+            keys = ", ".join(key for key, _ in items if key)
+            await self.sendln()
+            if enter_hint:
+                hint = self.note("ENTER") + " to redraw"
+                await self.sendln(f"{keys} | {hint}")
+            else:
+                await self.sendln(keys)
+            await self.send(prompt)
+
+    async def prompt_menu(
+        self,
+        title: str,
+        items: list[tuple[str, str]],
+        prompt: str = "Enter choice: ",
+        *,
+        max_len: int = 8,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """
+        Show the menu (full on first call, compact on repeats) then read and
+        return a non-empty, stripped, upper-cased choice.
+
+        Bare Enter (empty input) resets the title's shown state so the next
+        iteration displays the full menu again, then loops — it never returns
+        an empty string.
+        """
+        while True:
+            await self.send_menu(title, items, prompt=prompt, enter_hint=True)
+            raw = (await self.readline(max_len=max_len, timeout=timeout)).strip().upper()
+            if not raw:
+                self.reset_menu_state(title)
+                continue
+            return raw
 
     # ── Paging ────────────────────────────────────────────────────────────────
 
@@ -342,6 +417,15 @@ class Terminal:
                 await self.flush()
                 await self.send(self._more_style())
                 ch = await self.readchar()
+                # Consume complementary line ending (\r\n or \n\r)
+                if ch in ("\r", "\n"):
+                    complement = b"\n" if ch == "\r" else b"\r"
+                    try:
+                        peek = await asyncio.wait_for(self._reader.read(1), timeout=0.05)
+                        if peek and peek != complement:
+                            self._reader.feed_data(peek)
+                    except asyncio.TimeoutError:
+                        pass
                 await self.sendln()
                 if ch.upper() == "Q":
                     return False

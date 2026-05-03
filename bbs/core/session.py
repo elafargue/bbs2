@@ -256,14 +256,17 @@ class BBSSession:
                 ("?", "Help"),
             ]
 
-            await self.term.send_menu(self.cfg.name, menu_items, prompt="> ")
+            await self.term.send_menu(self.cfg.name, menu_items, prompt="> ", enter_hint=True)
+
             choice_raw = await self.term.readline(
                 max_len=8, timeout=idle_timeout
             )
+
+            # Empty input (bare Enter) redraws the full menu; it does not disconnect.
+            # Actual idle timeout is detected at the top of the loop via idle_seconds.
             if not choice_raw:
-                # Timeout or EOF
-                await self.term.sendln(self.term.warn("Idle timeout — disconnecting."))
-                break
+                self.term.reset_menu_state(self.cfg.name)
+                continue
 
             self.touch()
             choice = choice_raw.strip().upper()
@@ -279,7 +282,8 @@ class BBSSession:
             else:
                 plugin = self.plugin_registry.get_by_key(choice)
                 if plugin:
-                    await plugin.handle_session(self)
+                    with self.term.menu_scope():
+                        await plugin.handle_session(self)
                 else:
                     await self.term.sendln(self.term.warn("Unknown command."))
 
