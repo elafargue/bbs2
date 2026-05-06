@@ -233,6 +233,54 @@ class TestOnHeard:
             )).fetchone()
         assert row is not None
 
+    async def test_intermediate_without_star_keeps_heard_within_grace(self):
+        plugin = await _make_plugin()
+        now = int(time.time())
+
+        # KBETH is directly heard here (it's the last-starred hop)
+        await plugin.on_heard(
+            "N6PAA", "BEACON", ["KJOHN*", "KBETH*", "WOODY"], now, "agwpe"
+        )
+        # Later packet: KBETH is now intermediate without '*', but still within grace
+        await plugin.on_heard(
+            "N6PAA",
+            "BEACON",
+            ["KJOHN*", "KBETH", "WOODY", "KJOHN*", "KBANN"],
+            now + 60,
+            "agwpe",
+        )
+
+        async with aiosqlite.connect(plugin._db_path) as db:
+            row = await (await db.execute(
+                "SELECT source FROM heard_stations WHERE callsign='KBETH' AND transport=''"
+            )).fetchone()
+        assert row is not None
+        assert row[0] == "heard"
+
+    async def test_intermediate_without_star_downgrades_after_grace(self):
+        plugin = await _make_plugin()
+        now = int(time.time())
+
+        # KBETH is directly heard here (it's the last-starred hop)
+        await plugin.on_heard(
+            "N6PAA", "BEACON", ["KJOHN*", "KBETH*", "WOODY"], now, "agwpe"
+        )
+        # Later packet: KBETH is intermediate without '*', beyond grace window
+        await plugin.on_heard(
+            "N6PAA",
+            "BEACON",
+            ["KJOHN*", "KBETH", "WOODY", "KJOHN*", "KBANN"],
+            now + 121,
+            "agwpe",
+        )
+
+        async with aiosqlite.connect(plugin._db_path) as db:
+            row = await (await db.execute(
+                "SELECT source FROM heard_stations WHERE callsign='KBETH' AND transport=''"
+            )).fetchone()
+        assert row is not None
+        assert row[0] == "via"
+
     async def test_same_base_path_merges_stars_in_heard_paths(self):
         """Two receptions of the same base path must produce ONE heard_paths row
         with OR'd stars, not two separate rows."""

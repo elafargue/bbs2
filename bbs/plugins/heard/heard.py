@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS heard_stations (
     lon         REAL,
     comment     TEXT    NOT NULL DEFAULT '',
     source      TEXT    NOT NULL DEFAULT 'heard',
+    last_direct_heard INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (callsign, transport)
 );
 CREATE TABLE IF NOT EXISTS heard_paths (
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS heard_settings (
 """
 
 _DEFAULT_MAX_AGE_HOURS = 24
+_DIRECT_GRACE_SECONDS = 120
 
 
 def _merge_via(stored: str, incoming: str) -> str:
@@ -236,6 +238,12 @@ class HeardPlugin(BBSPlugin):
                 )
             except Exception:
                 pass  # column already exists
+            try:
+                await db.execute(
+                    "ALTER TABLE heard_stations ADD COLUMN last_direct_heard INTEGER NOT NULL DEFAULT 0"
+                )
+            except Exception:
+                pass  # column already exists
             # Migrate heard_paths: if via_base column is absent the table uses
             # the old schema (unique on raw via string).  Drop and recreate —
             # this is ephemeral data and correctness matters more than history.
@@ -255,48 +263,6 @@ class HeardPlugin(BBSPlugin):
                         UNIQUE (callsign, transport, via_base)
                     )
                 """)
-            # Seed via-path digipeaters into heard_stations if not already present.
-            # These nodes are only seen relaying frames, never as the source callsign;
-            # they get source='via' and transport='' so the sysop can annotate them
-            # (add lat/lon/comment) even though they are never heard directly.
-            # Re-seed relay digipeaters from heard_paths using the same 3-tier
-            # logic as on_heard(): last-starred digi → source='heard';
-            # earlier starred digi → source='via'; speculative → source='via'.
-            #
-            # Use a real upsert so that:
-            #   - Rows that don't exist yet are created.
-            #   - Existing 'via' rows are upgraded to 'heard' if the tier says so.
-            #   - 'heard' rows are never downgraded back to 'via'.
-            #   - lat/lon/comment (user annotations) are never touched.
-            async with db.execute(
-                "SELECT callsign, via, last_seen FROM heard_paths WHERE via_base != ''"
-            ) as _cur:
-                _via_rows = await _cur.fetchall()
-            for _src, _via_str, _last_seen in _via_rows:
-                _hops = [h.strip() for h in _via_str.split(",") if h.strip()]
-                _last_star = max(
-                    (j for j, h in enumerate(_hops) if h.endswith("*")),
-                    default=-1,
-                )
-                for _i, _hop in enumerate(_hops):
-                    _digi = _hop.rstrip("*").strip().upper()
-                    if not _digi or _digi == _src.upper():
-                        continue
-                    _src_val = 'heard' if (_last_star >= 0 and _i == _last_star) else 'via'
-                    await db.execute(
-                        """
-                        INSERT INTO heard_stations
-                            (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source)
-                        VALUES (?, '', '', '', ?, ?, 0, ?)
-                        ON CONFLICT(callsign, transport) DO UPDATE SET
-                            source     = CASE
-                                WHEN excluded.source = 'heard' THEN 'heard'
-                                ELSE source
-                            END
-                        """,
-                        (_digi, _last_seen, _last_seen, _src_val),
-                    )
             # Seed max_age_hours from YAML config only if not already stored.
             default = int(cfg.get("max_age_hours", _DEFAULT_MAX_AGE_HOURS))
             await db.execute(
@@ -363,23 +329,28 @@ class HeardPlugin(BBSPlugin):
             await db.execute(
                 """
                 INSERT INTO heard_stations
-                    (callsign, dest, transport, via, first_heard, last_heard, count, source)
-                VALUES (?, ?, ?, ?, ?, ?, 1, 'heard')
+                    (callsign, dest, transport, via, first_heard, last_heard, count, source, last_direct_heard)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 'heard', ?)
                 ON CONFLICT(callsign, transport) DO UPDATE SET
                     last_heard = excluded.last_heard,
                     count      = count + 1,
                     dest       = excluded.dest,
                     via        = excluded.via,
-                    source     = 'heard'
+                    source     = 'heard',
+                    last_direct_heard = CASE
+                        WHEN ? THEN excluded.last_direct_heard
+                        ELSE last_direct_heard
+                    END
                 """,
-                (src_up, dest_up, transport, via_str, ts, ts),
+                (src_up, dest_up, transport, via_str, ts, ts, ts if is_direct else 0, 1 if is_direct else 0),
             )
             # Auto-seed relay digipeaters from the via path.
             # Three tiers based on position relative to the last H-bit (*):
             #   i == last_star_idx: BBS received RF directly from this digi.
             #                       Update last_heard, mark source='heard'.
-            #   i <  last_star_idx: Confirmed intermediate relay (active, but
-            #                       BBS didn't hear it directly).  Update last_heard.
+            #   i <  last_star_idx: If this hop has '*', treat it as direct.
+            #                       Otherwise keep 'heard' only within a short
+            #                       grace window after the last direct hear.
             #   i >  last_star_idx: Speculative hop (H-bit not yet set).  Only
             #                       seed the row; do not update last_heard.
             _last_star = max(
@@ -396,8 +367,8 @@ class HeardPlugin(BBSPlugin):
                         """
                         INSERT OR IGNORE INTO heard_stations
                             (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source)
-                        VALUES (?, '', '', '', ?, ?, 0, 'via')
+                             first_heard, last_heard, count, source, last_direct_heard)
+                        VALUES (?, '', '', '', ?, ?, 0, 'via', 0)
                         """,
                         (_digi, ts, ts),
                     )
@@ -407,28 +378,51 @@ class HeardPlugin(BBSPlugin):
                         """
                         INSERT INTO heard_stations
                             (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source)
-                        VALUES (?, '', '', '', ?, ?, 0, 'heard')
+                             first_heard, last_heard, count, source, last_direct_heard)
+                        VALUES (?, '', '', '', ?, ?, 0, 'heard', ?)
                         ON CONFLICT(callsign, transport) DO UPDATE SET
                             last_heard = MAX(last_heard, excluded.last_heard),
+                            last_direct_heard = MAX(last_direct_heard, excluded.last_direct_heard),
                             source     = 'heard'
                         """,
-                        (_digi, ts, ts),
+                        (_digi, ts, ts, ts),
                     )
                 else:
-                    # Confirmed intermediate relay: was active, but not the
-                    # immediate RF source.  Keep source='via', bump last_heard.
-                    await db.execute(
-                        """
-                        INSERT INTO heard_stations
-                            (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source)
-                        VALUES (?, '', '', '', ?, ?, 0, 'via')
-                        ON CONFLICT(callsign, transport) DO UPDATE SET
-                            last_heard = MAX(last_heard, excluded.last_heard)
-                        """,
-                        (_digi, ts, ts),
-                    )
+                    if _part.endswith("*"):
+                        # Some transports mark intermediate digis with '*'.
+                        await db.execute(
+                            """
+                            INSERT INTO heard_stations
+                                (callsign, dest, transport, via,
+                                 first_heard, last_heard, count, source, last_direct_heard)
+                            VALUES (?, '', '', '', ?, ?, 0, 'heard', ?)
+                            ON CONFLICT(callsign, transport) DO UPDATE SET
+                                last_heard = MAX(last_heard, excluded.last_heard),
+                                last_direct_heard = MAX(last_direct_heard, excluded.last_direct_heard),
+                                source     = 'heard'
+                            """,
+                            (_digi, ts, ts, ts),
+                        )
+                    else:
+                        # No star on this hop: keep 'heard' only briefly after
+                        # a recent direct hear; otherwise downgrade to 'via'.
+                        cutoff = ts - _DIRECT_GRACE_SECONDS
+                        await db.execute(
+                            """
+                            INSERT INTO heard_stations
+                                (callsign, dest, transport, via,
+                                 first_heard, last_heard, count, source, last_direct_heard)
+                            VALUES (?, '', '', '', ?, ?, 0, 'via', 0)
+                            ON CONFLICT(callsign, transport) DO UPDATE SET
+                                last_heard = MAX(last_heard, excluded.last_heard),
+                                source     = CASE
+                                    WHEN COALESCE(heard_stations.last_direct_heard, 0) >= ?
+                                    THEN 'heard'
+                                    ELSE 'via'
+                                END
+                            """,
+                            (_digi, ts, ts, cutoff),
+                        )
             # ── heard_paths: direct receptions → via_base=""; relayed → base ─
             if is_direct:
                 # Record as a direct-path row (via_base="") so the display can
