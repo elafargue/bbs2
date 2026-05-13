@@ -15,12 +15,13 @@ Commands (from the plugin's own sub-menu)
   L    — List messages in current area
   R #  — Read message number #
   D #  — Delete message number # (authenticated / sysop only; shown only when area selected)
-  S    — Send / post a new message
+  S [call] — Send / post a new message (optionally to a specific recipient callsign instead of ALL)
   Q    — Return to main menu
 """
 from __future__ import annotations
 
 import re
+import textwrap
 import time
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -152,11 +153,11 @@ class BulletinsPlugin(BBSPlugin):
                 area_label = "(no area selected)"
 
             items: list[tuple[str, str]] = [
-                ("A",   "Areas (list/select)"),
-                ("L",   f"List messages  [{area_label}]"),
-                ("R#", "Read message number #"),
-                ("S",   "Send message"),
-                ("Q",   "Back to main menu"),
+                ("A",     "Areas (list/select)"),
+                ("L",     f"List messages  [{area_label}]"),
+                ("R#",   "Read message number #"),
+                ("S [call]", "Send message"),
+                ("Q",     "Back to main menu"),
                 ("?",   "Help"),
             ]
             if current_area_id:
@@ -185,7 +186,10 @@ class BulletinsPlugin(BBSPlugin):
                 else:
                     await self._do_read(session, current_area_id, numarg)
             elif choice == "S":
-                await self._post_message(session, current_area_id, current_area_name)
+                # numarg may be a callsign token like 'ALL' or 'W1AW'
+                to_preset = numarg.upper() if numarg else None
+                await self._post_message(session, current_area_id, current_area_name,
+                                         to_call=to_preset)
             elif choice == "D":
                 if not current_area_id:
                     await term.sendln("Select an area first (A).")
@@ -227,7 +231,7 @@ class BulletinsPlugin(BBSPlugin):
             f"  {term.ok('YES')}  List messages             (L)",
             f"  {term.ok('YES')}  Read public messages      (R#)",
             f"  {term.ok('YES')}  Read private messages addressed to you",
-            f"  {term.warn('NO ')}  Post messages",
+            f"  {term.ok('YES')}  Post messages (without authenticated 'CALLSIGN*' mark) (S)",
             f"  {term.warn('NO ')}  Delete messages",
             "",
             term.label("AUTHENTICATED  (IDENTIFIED + OTP challenge passed — type A)", "meta"),
@@ -512,10 +516,32 @@ class BulletinsPlugin(BBSPlugin):
         async with db.execute(sql, params) as cur:
             return await cur.fetchall()
 
+    async def _fetch_read_ids(
+        self, db: "aiosqlite.Connection", area_id: int, user_id: Optional[int]
+    ) -> Optional[set]:
+        """Return the set of message IDs in *area_id* already read by *user_id*.
+
+        Returns ``None`` when there is no user_id (anonymous / unidentified
+        sessions) so callers can skip the unread indicator entirely.
+        """
+        if not user_id:
+            return None
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT r.message_id
+               FROM read_receipts r
+               JOIN bulletin_messages m ON m.id = r.message_id
+               WHERE r.user_id=? AND m.area_id=? AND m.deleted=0""",
+            (user_id, area_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {row["message_id"] for row in rows}
+
     async def _show_message_index(
-        self, term: Any, area_name: str, messages: list
+        self, term: Any, area_name: str, messages: list,
+        read_ids: Optional[set] = None,
     ) -> None:
-        hdr = f"{'#':<5} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
+        hdr = f"{'#':<6} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
         sep = "-" * len(hdr)
         lines = [
             "",
@@ -530,14 +556,16 @@ class BulletinsPlugin(BBSPlugin):
             date = time.strftime("%m/%d/%Y %H:%M:%S", time.localtime(m["created_at"]))
             subj = str(m["subject"])[:self._max_subject]
             from_disp = m["from_call"] + ("*" if m["authenticated"] else "")
-            num_str   = f"{m['msg_number']:<5}"
+            unread    = read_ids is not None and m["id"] not in read_ids
+            num_disp  = f"{m['msg_number']:<4}{'*' if unread else ' '} "
+            num_color = "warning" if unread else "accent"
             st_str    = f"{st:<2}"
             from_str  = f"{from_disp:<9}"
             date_str  = f"{date:<20}"
             is_auth   = bool(m["authenticated"])
             from_tone = "success" if is_auth else "orange"
             lines.append(
-                f"{term.style(num_str, 'accent', bold=True)} "
+                f"{term.style(num_disp, num_color, bold=True)}"
                 f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
                 f"{size:<6} {to:<7} {term.style(from_str, from_tone, bold=True)} "
                 f"{term.note(date_str)} {subj}"
@@ -557,7 +585,8 @@ class BulletinsPlugin(BBSPlugin):
         if not messages:
             await term.sendln(term.note(f"No messages in {area_name}."))
             return
-        await self._show_message_index(term, area_name, messages)
+        read_ids = await self._fetch_read_ids(session.db, area_id, session.auth.user_id)
+        await self._show_message_index(term, area_name, messages, read_ids=read_ids)
 
     # ── Read a single message ─────────────────────────────────────────────────
 
@@ -600,7 +629,15 @@ class BulletinsPlugin(BBSPlugin):
             f"{term.label('Subj:', 'meta')} {term.style(str(target['subject']), 'accent', bold=True)}",
             term.note("-" * 60),
         ]
-        msg_lines += str(target["body"]).splitlines()
+        for raw in str(target["body"]).splitlines():
+            # Keep display width readable on packet links regardless of terminal width.
+            wrapped = textwrap.wrap(
+                raw,
+                width=80,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            msg_lines.extend(wrapped or [""])
         msg_lines.append("")
         await term.paginate(msg_lines)
 
@@ -621,6 +658,7 @@ class BulletinsPlugin(BBSPlugin):
         session: "BBSSession",
         area_id: Optional[int],
         area_name: str,
+        to_call: Optional[str] = None,
     ) -> None:
         term = session.term
         db = session.db
@@ -648,18 +686,22 @@ class BulletinsPlugin(BBSPlugin):
             await term.sendln(term.note("Cancelled."))
             return
 
-        # Gather To: (default ALL)
-        await term.send("To [ALL]: ")
-        to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
+        # Gather To: (default ALL) — skip prompt when pre-supplied via command (e.g. "S W1AW")
+        if to_call:
+            await term.sendln(f"To: {term.style(to_call, 'accent', bold=True)}")
+        else:
+            await term.send("To [ALL]: ")
+            to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
 
         # Gather body — /EX on its own line ends input (classic BBS convention)
         await term.sendln(term.label(f"Enter message body ({self._max_body} bytes max).", 'meta'))
         await term.sendln(term.note("Type /EX on a line by itself when done:"))
         body_lines = []
         total_bytes = 0
+        body_line_max = max(80, int(self._max_body))
         while True:
             await term.send("> ")
-            line = await term.readline(max_len=80, echo=False)
+            line = await term.readline(max_len=body_line_max, echo=False)
             if line.strip().upper() == "/EX":
                 break
             total_bytes += len(line) + 1
@@ -670,10 +712,10 @@ class BulletinsPlugin(BBSPlugin):
 
         body = "\n".join(body_lines)
 
-        # Confirm
-        await term.send("Post message? [Y/N]: ")
+        # Confirm (ENTER defaults to Y)
+        await term.send("Post message? [Y/n]: ")
         confirm = (await term.readline(max_len=2)).upper().strip()
-        if confirm != "Y":
+        if confirm not in ("", "Y"):
             await term.sendln(term.note("Cancelled."))
             return
 
@@ -748,11 +790,13 @@ class BulletinsPlugin(BBSPlugin):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-_CMD_RE = re.compile(r'^([A-Z]+)\s*(\d+)?$')
+# Matches: verb + optional numeric arg (R1 / R 1) OR verb + optional word arg (S ALL / S W1AW)
+_CMD_RE = re.compile(r'^([A-Z]+)\s*([A-Z0-9][-A-Z0-9]*)?$')
 
 def _parse_cmd(raw: str) -> tuple[str, Optional[str]]:
-    """Parse 'R 1', 'R1', 'D 5', 'D5', 'Q', etc.
-    Returns (verb, numarg_or_None).
+    """Parse 'R 1', 'R1', 'D 5', 'D5', 'S ALL', 'S W1AW', 'Q', etc.
+    Returns (verb, arg_or_None).  The arg may be numeric ('1') or a callsign
+    token ('ALL', 'W1AW'); callers decide how to interpret it.
     """
     m = _CMD_RE.match(raw)
     if not m:

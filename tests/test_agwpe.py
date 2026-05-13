@@ -218,6 +218,7 @@ class TestAGWPETransportDispatch:
                 pass
 
         self.transport._on_connect = _on_connect
+        self.transport._drain_lock = asyncio.Lock()
 
     async def test_incoming_connect_creates_session(self):
         """'C' frame → new _AGWPESession and _on_connect called."""
@@ -284,6 +285,32 @@ class TestAGWPETransportDispatch:
         await self.transport._dispatch("G", 0, "", "", 0, b"ignored", self.fake_writer)  # type: ignore
         assert len(self.transport._sessions) == 0
 
+    async def test_concurrent_drain_does_not_assert(self):
+        """Two sessions draining concurrently must not raise AssertionError.
+
+        Python 3.9 asyncio uses a single _drain_waiter on StreamWriter and
+        asserts it is None before creating a new one.  The shared drain_lock
+        must serialise concurrent drain() calls to prevent that crash.
+        """
+        drain_entered = asyncio.Event()
+
+        class _SlowFakeWriter(_FakeWriter):
+            async def drain(self) -> None:
+                drain_entered.set()
+                await asyncio.sleep(0.05)  # hold drain open so overlap is certain
+
+        slow_fw = _SlowFakeWriter()
+
+        # Two sessions on different ports but sharing the same underlying writer.
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", slow_fw)  # type: ignore
+        await self.transport._dispatch("C", 1, "W6ELA-8", "N0CALL-1", 0, b"", slow_fw)  # type: ignore
+
+        sess1 = self.transport._sessions[(0, "W6ELA-7")]
+        sess2 = self.transport._sessions[(1, "W6ELA-8")]
+
+        # Both sessions drain concurrently — must not raise AssertionError.
+        await asyncio.gather(sess1.writer.drain(), sess2.writer.drain())
+
 
 class TestAGWPEVirtualWriter:
     """Test the duck-typed writer that wraps outgoing data as 'D' frames."""
@@ -291,7 +318,8 @@ class TestAGWPEVirtualWriter:
     def _make_session_writer(self, local: str = "N0CALL-1", remote: str = "W6ELA-7"):
         from bbs.transport.agwpe import _AGWPEVirtualWriter
         fw = _FakeWriter()
-        w = _AGWPEVirtualWriter(fw, local, remote, agw_port=0)  # type: ignore
+        lock = asyncio.Lock()
+        w = _AGWPEVirtualWriter(fw, local, remote, agw_port=0, drain_lock=lock)  # type: ignore
         return w, fw
 
     def test_write_produces_D_frame(self):
@@ -339,8 +367,10 @@ class TestAGWPEBeaconFrames:
         registered.set()  # simulate successful 'X' registration ack
 
         # Run one iteration of the loop, then cancel
+        lock = asyncio.Lock()
+
         async def _run():
-            await t._beacon_loop(fw, registered)  # type: ignore
+            await t._beacon_loop(fw, registered, lock)  # type: ignore
 
         task = asyncio.create_task(_run())
         await asyncio.sleep(0.05)   # let first beacon fire
@@ -367,7 +397,8 @@ class TestAGWPEBeaconFrames:
         registered = asyncio.Event()
         registered.set()  # simulate successful 'X' registration ack
 
-        task = asyncio.create_task(t._beacon_loop(fw, registered))  # type: ignore
+        lock = asyncio.Lock()
+        task = asyncio.create_task(t._beacon_loop(fw, registered, lock))  # type: ignore
         await asyncio.sleep(0.05)
         task.cancel()
         try:

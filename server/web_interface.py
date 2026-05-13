@@ -45,6 +45,7 @@ def start_web(host: str, port: int, secret_key: str, debug: bool = False) -> Non
         host=host,
         port=port,
         debug=debug,
+        allow_unsafe_werkzeug=True,  # for development; in production use a real WSGI server
         use_reloader=False,
         log_output=False,
     )

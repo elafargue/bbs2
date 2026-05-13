@@ -197,6 +197,47 @@ class TestPostAndRead:
             or "AREAS" in text
         )
 
+    async def test_post_accepts_line_longer_than_80_chars(
+        self, bbs_server: _BbsServerHandle
+    ):
+        """Posting must preserve body lines longer than 80 chars (no input truncation)."""
+        secret = b"bulletin_long_line_secret_12345"
+        callsign = "W1LONGLN"
+        subject = "Long line input test"
+        long_line = "L" * 200
+
+        async with BbsTestClient(bbs_server.host, bbs_server.port) as poster:
+            await poster.do_login(callsign)
+            await _do_auth(poster, str(bbs_server.engine.cfg.db_path), callsign, secret)
+            await poster.sendln("BU")
+            await poster.wait_for(BULL_PROMPT)
+            await poster.sendln("A")
+            await poster.wait_for("area number")
+            await poster.sendln("1")
+            await poster.wait_for(BULL_PROMPT)
+            await poster.sendln("S")
+            await poster.wait_for("Subject")
+            await poster.sendln(subject)
+            await poster.wait_for("To [")
+            await poster.sendln("")
+            await poster.wait_for("body")
+            await poster.sendln(long_line)
+            await poster.sendln("/EX")
+            await poster.wait_for("Post message")
+            await poster.sendln("Y")
+            await poster.wait_for(BULL_PROMPT)
+
+        async with aiosqlite.connect(str(bbs_server.engine.cfg.db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (
+                await db.execute(
+                    "SELECT body FROM bulletin_messages WHERE subject=? ORDER BY id DESC LIMIT 1",
+                    (subject,),
+                )
+            ).fetchone()
+        assert row is not None
+        assert row["body"] == long_line
+
 
 class TestPostAuthRules:
     """
@@ -439,6 +480,50 @@ class TestFromCallColors:
 
         plain = _strip_ansi(output.decode("ascii", errors="replace"))
         assert "W1TEST*" in plain
+
+    async def test_read_display_wraps_body_at_80_columns(self):
+        """Body rendering in R# view must wrap to 80 columns for readability."""
+        from types import SimpleNamespace
+        from bbs.core.terminal import Terminal, ColorMode
+        from tests.client import _strip_ansi
+
+        output = bytearray()
+
+        class _FakeWriter:
+            def write(self, data: bytes) -> None:
+                output.extend(data)
+            async def drain(self) -> None: pass
+            def is_closing(self) -> bool: return False
+            def close(self) -> None: pass
+            async def wait_closed(self) -> None: pass
+
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        term = Terminal(reader, _FakeWriter(), color_mode=ColorMode.ANSI16)
+
+        plugin = _make_plugin_instance()
+        long_body = "X" * 170
+        msg = {
+            "id": 1,
+            "msg_number": 1,
+            "from_call": "W1TEST",
+            "to_call": "ALL",
+            "subject": "Wrap test",
+            "body": long_body,
+            "authenticated": 0,
+            "created_at": 0,
+        }
+        session = SimpleNamespace(
+            term=term,
+            auth=SimpleNamespace(user_id=None),
+            db=None,
+        )
+
+        await plugin._display_message_body(session, msg)
+
+        plain = _strip_ansi(output.decode("ascii", errors="replace")).replace("\r\n", "\n")
+        assert "X" * 81 not in plain
+        assert f"{'X' * 80}\n{'X' * 80}\n{'X' * 10}" in plain
 
 
 # ---------------------------------------------------------------------------

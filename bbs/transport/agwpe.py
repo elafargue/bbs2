@@ -57,6 +57,12 @@ import struct
 import time
 from typing import Any, Optional
 
+# Set this logger to DEBUG in your logging config (or via bbs.yaml) to get
+# per-frame traces.  At INFO level only connection events are emitted.
+#
+# Quick enable at runtime:
+#   logging.getLogger('bbs.transport.agwpe').setLevel(logging.DEBUG)
+
 import re
 
 from bbs.ax25.address import format_addr, parse
@@ -146,6 +152,11 @@ class _AGWPEVirtualWriter:
     write() wraps outgoing bytes as AGWPE 'D' frames.
     close() sends a 'd' (disconnect) frame to AGWPE.
     All writes go through the shared AGWPE TCP writer.
+
+    drain_lock must be shared across all writers and the beacon loop so that
+    concurrent drain() calls on the underlying StreamWriter are serialised.
+    Python 3.9 asyncio uses a single _drain_waiter and raises AssertionError
+    if two coroutines call drain() concurrently on the same writer.
     """
 
     def __init__(
@@ -154,21 +165,28 @@ class _AGWPEVirtualWriter:
         local_call: str,
         remote_call: str,
         agw_port: int,
+        drain_lock: asyncio.Lock,
     ) -> None:
         self._w = agwpe_writer
         self._local = local_call
         self._remote = remote_call
         self._port = agw_port
         self._closing = False
+        self._drain_lock = drain_lock
 
     def write(self, data: bytes) -> None:
         if data and not self._closing:
             frame = _build_frame(self._port, "D", self._local, self._remote, _PID_NO_L3, data)
             self._w.write(frame)
+            logger.debug(
+                "agwpe TX [D] %s→%s  %d bytes: %r",
+                self._local, self._remote, len(data), data[:80],
+            )
 
     async def drain(self) -> None:
         if not self._closing:
-            await self._w.drain()
+            async with self._drain_lock:
+                await self._w.drain()
 
     def is_closing(self) -> bool:
         return self._closing
@@ -176,6 +194,7 @@ class _AGWPEVirtualWriter:
     def close(self) -> None:
         if not self._closing:
             self._closing = True
+            logger.debug("agwpe TX [d] disconnect %s→%s", self._local, self._remote)
             try:
                 frame = _build_frame(self._port, "d", self._local, self._remote)
                 self._w.write(frame)
@@ -200,16 +219,23 @@ class _AGWPESession:
         local_call: str,
         agw_port: int,
         agwpe_writer: asyncio.StreamWriter,
+        drain_lock: asyncio.Lock,
     ) -> None:
         self.remote_call = remote_call
         self.reader = asyncio.StreamReader()
-        self.writer = _AGWPEVirtualWriter(agwpe_writer, local_call, remote_call, agw_port)
+        self.writer = _AGWPEVirtualWriter(agwpe_writer, local_call, remote_call, agw_port, drain_lock)
 
     def feed_data(self, data: bytes) -> None:
         if data:
+            qlen = self.reader._buffer.__len__() if hasattr(self.reader, '_buffer') else -1
+            logger.debug(
+                "agwpe RX [D] %s  %d bytes (reader buffer was %d bytes): %r",
+                self.remote_call, len(data), qlen, data[:80],
+            )
             self.reader.feed_data(data)
 
     def feed_eof(self) -> None:
+        logger.debug("agwpe feed_eof for %s", self.remote_call)
         try:
             self.reader.feed_eof()
         except Exception:
@@ -249,6 +275,9 @@ class AGWPETransport(Transport):
         self._sessions: dict[_SessionKey, _AGWPESession] = {}
         self._on_connect: Optional[ConnectionCallback] = None
         self._registered: Optional[asyncio.Event] = None  # set when 'X' ack received
+        # Serialises all drain() calls on the shared AGWPE TCP writer across
+        # concurrent session tasks and the beacon loop (Python 3.9 fix).
+        self._drain_lock: Optional[asyncio.Lock] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -256,6 +285,8 @@ class AGWPETransport(Transport):
         self._on_connect = on_connect
         self._running = True
         retry_delay = 5
+        # Create the lock here so it binds to the running event loop.
+        self._drain_lock = asyncio.Lock()
 
         while self._running:
             writer: Optional[asyncio.StreamWriter] = None
@@ -283,8 +314,9 @@ class AGWPETransport(Transport):
                 await writer.drain()
 
                 if self._beacon_text:
+                    assert self._drain_lock is not None
                     beacon_task = asyncio.create_task(
-                        self._beacon_loop(writer, self._registered), name="agwpe:beacon"
+                        self._beacon_loop(writer, self._registered, self._drain_lock), name="agwpe:beacon"
                     )
                     logger.info(
                         "agwpe beacon enabled: every %d min to %s — %s",
@@ -330,13 +362,17 @@ class AGWPETransport(Transport):
         writer: asyncio.StreamWriter,
     ) -> None:
         """Read AGWPE frames and route them to the appropriate session."""
+        frames_in = 0
+        logger.debug("agwpe _read_loop started, active sessions: %d", len(self._sessions))
         while self._running:
             try:
                 raw = await reader.readexactly(_HEADER_SIZE)
-            except (asyncio.IncompleteReadError, ConnectionResetError, EOFError):
+            except (asyncio.IncompleteReadError, ConnectionResetError, EOFError) as exc:
+                logger.info("agwpe read loop: TCP read error after %d frames: %s", frames_in, exc)
                 break
             except asyncio.CancelledError:
-                return
+                logger.debug("agwpe read loop cancelled after %d frames", frames_in)
+                raise  # propagate so start() exits rather than reconnecting
 
             (
                 port, _, _, _,
@@ -349,16 +385,26 @@ class AGWPETransport(Transport):
             call_to   = _decode_call(call_to_raw)
             kind      = chr(kind_byte)
 
+            logger.debug(
+                "agwpe frame #%d kind=%r port=%d from=%r to=%r data_len=%d sessions=%d",
+                frames_in, kind, port, call_from, call_to, data_len, len(self._sessions),
+            )
+            frames_in += 1
+
             payload = b""
             if data_len > 0:
                 try:
                     payload = await reader.readexactly(data_len)
-                except (asyncio.IncompleteReadError, ConnectionResetError):
+                except (asyncio.IncompleteReadError, ConnectionResetError) as exc:
+                    logger.info("agwpe read loop: payload read error: %s", exc)
                     break
 
             await self._dispatch(kind, port, call_from, call_to, pid, payload, writer)
 
-        logger.info("agwpe read loop ended — TCP connection closed")
+        logger.info(
+            "agwpe read loop ended after %d frames — TCP connection closed, %d sessions active",
+            frames_in, len(self._sessions),
+        )
 
     # ── Frame dispatcher ──────────────────────────────────────────────────────
 
@@ -387,7 +433,9 @@ class AGWPETransport(Transport):
                 # source, dest, and via path already parsed in TNC2 format.
                 if self._heard_observer is not None:
                     writer.write(_build_frame(self._agw_port, "m", "", ""))
-                    await writer.drain()
+                    assert self._drain_lock is not None
+                    async with self._drain_lock:
+                        await writer.drain()
                     logger.info("agwpe: monitoring enabled for heard-station tracking")
             else:
                 logger.warning(
@@ -398,10 +446,17 @@ class AGWPETransport(Transport):
         elif kind == "C":
             # Incoming connected call — create a new session
             if key in self._sessions:
-                logger.debug("agwpe: duplicate 'C' for %s — ignoring", call_from)
+                logger.warning(
+                    "agwpe: duplicate 'C' for %s (key=%s) — ignoring; existing sessions: %s",
+                    call_from, key, list(self._sessions.keys()),
+                )
                 return
-            logger.info("agwpe: incoming connection from %s", call_from)
-            sess = _AGWPESession(call_from, self._local_call, port, writer)
+            logger.info(
+                "agwpe: incoming connection from %s; total sessions will be %d",
+                call_from, len(self._sessions) + 1,
+            )
+            assert self._drain_lock is not None
+            sess = _AGWPESession(call_from, self._local_call, port, writer, self._drain_lock)
             self._sessions[key] = sess
             conn = Connection(
                 remote_addr=call_from,
@@ -419,17 +474,26 @@ class AGWPETransport(Transport):
             sess = self._sessions.get(key)
             if sess and payload:
                 sess.feed_data(payload)
-            else:
-                logger.debug("agwpe: 'D' frame for unknown session %s — dropped", call_from)
+            elif not sess:
+                logger.warning(
+                    "agwpe: 'D' frame for unknown session %s (key=%s) — dropped; known sessions: %s",
+                    call_from, key, list(self._sessions.keys()),
+                )
 
         elif kind == "d":
             # Remote station disconnected
             sess = self._sessions.pop(key, None)
             if sess:
-                logger.info("agwpe: %s disconnected", call_from)
+                logger.info(
+                    "agwpe: %s disconnected; remaining sessions: %d %s",
+                    call_from, len(self._sessions), list(self._sessions.keys()),
+                )
                 sess.feed_eof()
             else:
-                logger.debug("agwpe: 'd' for unknown session %s", call_from)
+                logger.warning(
+                    "agwpe: 'd' for unknown session %s (key=%s); known sessions: %s",
+                    call_from, key, list(self._sessions.keys()),
+                )
 
         elif kind == "U":
             # Monitored UI frame — AGWPE already parsed src/dest into the header;
@@ -459,17 +523,30 @@ class AGWPETransport(Transport):
 
     async def _run_session(self, key: _SessionKey, conn: Connection) -> None:
         assert self._on_connect is not None
+        t_start = time.monotonic()
+        logger.debug("agwpe: _run_session started for %s", conn.remote_addr)
         try:
             await self._on_connect(conn)
         except Exception:
             logger.exception("agwpe: error in session %s", conn.remote_addr)
         finally:
+            elapsed = time.monotonic() - t_start
+            was_in_sessions = key in self._sessions
             self._sessions.pop(key, None)
+            logger.info(
+                "agwpe: session %s ended after %.1fs; session was%s in table; remaining: %d %s",
+                conn.remote_addr,
+                elapsed,
+                "" if was_in_sessions else " NOT",
+                len(self._sessions),
+                list(self._sessions.keys()),
+            )
 
     # ── Beacon ────────────────────────────────────────────────────────────────
 
     async def _beacon_loop(
-        self, writer: asyncio.StreamWriter, registered: asyncio.Event
+        self, writer: asyncio.StreamWriter, registered: asyncio.Event,
+        drain_lock: asyncio.Lock,
     ) -> None:
         """Send an unproto beacon every beacon_interval seconds."""
         # Wait for the 'X' registration ack before sending; AGWPE silently drops
@@ -499,7 +576,8 @@ class AGWPETransport(Transport):
                             _PID_NO_L3, payload,
                         )
                     writer.write(frame)
-                    await writer.drain()
+                    async with drain_lock:
+                        await writer.drain()
                     logger.info(
                         "agwpe beacon sent to %s%s",
                         self._beacon_dest,
