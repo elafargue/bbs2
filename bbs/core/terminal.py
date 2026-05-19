@@ -396,6 +396,10 @@ class Terminal:
             await self.send_menu(title, items, prompt=prompt, enter_hint=True)
             raw = (await self.readline(max_len=max_len, timeout=timeout)).strip().upper()
             if not raw:
+                # EOF means the connection was closed — raise so the session
+                # exits cleanly rather than spinning (tight loop with no yield).
+                if self._reader.at_eof():
+                    raise ConnectionResetError("connection closed")
                 self.reset_menu_state(title)
                 continue
             return raw

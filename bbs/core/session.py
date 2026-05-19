@@ -264,7 +264,11 @@ class BBSSession:
 
             # Empty input (bare Enter) redraws the full menu; it does not disconnect.
             # Actual idle timeout is detected at the top of the loop via idle_seconds.
+            # EOF (connection closed) must break here — otherwise readline() returns
+            # "" immediately on every call and the loop spins, flooding the event loop.
             if not choice_raw:
+                if self.conn.reader.at_eof():
+                    break
                 self.term.reset_menu_state(self.cfg.name)
                 continue
 
