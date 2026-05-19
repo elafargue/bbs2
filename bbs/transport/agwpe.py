@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import struct
 import time
 from typing import Any, Optional
@@ -79,9 +80,12 @@ assert _HEADER_SIZE == 36, "AGWPE header must be 36 bytes"
 _PID_NO_L3 = 0xF0  # no layer-3 protocol
 
 # Timeout for a single readexactly() on the AGWPE TCP socket.
-# A half-open TCP connection (silent network partition, NAT expiry) stops
-# delivering bytes without sending FIN; this ensures _read_loop breaks and
-# the exponential-backoff reconnect fires.
+# Applied only to the *payload* read (mid-frame stall detection): once we have
+# the 36-byte header we expect the payload to arrive within this window.
+# The header read is NOT timed out — during idle periods (no AX.25 activity)
+# AGWPE sends nothing at all, which is normal; timing that out would cause
+# spurious reconnects.  Dead-connection detection for truly silent links is
+# handled by TCP keepalives set on the socket after connect.
 _TCP_READ_TIMEOUT = 120  # seconds
 
 # AGWPE 'U' monitor string format:
@@ -327,6 +331,14 @@ class AGWPETransport(Transport):
                 )
                 retry_delay = 5  # reset back-off after a successful connect
 
+                # Enable TCP keepalives so the OS will probe and tear down the
+                # connection if AGWPE or the host becomes unreachable silently
+                # (no FIN/RST), without requiring application-level read timeouts
+                # on the idle header read.
+                _sock = writer.get_extra_info("socket")
+                if _sock is not None:
+                    _sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
                 # Optional login (only needed when AGWPE has a password set)
                 if self._password:
                     writer.write(
@@ -407,17 +419,13 @@ class AGWPETransport(Transport):
         logger.debug("agwpe _read_loop started, active sessions: %d", len(self._sessions))
         while self._running:
             try:
-                raw = await asyncio.wait_for(
-                    reader.readexactly(_HEADER_SIZE), timeout=_TCP_READ_TIMEOUT
-                )
+                # No timeout here: during idle periods (no AX.25 activity) AGWPE
+                # sends nothing, which is normal.  Dead connections are detected
+                # by TCP keepalives (set on the socket after connect) and by the
+                # payload-read timeout below.
+                raw = await reader.readexactly(_HEADER_SIZE)
             except (asyncio.IncompleteReadError, ConnectionResetError, EOFError) as exc:
                 logger.info("agwpe read loop: TCP read error after %d frames: %s", frames_in, exc)
-                break
-            except asyncio.TimeoutError:
-                logger.info(
-                    "agwpe read loop: TCP read timeout (%ds) after %d frames — reconnecting",
-                    _TCP_READ_TIMEOUT, frames_in,
-                )
                 break
             except asyncio.CancelledError:
                 logger.debug("agwpe read loop cancelled after %d frames", frames_in)

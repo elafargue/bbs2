@@ -12,6 +12,10 @@ bbs:
   max_users: 20
   # Idle timeout in seconds before disconnecting a user (0 = disabled)
   idle_timeout: 300
+  # Write timeout in seconds: if a drain() call blocks longer than this the
+  # session is torn down.  Protects against stations that vanish off the air
+  # without sending a disconnect (common on AX.25 / RF links).
+  write_timeout: 30
 
 transports:
   # Enable one or more transports. The BBS listens on all enabled transports simultaneously.
