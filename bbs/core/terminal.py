@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from enum import Enum
 from typing import Optional
 
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 # Maximum bytes per write flush — keeps RF frames manageable
 MAX_CHUNK = 256
+
+# Precompiled ANSI escape-strip patterns (used in _encode and _visible_len)
+_RE_CSI = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]")
+_RE_ESC = re.compile(r"\x1b.")
 
 # ── ANSI escape helpers ────────────────────────────────────────────────────────
 
@@ -108,6 +113,7 @@ class Terminal:
         echo: bool = True,
         must_echo: bool = False,
         eol: str = "\r\n",
+        write_timeout: int = 30,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -117,6 +123,7 @@ class Terminal:
         self._echo = echo
         self._must_echo = must_echo  # True for web sessions: can't be suppressed by callers
         self._eol = eol
+        self._write_timeout = write_timeout
         self._buf = bytearray()
         # Tracks which menu titles have already been shown full in this session.
         self._shown_menus: set[str] = set()
@@ -145,6 +152,7 @@ class Terminal:
         echo: bool = True,
         must_echo: bool = False,
         eol: str = "\r\n",
+        write_timeout: int = 30,
     ) -> "Terminal":
         """Return a Terminal using the requested color mode."""
         return cls(
@@ -156,6 +164,7 @@ class Terminal:
             echo=echo,
             must_echo=must_echo,
             eol=eol,
+            write_timeout=write_timeout,
         )
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -163,10 +172,8 @@ class Terminal:
     def _encode(self, text: str) -> bytes:
         """Encode text to bytes, stripping ANSI codes if in ASCII mode."""
         if self.color_mode is ColorMode.OFF:
-            # Strip ESC sequences
-            import re
-            text = re.sub(r"\x1b\[[^A-Za-z]*[A-Za-z]", "", text)
-            text = re.sub(r"\x1b.", "", text)
+            text = _RE_CSI.sub("", text)
+            text = _RE_ESC.sub("", text)
         return text.encode("ascii", errors="replace")
 
     def _key_style(self, key: str) -> str:
@@ -179,8 +186,7 @@ class Terminal:
     @staticmethod
     def _visible_len(text: str) -> int:
         """Return the printable length of *text*, ignoring ANSI escape codes."""
-        import re
-        plain = re.sub(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b.", "", text)
+        plain = _RE_CSI.sub("", _RE_ESC.sub("", text))
         return len(plain)
 
     def style(self, text: str, tone: str = "accent", *, bold: bool = False) -> str:
@@ -255,7 +261,14 @@ class Terminal:
             chunk = bytes(self._buf[:MAX_CHUNK])
             self._buf = self._buf[MAX_CHUNK:]
             self._writer.write(chunk)
-            await self._writer.drain()
+            try:
+                await asyncio.wait_for(
+                    self._writer.drain(), timeout=self._write_timeout
+                )
+            except asyncio.TimeoutError:
+                raise ConnectionResetError(
+                    f"write timeout after {self._write_timeout}s — remote station unresponsive"
+                )
 
     async def send(self, text: str) -> None:
         """Write and immediately flush *text*."""
@@ -406,11 +419,16 @@ class Terminal:
 
     # ── Paging ────────────────────────────────────────────────────────────────
 
-    async def paginate(self, lines: list[str], page_height: Optional[int] = None) -> bool:
+    async def paginate(
+        self,
+        lines: list[str],
+        page_height: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
         """
         Send *lines* with paging.  After every page_height lines, display
         a [MORE] prompt and wait for SPACE/ENTER (continue) or Q (quit).
-        Returns False if the user aborted with Q.
+        Returns False if the user aborted with Q or if *timeout* expires at [MORE].
         """
         ph = page_height or (self.height - 2)
         count = 0
@@ -420,7 +438,10 @@ class Terminal:
             if count >= ph:
                 await self.flush()
                 await self.send(self._more_style())
-                ch = await self.readchar()
+                ch = await self.readchar(timeout=timeout)
+                if not ch:  # timeout or EOF → abort paging
+                    await self.sendln()
+                    return False
                 # Consume complementary line ending (\r\n or \n\r)
                 if ch in ("\r", "\n"):
                     complement = b"\n" if ch == "\r" else b"\r"

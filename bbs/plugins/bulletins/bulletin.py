@@ -250,7 +250,7 @@ class BulletinsPlugin(BBSPlugin):
             f"  {term.ok('YES')}  Manage areas              (SA)",
             "",
         ]
-        await term.paginate(lines)
+        await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
 
     # ── Default area lookup ───────────────────────────────────────────────────
 
@@ -325,7 +325,7 @@ class BulletinsPlugin(BBSPlugin):
                 f"[{term.style(dflt, 'warning', bold=True) if dflt == '*' else ' '}]    {a['description']}"
             )
         lines.append("")
-        await term.paginate(lines)
+        await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
 
     async def _sysop_new_area(self, session: "BBSSession") -> None:
         term = session.term
@@ -469,7 +469,7 @@ class BulletinsPlugin(BBSPlugin):
                 f"  {i:2}. {term.style(name_padded, 'accent', bold=True)} {row['description']}"
             )
         lines += ["", "Enter area number (or ENTER to cancel): "]
-        await term.paginate(lines[:-1])
+        await term.paginate(lines[:-1], timeout=float(session.cfg.idle_timeout) or None)
         await term.send(term.prompt(lines[-1]))
 
         choice_str = (await term.readline(max_len=4)).strip()
@@ -540,6 +540,7 @@ class BulletinsPlugin(BBSPlugin):
     async def _show_message_index(
         self, term: Any, area_name: str, messages: list,
         read_ids: Optional[set] = None,
+        idle_timeout: Optional[float] = None,
     ) -> None:
         hdr = f"{'#':<6} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
         sep = "-" * len(hdr)
@@ -571,7 +572,7 @@ class BulletinsPlugin(BBSPlugin):
                 f"{term.note(date_str)} {subj}"
             )
         lines.append("")
-        await term.paginate(lines)
+        await term.paginate(lines, timeout=idle_timeout)
 
     # ── List messages (interactive) ───────────────────────────────────────────
 
@@ -586,7 +587,8 @@ class BulletinsPlugin(BBSPlugin):
             await term.sendln(term.note(f"No messages in {area_name}."))
             return
         read_ids = await self._fetch_read_ids(session.db, area_id, session.auth.user_id)
-        await self._show_message_index(term, area_name, messages, read_ids=read_ids)
+        await self._show_message_index(term, area_name, messages, read_ids=read_ids,
+                                        idle_timeout=float(session.cfg.idle_timeout) or None)
 
     # ── Read a single message ─────────────────────────────────────────────────
 
@@ -639,7 +641,9 @@ class BulletinsPlugin(BBSPlugin):
             )
             msg_lines.extend(wrapped or [""])
         msg_lines.append("")
-        await term.paginate(msg_lines)
+        _cfg = getattr(session, "cfg", None)
+        _timeout = (float(getattr(_cfg, "idle_timeout", 0)) or None) if _cfg else None
+        await term.paginate(msg_lines, timeout=_timeout)
 
         if session.auth.user_id:
             try:
@@ -720,22 +724,27 @@ class BulletinsPlugin(BBSPlugin):
             return
 
         db.row_factory = aiosqlite.Row
-        # Next message number in this area
-        async with db.execute(
-            "SELECT COALESCE(MAX(msg_number),0)+1 AS next FROM bulletin_messages WHERE area_id=?",
-            (area_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            next_num = row["next"] if row else 1
-
-        await db.execute(
+        # Atomic INSERT: msg_number is computed inline so there is no TOCTOU
+        # window between the SELECT MAX and the INSERT even under concurrent
+        # sessions sharing the same SQLite database.
+        cur = await db.execute(
             """INSERT INTO bulletin_messages
                (area_id, msg_number, subject, from_call, to_call, body, authenticated)
-               VALUES (?,?,?,?,?,?,?)""",
-            (area_id, next_num, subject, session.auth.callsign, to_call, body,
+               VALUES (?,
+                       (SELECT COALESCE(MAX(msg_number),0)+1
+                        FROM bulletin_messages WHERE area_id=?),
+                       ?,?,?,?,?)""",
+            (area_id, area_id, subject, session.auth.callsign, to_call, body,
              1 if is_authenticated_post else 0),
         )
+        next_num = cur.lastrowid  # approximate; use a follow-up SELECT if needed
         await db.commit()
+        # Retrieve the actual msg_number we just inserted
+        async with db.execute(
+            "SELECT msg_number FROM bulletin_messages WHERE rowid=?", (next_num,)
+        ) as sel:
+            row_ins = await sel.fetchone()
+            next_num = row_ins["msg_number"] if row_ins else "?"
         await term.sendln(term.ok(f"Message #{next_num} posted to {area_name}."))
 
     # ── Delete message ────────────────────────────────────────────────────────

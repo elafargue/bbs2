@@ -121,7 +121,19 @@ class BBSSession:
                 # it with CO, and _apply_user_preferences will honour their
                 # saved setting after login).
                 color_mode="truecolor" if _is_web else "off",
+                write_timeout=self.cfg.write_timeout,
             )
+
+            # Launch a watchdog that cancels this task when the session is
+            # idle for longer than cfg.idle_timeout.  This fires even while
+            # deep inside a plugin handler, unlike the main-loop idle check
+            # which only runs at the top of the command loop.
+            _main_task = asyncio.current_task()
+            _watchdog: Optional[asyncio.Task] = None
+            if self.cfg.idle_timeout > 0 and _main_task is not None:
+                _watchdog = asyncio.create_task(
+                    self._idle_watchdog(_main_task), name="session:watchdog"
+                )
 
             try:
                 await self._greet()
@@ -149,9 +161,33 @@ class BBSSession:
             except Exception:
                 logger.exception("Unhandled error in session %s", self.session_id)
             finally:
+                if _watchdog is not None:
+                    _watchdog.cancel()
+                    await asyncio.gather(_watchdog, return_exceptions=True)
                 await self._farewell()
                 self.state = SessionState.DISCONNECTED
+    # ── Idle watchdog ─────────────────────────────────────────────────────────
 
+    async def _idle_watchdog(self, main_task: asyncio.Task) -> None:
+        """
+        Cancel *main_task* when the session has been idle for longer than
+        cfg.idle_timeout.  Runs as an independent asyncio Task so it fires
+        even when the main task is blocked inside a plugin.
+        """
+        timeout = float(self.cfg.idle_timeout)
+        sleep_interval = min(10.0, timeout / 3.0)
+        try:
+            while True:
+                await asyncio.sleep(sleep_interval)
+                if self.idle_seconds > timeout:
+                    logger.info(
+                        "session %s: idle watchdog fired after %.0fs — cancelling",
+                        self.session_id, self.idle_seconds,
+                    )
+                    main_task.cancel()
+                    return
+        except asyncio.CancelledError:
+            pass
     # ── Greeting ─────────────────────────────────────────────────────────────
 
     async def _greet(self) -> None:
@@ -209,7 +245,9 @@ class BBSSession:
         else:
             # TCP / unknown — ask for callsign
             await self.term.send("Callsign: ")
-            raw_call = (await self.term.readline(max_len=10)).upper().strip()
+            raw_call = (
+                await self.term.readline(max_len=10, timeout=float(self.cfg.idle_timeout) or None)
+            ).upper().strip()
             if not raw_call:
                 await self.term.sendln("No callsign entered. Goodbye.")
                 self.state = SessionState.DISCONNECTED
@@ -259,9 +297,13 @@ class BBSSession:
 
             await self.term.send_menu(self.cfg.name, menu_items, prompt="> ", enter_hint=True)
 
-            choice_raw = await self.term.readline(
-                max_len=8, timeout=idle_timeout
+            # Pass the remaining idle time rather than the full idle_timeout so
+            # that a station which consistently types just under the limit is still
+            # evicted.  Floor at 1 s to avoid a zero/negative timeout.
+            remaining = (
+                max(1.0, idle_timeout - self.idle_seconds) if idle_timeout else None
             )
+            choice_raw = await self.term.readline(max_len=8, timeout=remaining)
 
             # Empty input (bare Enter) redraws the full menu; it does not disconnect.
             # Actual idle timeout is detected at the top of the loop via idle_seconds.
@@ -303,7 +345,10 @@ class BBSSession:
 
         prompt = await self.auth_service.otp_prompt(self.db, self.auth)
         await self.term.send(prompt)
-        code = await self.term.readline(max_len=8, echo=False)
+        code = await self.term.readline(
+            max_len=8, echo=False,
+            timeout=float(self.cfg.idle_timeout) or None,
+        )
         if not code or not code.strip():
             await self.term.sendln(self.term.note("Auth cancelled."))
             return
@@ -333,7 +378,11 @@ class BBSSession:
         await self.term.sendln(f"{self.term.label('A')} - ANSI 16-color")
         await self.term.sendln(f"{self.term.label('T')} - 24-bit truecolor")
         await self.term.send(self.term.prompt("Selection (ENTER cancels): "))
-        choice = (await self.term.readline(max_len=1)).strip().upper()
+        choice = (
+            await self.term.readline(
+                max_len=1, timeout=float(self.cfg.idle_timeout) or None
+            )
+        ).strip().upper()
 
         selected_mode = {
             "O": "off",
@@ -373,7 +422,7 @@ class BBSSession:
             "B  - Bye / disconnect.",
 
         ]
-        await self.term.paginate(lines)
+        await self.term.paginate(lines, timeout=float(self.cfg.idle_timeout) or None)
 
     async def _apply_user_preferences(self) -> None:
         if self.auth.user_id is None:

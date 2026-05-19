@@ -78,6 +78,12 @@ assert _HEADER_SIZE == 36, "AGWPE header must be 36 bytes"
 
 _PID_NO_L3 = 0xF0  # no layer-3 protocol
 
+# Timeout for a single readexactly() on the AGWPE TCP socket.
+# A half-open TCP connection (silent network partition, NAT expiry) stops
+# delivering bytes without sending FIN; this ensures _read_loop breaks and
+# the exponential-backoff reconnect fires.
+_TCP_READ_TIMEOUT = 120  # seconds
+
 # AGWPE 'U' monitor string format:
 #   "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN*,KBERR <UI pid=F0 ...>"
 # Via section is absent for direct (non-digipeated) frames.
@@ -166,6 +172,7 @@ class _AGWPEVirtualWriter:
         remote_call: str,
         agw_port: int,
         drain_lock: asyncio.Lock,
+        write_timeout: int = 30,
     ) -> None:
         self._w = agwpe_writer
         self._local = local_call
@@ -173,6 +180,7 @@ class _AGWPEVirtualWriter:
         self._port = agw_port
         self._closing = False
         self._drain_lock = drain_lock
+        self._write_timeout = write_timeout
 
     def write(self, data: bytes) -> None:
         if data and not self._closing:
@@ -188,7 +196,15 @@ class _AGWPEVirtualWriter:
         # closed between the check and the lock acquisition.
         async with self._drain_lock:
             if not self._closing:
-                await self._w.drain()
+                try:
+                    await asyncio.wait_for(
+                        self._w.drain(), timeout=self._write_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self._closing = True
+                    raise ConnectionResetError(
+                        f"agwpe write timeout after {self._write_timeout}s"
+                    )
 
     def is_closing(self) -> bool:
         return self._closing
@@ -222,10 +238,13 @@ class _AGWPESession:
         agw_port: int,
         agwpe_writer: asyncio.StreamWriter,
         drain_lock: asyncio.Lock,
+        write_timeout: int = 30,
     ) -> None:
         self.remote_call = remote_call
         self.reader = asyncio.StreamReader()
-        self.writer = _AGWPEVirtualWriter(agwpe_writer, local_call, remote_call, agw_port, drain_lock)
+        self.writer = _AGWPEVirtualWriter(
+            agwpe_writer, local_call, remote_call, agw_port, drain_lock, write_timeout
+        )
 
     def feed_data(self, data: bytes) -> None:
         if data:
@@ -282,6 +301,7 @@ class AGWPETransport(Transport):
         # Serialises all drain() calls on the shared AGWPE TCP writer across
         # concurrent session tasks and the beacon loop (Python 3.9 fix).
         self._drain_lock: Optional[asyncio.Lock] = None
+        self._write_timeout: int = int(cfg.get("write_timeout", 30))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -297,7 +317,10 @@ class AGWPETransport(Transport):
             # do not contend with new-connection sessions on a different writer.
             self._drain_lock = asyncio.Lock()
             try:
-                reader, writer = await asyncio.open_connection(self._host, self._port)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._host, self._port),
+                    timeout=30,
+                )
                 logger.info(
                     "agwpe connected to %s:%d — registering %s on port %d",
                     self._host, self._port, self._local_call, self._agw_port,
@@ -309,14 +332,14 @@ class AGWPETransport(Transport):
                     writer.write(
                         _build_frame(0, "P", "", "", data=self._password.encode("ascii"))
                     )
-                    await writer.drain()
+                    await asyncio.wait_for(writer.drain(), timeout=30)
 
                 # Register our callsign so AGWPE routes incoming calls to us
                 self._registered = asyncio.Event()
                 writer.write(
                     _build_frame(self._agw_port, "X", self._local_call, "")
                 )
-                await writer.drain()
+                await asyncio.wait_for(writer.drain(), timeout=30)
 
                 if self._beacon_text:
                     assert self._drain_lock is not None
@@ -334,7 +357,7 @@ class AGWPETransport(Transport):
 
             except asyncio.CancelledError:
                 return
-            except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
+            except (asyncio.TimeoutError, ConnectionRefusedError, ConnectionResetError, OSError) as exc:
                 logger.warning(
                     "agwpe connection to %s:%d failed: %s — retry in %ds",
                     self._host, self._port, exc, retry_delay,
@@ -384,9 +407,17 @@ class AGWPETransport(Transport):
         logger.debug("agwpe _read_loop started, active sessions: %d", len(self._sessions))
         while self._running:
             try:
-                raw = await reader.readexactly(_HEADER_SIZE)
+                raw = await asyncio.wait_for(
+                    reader.readexactly(_HEADER_SIZE), timeout=_TCP_READ_TIMEOUT
+                )
             except (asyncio.IncompleteReadError, ConnectionResetError, EOFError) as exc:
                 logger.info("agwpe read loop: TCP read error after %d frames: %s", frames_in, exc)
+                break
+            except asyncio.TimeoutError:
+                logger.info(
+                    "agwpe read loop: TCP read timeout (%ds) after %d frames — reconnecting",
+                    _TCP_READ_TIMEOUT, frames_in,
+                )
                 break
             except asyncio.CancelledError:
                 logger.debug("agwpe read loop cancelled after %d frames", frames_in)
@@ -412,9 +443,17 @@ class AGWPETransport(Transport):
             payload = b""
             if data_len > 0:
                 try:
-                    payload = await reader.readexactly(data_len)
+                    payload = await asyncio.wait_for(
+                        reader.readexactly(data_len), timeout=_TCP_READ_TIMEOUT
+                    )
                 except (asyncio.IncompleteReadError, ConnectionResetError) as exc:
                     logger.info("agwpe read loop: payload read error: %s", exc)
+                    break
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "agwpe read loop: payload read timeout (%ds) — reconnecting",
+                        _TCP_READ_TIMEOUT,
+                    )
                     break
 
             await self._dispatch(kind, port, call_from, call_to, pid, payload, writer)
@@ -474,7 +513,10 @@ class AGWPETransport(Transport):
                 call_from, len(self._sessions) + 1,
             )
             assert self._drain_lock is not None
-            sess = _AGWPESession(call_from, self._local_call, port, writer, self._drain_lock)
+            sess = _AGWPESession(
+                call_from, self._local_call, port, writer,
+                self._drain_lock, self._write_timeout,
+            )
             self._sessions[key] = sess
             conn = Connection(
                 remote_addr=call_from,

@@ -28,7 +28,9 @@ def build_transports(cfg: "BBSConfig") -> list["Transport"]:
         transports.append(KernelAX25Transport(t["kernel_ax25"], cfg.full_callsign))
 
     if t.get("agwpe", {}).get("enabled"):
-        transports.append(AGWPETransport(t["agwpe"], cfg.full_callsign))
+        agwpe_cfg = dict(t["agwpe"])
+        agwpe_cfg.setdefault("write_timeout", cfg.write_timeout)
+        transports.append(AGWPETransport(agwpe_cfg, cfg.full_callsign))
 
     if t.get("tcp", {}).get("enabled"):
         transports.append(TCPTransport(t["tcp"]))

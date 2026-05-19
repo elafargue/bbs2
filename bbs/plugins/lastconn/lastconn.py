@@ -88,5 +88,5 @@ class LastConnectionsPlugin(BBSPlugin):
         await term.sendln(term.note("-" * min(len(col_hdr), term.width)))
         await term.flush()
 
-        await term.paginate(lines)
+        await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
         await term.sendln()

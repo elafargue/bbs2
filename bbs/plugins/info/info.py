@@ -71,7 +71,7 @@ class InfoPlugin(BBSPlugin):
         else:
             await term.sendln(term.label("BBS INFO", "meta"))
             await term.sendln(term.note("--------"))
-            await term.paginate(message.splitlines())
+            await term.paginate(message.splitlines(), timeout=float(session.cfg.idle_timeout) or None)
 
         if not session.auth.is_sysop:
             return

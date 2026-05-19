@@ -22,6 +22,7 @@ class BBSConfig:
     location: str
     max_users: int
     idle_timeout: int
+    write_timeout: int
 
     # Sub-sections as raw dicts (validated at use-site)
     transports: dict[str, Any]
@@ -102,6 +103,7 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
         location=str(bbs.get("location", "")),
         max_users=int(bbs.get("max_users", 20)),
         idle_timeout=int(bbs.get("idle_timeout", 300)),
+        write_timeout=int(bbs.get("write_timeout", 30)),
         transports=raw.get("transports", {}),
         database=raw.get("database", {}),
         auth=raw.get("auth", {}),

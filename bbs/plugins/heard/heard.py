@@ -610,7 +610,7 @@ class HeardPlugin(BBSPlugin):
                     digis_only=(action == "M"),
                     term=term,
                 )
-                await term.paginate(map_lines)
+                await term.paginate(map_lines, timeout=float(session.cfg.idle_timeout) or None)
                 continue
 
             if action in ("H", "HS"):
@@ -664,7 +664,7 @@ class HeardPlugin(BBSPlugin):
                             buf = []
                     if buf:
                         lines.append("  ".join(buf))
-                    await term.paginate(lines)
+                    await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
                 else:
                     # Full listing
                     header  = f"HEARD STATIONS  ({len(rows)} entries, {age_label})"
@@ -707,7 +707,7 @@ class HeardPlugin(BBSPlugin):
                             f"{term.style(call, 'accent')} {term.note(last)} "
                             f"{trn} {via_text}"
                         )
-                    await term.paginate(lines)
+                    await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
 
         await term.sendln()
 

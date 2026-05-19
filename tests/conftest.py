@@ -88,6 +88,7 @@ def _make_test_config(db_path: str, tcp_port: int) -> BBSConfig:
             "sysop_password_hash": "",
         },
         logging={"level": "WARNING", "file": ""},
+        write_timeout=30,
     )
 
 

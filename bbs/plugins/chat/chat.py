@@ -58,7 +58,7 @@ class ChatRoom:
         self._persist_cb: Optional[Callable[[str], Awaitable[None]]] = None
 
     def join(self, callsign: str) -> asyncio.Queue[str]:
-        q: asyncio.Queue[str] = asyncio.Queue()
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
         self._members[callsign.upper()] = q
         self._broadcast(f"*** {callsign} joined {self.name} ***", exclude=callsign)
         return q
@@ -108,7 +108,7 @@ class ChatRoom:
             try:
                 q.put_nowait(line)
             except asyncio.QueueFull:
-                pass
+                logger.warning("chat: dropped message to %s (queue full)", call)
 
     @property
     def member_count(self) -> int:
@@ -227,6 +227,12 @@ class ChatPlugin(BBSPlugin):
             f"*** Room {room_name} has been deleted by the sysop. Use /JOIN to switch rooms. ***",
             exclude=None,
         )
+        # Signal all member reader tasks to exit by sending a None sentinel.
+        for q in room._members.values():
+            try:
+                q.put_nowait(None)  # type: ignore[arg-type]
+            except asyncio.QueueFull:
+                pass
         return True
 
     async def handle_session(self, session: "BBSSession") -> None:
@@ -297,8 +303,10 @@ class ChatPlugin(BBSPlugin):
             while True:
                 try:
                     line = await asyncio.wait_for(inbox.get(), timeout=0.5)
+                    if line is None:  # room deleted — signal chat loop to exit
+                        inbox.put_nowait(None)  # re-queue so _chat_loop can see it
+                        break
                     await term.sendln(line)
-                    await term.send(term.prompt(f"{room.name}> "))
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -310,6 +318,10 @@ class ChatPlugin(BBSPlugin):
 
         try:
             while True:
+                # If the room was deleted (reader_task finished naturally), exit.
+                if reader_task.done() and not reader_task.cancelled():
+                    await term.sendln(term.warn("Room has been deleted. Leaving chat."))
+                    break
                 await term.send(term.prompt(f"{room.name}> "))
                 line = await term.readline(max_len=MAX_MSG_LEN, echo=False)
                 session.touch()
