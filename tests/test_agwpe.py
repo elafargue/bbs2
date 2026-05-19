@@ -382,7 +382,7 @@ class TestAGWPEBeaconFrames:
 
         assert len(fw.written) >= _HEADER_SIZE
         h = _unpack_header(bytes(fw.written[:_HEADER_SIZE + len(b"test beacon")]))
-        assert h["kind"] == "M"
+        assert h["kind"] == "T"
         assert h["data"] == b"test beacon"
 
     async def test_beacon_with_path_sends_V_frame(self):

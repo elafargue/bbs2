@@ -78,8 +78,9 @@ class BBSSession:
         # Per-session scratch space for plugins (keyed by plugin name)
         self.plugin_state: dict = {}
 
-        # Unique session ID for web dashboard / logs
-        self.session_id = f"{conn.transport_id}:{conn.remote_addr}:{int(self.connected_at)}"
+        # Unique session ID for web dashboard / logs.
+        # Use millisecond precision so sub-second reconnects get distinct IDs.
+        self.session_id = f"{conn.transport_id}:{conn.remote_addr}:{self.connected_at:.3f}"
 
     @property
     def remote_addr(self) -> str:

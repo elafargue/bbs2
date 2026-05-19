@@ -119,8 +119,11 @@ class BBSEngine:
         self._emit_log(f"BBS {self.cfg.full_callsign} online — {len(transports)} transport(s)")
         logger.info("BBS engine running")
 
-        # Wait until stop is requested
-        await self._stop_event.wait()
+        # Wait until stop is requested, or a KeyboardInterrupt cancels our task.
+        try:
+            await self._stop_event.wait()
+        except asyncio.CancelledError:
+            pass
 
         # Graceful shutdown
         logger.info("BBS engine shutting down…")
@@ -130,6 +133,10 @@ class BBSEngine:
         # Disconnect all sessions
         for task in list(self._session_tasks.values()):
             task.cancel()
+
+        # Wait for transports (and their sessions) to fully tear down before
+        # calling plugin shutdown, so plugins see a consistent state.
+        await asyncio.gather(*transport_tasks, return_exceptions=True)
 
         # Shutdown plugins
         for plugin in self.plugin_registry:

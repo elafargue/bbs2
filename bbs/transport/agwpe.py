@@ -184,8 +184,10 @@ class _AGWPEVirtualWriter:
             )
 
     async def drain(self) -> None:
-        if not self._closing:
-            async with self._drain_lock:
+        # Check _closing INSIDE the lock so we never drain a writer that was
+        # closed between the check and the lock acquisition.
+        async with self._drain_lock:
+            if not self._closing:
                 await self._w.drain()
 
     def is_closing(self) -> bool:
@@ -273,6 +275,8 @@ class AGWPETransport(Transport):
         ]
         self._running = False
         self._sessions: dict[_SessionKey, _AGWPESession] = {}
+        # Maps session key → running Task so they can be force-cancelled on TCP drop.
+        self._session_tasks: dict[_SessionKey, "asyncio.Task[None]"] = {}
         self._on_connect: Optional[ConnectionCallback] = None
         self._registered: Optional[asyncio.Event] = None  # set when 'X' ack received
         # Serialises all drain() calls on the shared AGWPE TCP writer across
@@ -285,12 +289,13 @@ class AGWPETransport(Transport):
         self._on_connect = on_connect
         self._running = True
         retry_delay = 5
-        # Create the lock here so it binds to the running event loop.
-        self._drain_lock = asyncio.Lock()
 
         while self._running:
             writer: Optional[asyncio.StreamWriter] = None
             beacon_task: Optional[asyncio.Task[None]] = None
+            # Fresh lock per TCP connection so zombie tasks from a prior connection
+            # do not contend with new-connection sessions on a different writer.
+            self._drain_lock = asyncio.Lock()
             try:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
                 logger.info(
@@ -339,8 +344,21 @@ class AGWPETransport(Transport):
             finally:
                 if beacon_task:
                     beacon_task.cancel()
+                    try:
+                        await beacon_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 if writer and not writer.is_closing():
                     writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                # Force-cancel live session tasks; they also receive feed_eof
+                # below, but cancellation ensures hung tasks don't ghost.
+                for stask in list(self._session_tasks.values()):
+                    stask.cancel()
+                self._session_tasks.clear()
                 # Tear down all active sessions so the BBS sessions see EOF
                 for sess in list(self._sessions.values()):
                     sess.feed_eof()
@@ -465,9 +483,10 @@ class AGWPETransport(Transport):
                 transport_id=self.transport_id,
             )
             assert self._on_connect is not None
-            asyncio.create_task(
-                self._run_session(key, conn), name=f"agwpe:session:{call_from}"
+            task = asyncio.create_task(
+                self._run_session(key, sess, conn), name=f"agwpe:session:{call_from}"
             )
+            self._session_tasks[key] = task
 
         elif kind == "D":
             # Data for an active connected session
@@ -521,7 +540,9 @@ class AGWPETransport(Transport):
 
     # ── Session runner ────────────────────────────────────────────────────────
 
-    async def _run_session(self, key: _SessionKey, conn: Connection) -> None:
+    async def _run_session(
+        self, key: _SessionKey, sess: _AGWPESession, conn: Connection
+    ) -> None:
         assert self._on_connect is not None
         t_start = time.monotonic()
         logger.debug("agwpe: _run_session started for %s", conn.remote_addr)
@@ -531,8 +552,14 @@ class AGWPETransport(Transport):
             logger.exception("agwpe: error in session %s", conn.remote_addr)
         finally:
             elapsed = time.monotonic() - t_start
-            was_in_sessions = key in self._sessions
-            self._sessions.pop(key, None)
+            # Guard: only remove OUR entry; a fast reconnect from the same station
+            # may have already registered a new session/task under this key.
+            was_in_sessions = self._sessions.get(key) is sess
+            if was_in_sessions:
+                self._sessions.pop(key, None)
+            cur_task = asyncio.current_task()
+            if self._session_tasks.get(key) is cur_task:
+                self._session_tasks.pop(key, None)
             logger.info(
                 "agwpe: session %s ended after %.1fs; session was%s in table; remaining: %d %s",
                 conn.remote_addr,
@@ -571,7 +598,7 @@ class AGWPETransport(Transport):
                         )
                     else:
                         frame = _build_frame(
-                            self._agw_port, "M",
+                            self._agw_port, "T",
                             self._local_call, self._beacon_dest,
                             _PID_NO_L3, payload,
                         )
