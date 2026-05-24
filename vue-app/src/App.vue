@@ -1,9 +1,11 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import socket from './socket.js'
 
 const router = useRouter()
+const { mobile } = useDisplay()
 const isSysop = ref(false)
 const drawer = ref(false)
 
@@ -19,7 +21,7 @@ onMounted(async () => {
   const res = await fetch('/api/admin/me')
   if (res.ok) {
     isSysop.value = true
-    drawer.value = true
+    drawer.value = !mobile.value
     socket.connect()
     socket.emit('join_admin', {})
   } else {
