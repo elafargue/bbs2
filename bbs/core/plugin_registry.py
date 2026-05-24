@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from bbs.core.auth import AuthLevel
     from bbs.core.session import BBSSession
     from bbs.config import BBSConfig
+    from bbs.core.event_bus import PluginEventBus
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ class BBSPlugin(ABC):
     def __init__(self) -> None:
         self.enabled: bool = True
         self._cfg: dict[str, Any] = {}
+        # Injected by PluginRegistry.load_plugins() after initialize().
+        self._bus: Optional["PluginEventBus"] = None
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
         """
@@ -81,6 +84,18 @@ class BBSPlugin(ABC):
         Take over a user session until the user exits the plugin.
         Must return control to the main menu when done.
         """
+
+    def set_event_bus(self, bus: "PluginEventBus") -> None:
+        """
+        Called by PluginRegistry after initialize() to inject the shared
+        event bus.  Override to subscribe to topics::
+
+            def set_event_bus(self, bus):
+                super().set_event_bus(bus)
+                bus.subscribe("heard.station",      self._on_heard)
+                bus.subscribe("session.connected",  self._on_connected)
+        """
+        self._bus = bus
 
     async def shutdown(self) -> None:
         """Called on graceful BBS shutdown."""
@@ -104,6 +119,9 @@ class PluginRegistry:
     def __init__(self, cfg: "BBSConfig") -> None:
         self._cfg = cfg
         self._plugins: dict[str, BBSPlugin] = {}  # name → plugin
+
+        from bbs.core.event_bus import PluginEventBus
+        self.event_bus: PluginEventBus = PluginEventBus()
 
     async def load_plugins(self) -> None:
         """
@@ -145,6 +163,7 @@ class PluginRegistry:
                     plugin.enabled = False
 
                 await plugin.initialize(section, db_path)
+                plugin.set_event_bus(self.event_bus)
                 self._plugins[plugin.name] = plugin
                 logger.info(
                     "Loaded plugin: %s [%s] enabled=%s",
@@ -214,6 +233,8 @@ class PluginRegistry:
         items = []
         for p in sorted(self._plugins.values(), key=lambda x: x.menu_key):
             if not p.enabled:
+                continue
+            if not p.menu_key:          # headless/background plugins — no menu entry
                 continue
             required = AuthLevel[p.min_auth_level_name]
             if current_level.value >= required.value:

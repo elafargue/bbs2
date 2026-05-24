@@ -7,6 +7,7 @@ const routes = [
   { path: '/plugins',   component: () => import('./views/Plugins.vue') },
   { path: '/activity',  component: () => import('./views/Activity.vue') },
   { path: '/terminal',  component: () => import('./views/Terminal.vue') },
+  { path: '/display',   component: () => import('./views/Display.vue') },
   { path: '/login',     component: () => import('./views/Login.vue') },
 ]
 

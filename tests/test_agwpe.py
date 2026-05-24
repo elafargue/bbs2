@@ -14,7 +14,9 @@ objects stand in for the TCP connection to AGWPE.
 from __future__ import annotations
 
 import asyncio
+import re
 import struct
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -29,6 +31,8 @@ from bbs.transport.agwpe import (
     _decode_call,
     _encode_call,
     _PID_NO_L3,
+    _parse_info,
+    _parse_via,
 )
 from bbs.transport.base import Connection
 
@@ -195,6 +199,100 @@ def _feed_frames(reader: asyncio.StreamReader, *frames: bytes) -> None:
     for f in frames:
         reader.feed_data(f)
     reader.feed_eof()
+
+
+# ─── Monitor string parsers ───────────────────────────────────────────────────
+
+class TestParseInfo:
+    """
+    _parse_info must return the AX.25 payload that follows >[HH:MM:SS]\\r.
+
+    Actual Direwolf AGWPE monitor format:
+      " 1:Fm CALL To DEST [Via PATH ]<UI pid=F0 Len=NN PF=0 >[HH:MM:SS]\\rPAYLOAD\\r\\r\\x00"
+    The <...> block is AGWPE frame-control metadata; the info payload follows
+    the timestamp marker.
+    """
+
+    def test_no_via(self):
+        # Real sample: N6ZX direct beacon (no Via)
+        monitor = " 1:Fm N6ZX To BEACON <UI pid=F0 Len=55 PF=0 >[15:13:21]\rN6ZX Kings Mt. ARC\r\r\x00"
+        assert _parse_info(monitor) == "N6ZX Kings Mt. ARC"
+
+    def test_via_present(self):
+        # Real sample: W6ABJ-12 ID frame digipeated via KJOHN*
+        monitor = " 1:Fm W6ABJ-12 To ID Via KJOHN*,KBETH,KBERR,WOODY <UI pid=F0 Len=34 PF=0 >[15:16:37]\rW6ABJ-12/R KBULN/D\r\r\x00"
+        assert _parse_info(monitor) == "W6ABJ-12/R KBULN/D"
+
+    def test_same_payload_different_timestamps(self):
+        """Same station re-heard via different starred digi → identical info (enables dedup)."""
+        m1 = " 1:Fm W6ABJ-12 To ID Via KJOHN*,KBETH,KBERR,WOODY <UI pid=F0 Len=34 PF=0 >[15:16:37]\rW6ABJ-12/R KBULN/D\r\r\x00"
+        m2 = " 1:Fm W6ABJ-12 To ID Via KJOHN,KBETH,KBERR*,WOODY <UI pid=F0 Len=34 PF=0 >[15:16:39]\rW6ABJ-12/R KBULN/D\r\r\x00"
+        assert _parse_info(m1) == _parse_info(m2)
+
+    def test_empty_payload(self):
+        assert _parse_info("") == ""
+
+
+class TestParseVia:
+    # Real-world Via format: "Via KJOHN*,KBETH,KBERR,WOODY <UI pid=F0 ..."
+    # The \\s*< in _MONITOR_VIA_RE strips the space before <.
+
+    def test_starred_digi(self):
+        monitor = " 1:Fm W6ABJ-12 To ID Via KJOHN*,KBETH,KBERR,WOODY <UI pid=F0 Len=34 PF=0 >[15:16:37]\rW6ABJ-12/R KBULN/D\r\r\x00"
+        assert _parse_via(monitor) == ["KJOHN*", "KBETH", "KBERR", "WOODY"]
+
+    def test_no_via(self):
+        monitor = " 1:Fm N6ZX To BEACON <UI pid=F0 Len=55 PF=0 >[15:13:21]\rN6ZX Kings Mt. ARC\r\r\x00"
+        assert _parse_via(monitor) == []
+
+
+# ─── Fixture-based tests (real captured AGWPE traffic) ────────────────────────
+
+_FIXTURE_LOG  = Path(__file__).parent / "fixtures" / "agwpe_monitor.log"
+_LOG_LINE_RE  = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\t(.+)", re.DOTALL)
+
+
+def _load_monitor_log(path: Path = _FIXTURE_LOG) -> list[str]:
+    """Return raw monitor strings from an agwpe_monitor.log fixture file."""
+    entries = []
+    with open(path, "rb") as f:
+        for raw in f:
+            try:
+                line = raw.decode("latin-1").rstrip("\n")
+            except Exception:
+                continue
+            m = _LOG_LINE_RE.match(line)
+            if m:
+                entries.append(m.group(1))
+    return entries
+
+
+@pytest.mark.skipif(not _FIXTURE_LOG.exists(), reason="fixture log not present")
+class TestParseFromLog:
+    """Verify _parse_info / _parse_via against real captured AGWPE traffic."""
+
+    def test_info_never_contains_ctrl_prefix(self):
+        """No parsed info field should start with the AGWPE frame-control metadata."""
+        for monitor in _load_monitor_log():
+            info = _parse_info(monitor)
+            assert not info.startswith("UI pid="), (
+                f"_parse_info leaked CTRL block for:\n  {monitor!r}"
+            )
+
+    def test_info_consistent_for_same_beacon(self):
+        """W6ABJ-12 beacon heard 3× via different digis → same info each time."""
+        monitors = [m for m in _load_monitor_log() if "W6ABJ-12" in m and " To ID " in m]
+        assert len(monitors) >= 2, "Fixture needs ≥2 W6ABJ-12 ID frames"
+        infos = {_parse_info(m) for m in monitors}
+        assert len(infos) == 1, f"Expected identical info, got: {infos}"
+
+    def test_via_entries_have_no_ctrl_metadata(self):
+        """No via entry should contain angle-brackets or AGWPE metadata."""
+        for monitor in _load_monitor_log():
+            for digi in _parse_via(monitor):
+                assert "<" not in digi and ">" not in digi and "pid" not in digi, (
+                    f"via entry looks like CTRL metadata: {digi!r}"
+                )
 
 
 class TestAGWPETransportDispatch:

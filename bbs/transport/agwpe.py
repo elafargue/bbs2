@@ -88,10 +88,13 @@ _PID_NO_L3 = 0xF0  # no layer-3 protocol
 # handled by TCP keepalives set on the socket after connect.
 _TCP_READ_TIMEOUT = 120  # seconds
 
-# AGWPE 'U' monitor string format:
-#   "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN*,KBERR <UI pid=F0 ...>"
-# Via section is absent for direct (non-digipeated) frames.
-_MONITOR_VIA_RE = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
+# AGWPE 'U' monitor string format (as sent by Direwolf):
+#   " 1:Fm CALL To DEST [Via PATH ]<UI pid=F0 Len=NN PF=0 >[HH:MM:SS]\rPAYLOAD\r\r\x00"
+# The Via section is absent for direct (non-digipeated) frames.
+# The actual AX.25 info payload follows >[HH:MM:SS]\r — everything between
+# <...> is AGWPE frame-control metadata, not the payload.
+_MONITOR_VIA_RE  = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
+_AGWPE_PAYLOAD_RE = re.compile(r">\[[\d:]+\]\r?(.*)", re.DOTALL)
 
 
 def _parse_via(monitor_text: str) -> list[str]:
@@ -100,6 +103,37 @@ def _parse_via(monitor_text: str) -> list[str]:
     if not m:
         return []
     return [v.strip() for v in m.group(1).split(",") if v.strip()]
+
+
+def _parse_info(monitor_text: str) -> str:
+    """
+    Extract the information field from an AGWPE 'U' monitor string.
+
+    AGWPE format: 'PORT:Fm CALL To DEST [Via PATH ]<CTRL>[HH:MM:SS]\rPAYLOAD\r\r\x00'
+    The payload follows the '>[HH:MM:SS]\r' marker, regardless of whether
+    a Via path is present.
+
+    TNC2 fallback: 'CALL>DEST,PATH:INFO'
+    """
+    m = _AGWPE_PAYLOAD_RE.search(monitor_text)
+    if m:
+        return m.group(1).strip("\r\n\x00 ")
+    # TNC2 fallback: "CALL>DEST,PATH:INFO"
+    colon = monitor_text.find(":")
+    if colon > 0:
+        return monitor_text[colon + 1:].strip()
+    return ""
+
+
+def _append_monitor_log(path: str, text: str) -> None:
+    """Append one raw AGWPE 'U' monitor string to *path* (one line per frame)."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        with open(path, "a", encoding="ascii", errors="replace") as fh:
+            fh.write(f"{ts}\t{text.rstrip()}\n")
+    except OSError as exc:
+        logger.warning("monitor_log write failed (%s): %s", path, exc)
 
 
 def _encode_call(callsign: str) -> bytes:
@@ -306,6 +340,8 @@ class AGWPETransport(Transport):
         # concurrent session tasks and the beacon loop (Python 3.9 fix).
         self._drain_lock: Optional[asyncio.Lock] = None
         self._write_timeout: int = int(cfg.get("write_timeout", 30))
+        # Optional path for logging raw 'U' monitor strings (useful for test-data capture).
+        self._monitor_log: str = cfg.get("monitor_log", "").strip()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -572,9 +608,14 @@ class AGWPETransport(Transport):
             if call_from.upper() == self._local_call.upper():
                 return  # our own transmitted frame echoed back
             via: list[str] = []
+            info = ""
             if payload:
                 try:
-                    via = _parse_via(payload.decode("ascii", errors="replace"))
+                    text = payload.decode("ascii", errors="replace")
+                    if self._monitor_log:
+                        _append_monitor_log(self._monitor_log, text)
+                    via  = _parse_via(text)
+                    info = _parse_info(text)
                 except Exception:
                     pass
             await self._heard_observer(
@@ -583,6 +624,7 @@ class AGWPETransport(Transport):
                 via,
                 int(time.time()),
                 self.transport_id,
+                info,
             )
 
         # All other frame types (version info, port info, etc.) are

@@ -747,6 +747,16 @@ class BulletinsPlugin(BBSPlugin):
             next_num = row_ins["msg_number"] if row_ins else "?"
         await term.sendln(term.ok(f"Message #{next_num} posted to {area_name}."))
 
+        if self._bus is not None:
+            await self._bus.publish("bulletin.new_message", {
+                "area":      area_name,
+                "from_call": session.auth.callsign,
+                "to_call":   to_call,
+                "subject":   subject,
+                "msg_id":    next_num,
+                "timestamp": __import__("time").time(),
+            })
+
     # ── Delete message ────────────────────────────────────────────────────────
 
     async def _delete_message(

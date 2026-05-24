@@ -199,6 +199,11 @@ class BBSEngine:
             "timestamp": time.time(),
         })
         self._emit_log(f"CONNECT {session.remote_addr} via {session.conn.transport_id}")
+        await self.plugin_registry.event_bus.publish("session.connected", {
+            "remote_addr": session.remote_addr,
+            "transport": session.conn.transport_id,
+            "timestamp": time.time(),
+        })
 
         try:
             await session.run()
@@ -223,6 +228,14 @@ class BBSEngine:
                 "session_id": session.session_id,
                 "remote_addr": session.remote_addr,
                 "transport": session.conn.transport_id,
+                "timestamp": time.time(),
+            })
+            await self.plugin_registry.event_bus.publish("session.disconnected", {
+                "callsign": session.auth.callsign or session.remote_addr,
+                "remote_addr": session.remote_addr,
+                "transport": session.conn.transport_id,
+                "duration": time.time() - session.connected_at,
+                "auth_level": session.auth.level.name,
                 "timestamp": time.time(),
             })
             self._emit_log(

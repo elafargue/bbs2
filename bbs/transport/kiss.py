@@ -177,8 +177,10 @@ class _KISSBaseTransport(Transport):
         # Frames not addressed to the BBS callsign — heard but not for us.
         if frame.dest_call.upper() != self._local_addr.upper():
             if self._heard_observer is not None:
+                info = frame.payload.decode("latin-1", errors="replace").strip()
                 await self._heard_observer(
-                    frame.src_call, frame.dest_call, frame.via, int(time.time()), self.transport_id
+                    frame.src_call, frame.dest_call, frame.via,
+                    int(time.time()), self.transport_id, info,
                 )
             return
 

@@ -15,6 +15,7 @@ const navItems = [
   { title: 'Plugins',    icon: 'mdi-puzzle',           to: '/plugins'  },
   { title: 'Activity',   icon: 'mdi-text-box-outline', to: '/activity' },
   { title: 'Terminal',   icon: 'mdi-console',          to: '/terminal' },
+  { title: 'Display',    icon: 'mdi-monitor',          to: '/display'  },
 ]
 
 onMounted(async () => {

@@ -54,8 +54,9 @@ ConnectionCallback = Callable[[Connection], Awaitable[None]]
 
 # Type alias: callback fired by transports when a frame is heard but NOT
 # addressed to the BBS callsign.
-# Arguments: src_call, dest_call, via (digipeater path), unix_ts, transport_id.
-HeardFrameCallback = Callable[[str, str, list[str], int, str], Awaitable[None]]
+# Arguments: src_call, dest_call, via (digipeater path), unix_ts, transport_id,
+#            info (decoded AX.25 information field, may be empty).
+HeardFrameCallback = Callable[[str, str, list[str], int, str, str], Awaitable[None]]
 
 
 class Transport(ABC):

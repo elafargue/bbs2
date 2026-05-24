@@ -308,7 +308,8 @@ class HeardPlugin(BBSPlugin):
     # ── Transport observer ────────────────────────────────────────────────────
 
     async def on_heard(
-        self, src: str, dest: str, via: list[str], ts: int, transport: str
+        self, src: str, dest: str, via: list[str], ts: int, transport: str,
+        info: str = "",
     ) -> None:
         """
         Called by RF transports when a frame is received that is NOT addressed
@@ -462,6 +463,17 @@ class HeardPlugin(BBSPlugin):
                     (src_up, transport, via_base, merged_path_via, ts, ts, merged_path_via),
                 )
             await db.commit()
+
+        # Notify subscribers after the DB write so the data is consistent.
+        if self._bus is not None:
+            await self._bus.publish("heard.station", {
+                "callsign":  src_up,
+                "dest":      dest_up,
+                "transport": transport,
+                "via":       via_str,
+                "timestamp": ts,
+                "info":      info,
+            })
 
     # ── ASCII network map ─────────────────────────────────────────────────────
 

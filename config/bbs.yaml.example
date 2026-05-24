@@ -121,6 +121,32 @@ plugins:
     # Maximum rows shown in the listing
     limit: 200
 
+  display:
+    enabled: false          # Set to true after installing deps (pip install bbs2[display])
+    # Framebuffer device (480x320 @ RGB565)
+    fb_device: /dev/fb0
+    width: 480
+    height: 320
+    # Seconds between screen refreshes (0.5–5 is a good range)
+    refresh_interval: 1.0
+    # Dim screen after N minutes of RF inactivity (0 = never dim)
+    idle_dim_minutes: 5
+    # Blank screen after N minutes of RF inactivity (0 = never blank)
+    idle_off_minutes: 30
+    # Software brightness level when dimmed (1–100 %)
+    dim_level: 20
+    # Optional: sysfs path to hardware backlight (leave empty for software-only dimming)
+    # Example: /sys/class/backlight/soc:backlight/brightness
+    backlight_path: ""
+    backlight_max: 255
+    # Font path: leave empty to auto-detect system fonts (prefers Terminus, falls back to DejaVu)
+    # Install pixel-perfect Terminus font: sudo apt install fonts-terminus
+    font_path: ""
+    # Messages posted within this window are counted as "new" on the display
+    bulletin_new_hours: 24
+    # Length of the scrolling RF heard deque
+    max_heard_scroll: 20
+
 web:
   host: "127.0.0.1"
   port: 8080
