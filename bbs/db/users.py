@@ -68,10 +68,19 @@ def _row_to_user(row: aiosqlite.Row) -> User:
     )
 
 
-async def get_or_create(db: aiosqlite.Connection, callsign: str) -> tuple[User, bool]:
+async def get_or_create(
+    db: aiosqlite.Connection,
+    callsign: str,
+    initial_approved: bool = True,
+) -> tuple[User, bool]:
     """
-    Fetch the user record for *callsign*, creating a pending account if
-    none exists.  Returns (user, created).
+    Fetch the user record for *callsign*, creating an account if none exists.
+
+    *initial_approved* controls the approved flag for newly created accounts:
+    - True (default): the user can post immediately (enforce_active is off)
+    - False: the user is pending sysop approval (enforce_active is on)
+
+    Returns (user, created).
     """
     callsign = callsign.upper().strip()
     db.row_factory = aiosqlite.Row
@@ -84,8 +93,8 @@ async def get_or_create(db: aiosqlite.Connection, callsign: str) -> tuple[User, 
         return _row_to_user(row), False
 
     await db.execute(
-        "INSERT INTO users (callsign, approved) VALUES (?, 0)",
-        (callsign,),
+        "INSERT INTO users (callsign, approved) VALUES (?, ?)",
+        (callsign, 1 if initial_approved else 0),
     )
     await db.commit()
     async with db.execute(

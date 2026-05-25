@@ -1010,3 +1010,201 @@ class TestHelp:
         await logged_in_client.sendln("Q")
         await logged_in_client.wait_for(">")
 
+
+# ---------------------------------------------------------------------------
+# Unread indicator tests
+# ---------------------------------------------------------------------------
+
+class TestUnreadIndicator:
+    """Unit tests for the unread (*) marker in _show_message_index.
+
+    The key invariant: a message sent *by* the current user must never be
+    marked as unread for them, regardless of read_receipts.
+    """
+
+    def _capture(self):
+        """Return ``(term, buf)`` — an ANSI16 Terminal whose output lands in buf."""
+        from bbs.core.terminal import Terminal, ColorMode
+
+        buf = bytearray()
+
+        class _W:
+            def write(self, d: bytes) -> None: buf.extend(d)
+            async def drain(self) -> None: pass
+            def is_closing(self) -> bool: return False
+            def close(self) -> None: pass
+            async def wait_closed(self) -> None: pass
+
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        return Terminal(reader, _W(), color_mode=ColorMode.ANSI16), buf
+
+    def _msg(self, msg_id: int, from_call: str, to_call: str) -> dict:
+        return {
+            "id": msg_id,
+            "msg_number": msg_id,
+            "from_call": from_call,
+            "to_call": to_call,
+            "subject": "Subj",
+            "body": "body",
+            "authenticated": 1,
+            "created_at": 0,
+        }
+
+    async def test_sent_message_not_unread_for_sender(self):
+        """A message sent by the current user must NOT show '*' even when not in read_ids."""
+        from tests.client import _strip_ansi
+
+        term, buf = self._capture()
+        plugin = _make_plugin_instance()
+        msg = self._msg(1, "W1SEND", "N3RECV")
+        # empty read_ids means "nothing read" — but W1SEND is the sender
+        await plugin._show_message_index(
+            term, "GENERAL", [msg], read_ids=set(), callsign="W1SEND"
+        )
+        plain = _strip_ansi(buf.decode("ascii", errors="replace"))
+        assert "1   *" not in plain
+
+    async def test_received_unread_message_shows_star_for_recipient(self):
+        """An unread message addressed to the current user MUST show '*'."""
+        from tests.client import _strip_ansi
+
+        term, buf = self._capture()
+        plugin = _make_plugin_instance()
+        msg = self._msg(1, "W1SEND", "W1RECV")
+        await plugin._show_message_index(
+            term, "GENERAL", [msg], read_ids=set(), callsign="W1RECV"
+        )
+        plain = _strip_ansi(buf.decode("ascii", errors="replace"))
+        assert "1   *" in plain
+
+    async def test_message_in_read_ids_not_marked_unread(self):
+        """A message that already has a read receipt must NOT show '*'."""
+        from tests.client import _strip_ansi
+
+        term, buf = self._capture()
+        plugin = _make_plugin_instance()
+        msg = self._msg(42, "W1SEND", "W1RECV")
+        await plugin._show_message_index(
+            term, "GENERAL", [msg], read_ids={42}, callsign="W1RECV"
+        )
+        plain = _strip_ansi(buf.decode("ascii", errors="replace"))
+        assert "42  *" not in plain
+
+    async def test_none_read_ids_anonymous_session_no_star(self):
+        """When read_ids is None (anonymous / unidentified session), no '*' appears."""
+        from tests.client import _strip_ansi
+
+        term, buf = self._capture()
+        plugin = _make_plugin_instance()
+        msg = self._msg(1, "W1SEND", "W1RECV")
+        await plugin._show_message_index(
+            term, "GENERAL", [msg], read_ids=None, callsign="W1RECV"
+        )
+        plain = _strip_ansi(buf.decode("ascii", errors="replace"))
+        assert "1   *" not in plain
+
+    async def test_case_insensitive_sender_check(self):
+        """Sender check must be case-insensitive (callsign stored mixed-case vs queried upper)."""
+        from tests.client import _strip_ansi
+
+        term, buf = self._capture()
+        plugin = _make_plugin_instance()
+        # from_call stored as lowercase; callsign queried as uppercase
+        msg = self._msg(1, "w1send", "N3RECV")
+        await plugin._show_message_index(
+            term, "GENERAL", [msg], read_ids=set(), callsign="W1SEND"
+        )
+        plain = _strip_ansi(buf.decode("ascii", errors="replace"))
+        assert "1   *" not in plain
+
+
+class TestCountUnread:
+    """Unit tests for the _count_unread helper.
+
+    Sent messages must never count toward the sender's unread tally.
+    """
+
+    async def test_sent_message_not_counted_as_unread_for_sender(self):
+        """Messages sent by the user do not contribute to their unread count."""
+        from bbs.plugins.bulletins.bulletin import _count_unread
+
+        db, area_id = await _make_bulletin_db()
+        try:
+            await db.execute(
+                "INSERT INTO bulletin_messages "
+                "(area_id, msg_number, subject, from_call, to_call, body, authenticated) "
+                "VALUES (?,1,'SentMsg','W1SEND','N3RECV','body',1)",
+                (area_id,),
+            )
+            await db.commit()
+            count = await _count_unread(db, area_id, user_id=1, callsign="W1SEND")
+            assert count == 0
+        finally:
+            await db.close()
+
+    async def test_received_unread_message_counted_for_recipient(self):
+        """An unread incoming private message counts as 1 unread for the recipient."""
+        from bbs.plugins.bulletins.bulletin import _count_unread
+
+        db, area_id = await _make_bulletin_db()
+        try:
+            await db.execute(
+                "INSERT INTO bulletin_messages "
+                "(area_id, msg_number, subject, from_call, to_call, body, authenticated) "
+                "VALUES (?,1,'InboxMsg','W1SEND','W1RECV','body',1)",
+                (area_id,),
+            )
+            await db.commit()
+            count = await _count_unread(db, area_id, user_id=2, callsign="W1RECV")
+            assert count == 1
+        finally:
+            await db.close()
+
+    async def test_read_receipt_removes_from_unread_count(self):
+        """After inserting a read receipt, unread count drops to 0."""
+        from bbs.plugins.bulletins.bulletin import _count_unread
+
+        db, area_id = await _make_bulletin_db()
+        try:
+            await db.execute(
+                "INSERT INTO bulletin_messages "
+                "(area_id, msg_number, subject, from_call, to_call, body, authenticated) "
+                "VALUES (?,1,'ReadMsg','W1SEND','W1RECV','body',1)",
+                (area_id,),
+            )
+            await db.commit()
+            msg_id = (
+                await (
+                    await db.execute("SELECT id FROM bulletin_messages WHERE subject='ReadMsg'")
+                ).fetchone()
+            )[0]
+            await db.execute(
+                "INSERT INTO read_receipts (user_id, message_id) VALUES (2, ?)", (msg_id,)
+            )
+            await db.commit()
+            count = await _count_unread(db, area_id, user_id=2, callsign="W1RECV")
+            assert count == 0
+        finally:
+            await db.close()
+
+    async def test_sender_zero_recipient_one_same_message(self):
+        """For the same private message: sender=0 unread, recipient=1 unread."""
+        from bbs.plugins.bulletins.bulletin import _count_unread
+
+        db, area_id = await _make_bulletin_db()
+        try:
+            await db.execute(
+                "INSERT INTO bulletin_messages "
+                "(area_id, msg_number, subject, from_call, to_call, body, authenticated) "
+                "VALUES (?,1,'PrivMsg','W1SEND','W1RECV','body',1)",
+                (area_id,),
+            )
+            await db.commit()
+            sender_unread    = await _count_unread(db, area_id, user_id=1, callsign="W1SEND")
+            recipient_unread = await _count_unread(db, area_id, user_id=2, callsign="W1RECV")
+            assert sender_unread == 0
+            assert recipient_unread == 1
+        finally:
+            await db.close()
+

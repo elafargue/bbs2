@@ -44,8 +44,9 @@ class BBSEngine:
     for simple types; the event_queue is the only cross-thread channel).
     """
 
-    def __init__(self, cfg: BBSConfig) -> None:
+    def __init__(self, cfg: BBSConfig, cfg_path: str = "config/bbs.yaml") -> None:
         self.cfg = cfg
+        self.cfg_path = cfg_path  # path to the yaml file, used for live config updates
         self.auth_service = AuthService(cfg)
         self.plugin_registry = PluginRegistry(cfg)
 

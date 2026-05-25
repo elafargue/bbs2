@@ -236,9 +236,17 @@ class BBSSession:
                 f"{self.term.label('Welcome,', 'success')} {self.term.style(display_call, 'accent', bold=True)}!"
             )
             if created:
-                await self.term.sendln(
-                    self.term.note("(New account created — sysop approval pending for write access)")
+                enforce_active = bool(
+                    self.cfg.plugins.get("bulletins", {}).get("enforce_active", False)
                 )
+                if enforce_active:
+                    await self.term.sendln(
+                        self.term.note("(New account created — sysop approval required before posting to bulletins.)")
+                    )
+                else:
+                    await self.term.sendln(
+                        self.term.note("(New account created.)")
+                    )
         elif self.conn.transport_id == "web":
             # Web terminal is sysop-only; identify automatically as the BBS
             # sysop callsign so the session is always tracked in connection_log.
@@ -274,9 +282,17 @@ class BBSSession:
                 f"{self.term.label('Welcome,', 'success')} {self.term.style(base_call, 'accent', bold=True)}!"
             )
             if created:
-                await self.term.sendln(
-                    self.term.note("(New account — sysop approval pending for write access)")
+                enforce_active = bool(
+                    self.cfg.plugins.get("bulletins", {}).get("enforce_active", False)
                 )
+                if enforce_active:
+                    await self.term.sendln(
+                        self.term.note("(New account created — sysop approval required before posting to bulletins.)")
+                    )
+                else:
+                    await self.term.sendln(
+                        self.term.note("(New account created.)")
+                    )
 
         level_label = self.auth_service.level_label(self.auth.level)
         await self.term.sendln(

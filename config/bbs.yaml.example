@@ -87,6 +87,10 @@ auth:
 plugins:
   bulletins:
     enabled: true
+    # When true, new users are created as pending and must be approved by
+    # the sysop (via the web UI) before they can post to bulletins.
+    # When false (default), all users can post immediately.
+    enforce_active: false
     # Maximum message body size in bytes (keep small for 1200bps)
     max_body_bytes: 4096
     # Maximum subject length in characters

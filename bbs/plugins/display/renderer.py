@@ -303,7 +303,7 @@ class Renderer:
     ) -> None:
         """Bottom section: scrolling RF heard log (y=143 ..)."""
         y_top    = 143
-        line_h   = 18
+        line_h   = 15
         pad      = 6
         max_lines = (self.height - y_top - 4) // line_h
 
@@ -330,26 +330,6 @@ class Renderer:
         for entry in entries:
             if y + line_h > self.height - 2:
                 break
-
-            # ── Legacy plain-string entries (backward compat for old tests) ──
-            if isinstance(entry, str):
-                if "\n" in entry:
-                    header_line, info_line = entry.split("\n", 1)
-                    max_h = (self.width - pad * 2) // 7
-                    max_i = (self.width - pad * 2 - 8) // 6
-                    draw.text((pad, y), header_line[:max_h],
-                              font=self._font("normal"), fill=C_HEARD)
-                    y += line_h
-                    if y + info_line_h <= self.height - 2:
-                        draw.text((pad + 8, y), info_line[:max_i],
-                                  font=self._font("small"), fill=C_BODY)
-                        y += info_line_h
-                else:
-                    max_chars = (self.width - pad * 2) // 7
-                    draw.text((pad, y), entry[:max_chars],
-                              font=self._font("normal"), fill=C_HEARD)
-                    y += line_h
-                continue
 
             # ── Structured dict entry — per-token via coloring ────────────────
             src       = entry.get("src", "?")

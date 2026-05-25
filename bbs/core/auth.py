@@ -68,6 +68,7 @@ class AuthState:
     callsign: str = ""
     level: AuthLevel = AuthLevel.ANONYMOUS
     user_id: Optional[int] = None
+    approved: bool = True  # mirrors users.approved; False when enforce_active is set and user is pending
 
     @property
     def is_identified(self) -> bool:
@@ -158,7 +159,13 @@ class AuthService:
         Returns (AuthState, user_was_just_created).
         """
         callsign = callsign.upper().strip()
-        user, created = await user_db.get_or_create(db, callsign)
+        enforce_active = bool(
+            self._cfg.plugins.get("bulletins", {}).get("enforce_active", False)
+        )
+        initial_approved = not enforce_active
+        user, created = await user_db.get_or_create(
+            db, callsign, initial_approved=initial_approved
+        )
         await user_db.update_last_seen(db, user.id)
 
         level = AuthLevel.IDENTIFIED
@@ -166,6 +173,7 @@ class AuthService:
             callsign=callsign,
             level=level,
             user_id=user.id,
+            approved=user.approved,
         )
         return state, created
 

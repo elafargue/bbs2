@@ -111,3 +111,29 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
         web=raw.get("web", {}),
         logging=raw.get("logging", {}),
     )
+
+
+def update_yaml_setting(path: str | Path, key_path: list[str], value: Any) -> None:
+    """
+    Load *path* as YAML, navigate the nested *key_path*, set *value*, and
+    write back.  Intermediate dicts are created if absent.
+
+    Note: this round-trips through pyyaml, so inline comments in the file
+    will be lost on the first save.
+
+    Example::
+        update_yaml_setting("config/bbs.yaml", ["plugins", "bulletins", "enforce_active"], True)
+    """
+    config_path = Path(path)
+    with config_path.open() as fh:
+        raw: dict[str, Any] = yaml.safe_load(fh) or {}
+
+    node = raw
+    for key in key_path[:-1]:
+        if key not in node or not isinstance(node[key], dict):
+            node[key] = {}
+        node = node[key]
+    node[key_path[-1]] = value
+
+    with config_path.open("w") as fh:
+        yaml.dump(raw, fh, default_flow_style=False, allow_unicode=True)

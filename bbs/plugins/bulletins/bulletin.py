@@ -27,6 +27,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import aiosqlite
 
+from bbs.ax25.address import _CALLSIGN_RE
 from bbs.core.auth import AuthLevel
 from bbs.core.plugin_registry import BBSPlugin
 
@@ -123,6 +124,7 @@ class BulletinsPlugin(BBSPlugin):
         )
         default_area_cfg: str = cfg.get("default_area", "")
         self._default_area_name: Optional[str] = default_area_cfg.upper().strip() or None
+        self._enforce_active: bool = bool(cfg.get("enforce_active", False))
         await _ensure_schema(db_path, self._default_areas)
 
     async def handle_session(self, session: "BBSSession") -> None:
@@ -541,6 +543,7 @@ class BulletinsPlugin(BBSPlugin):
         self, term: Any, area_name: str, messages: list,
         read_ids: Optional[set] = None,
         idle_timeout: Optional[float] = None,
+        callsign: Optional[str] = None,
     ) -> None:
         hdr = f"{'#':<6} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
         sep = "-" * len(hdr)
@@ -557,7 +560,8 @@ class BulletinsPlugin(BBSPlugin):
             date = time.strftime("%m/%d/%Y %H:%M:%S", time.localtime(m["created_at"]))
             subj = str(m["subject"])[:self._max_subject]
             from_disp = m["from_call"] + ("*" if m["authenticated"] else "")
-            unread    = read_ids is not None and m["id"] not in read_ids
+            is_sender = callsign and m["from_call"].upper() == callsign.upper()
+            unread    = read_ids is not None and m["id"] not in read_ids and not is_sender
             num_disp  = f"{m['msg_number']:<4}{'*' if unread else ' '} "
             num_color = "warning" if unread else "accent"
             st_str    = f"{st:<2}"
@@ -588,7 +592,8 @@ class BulletinsPlugin(BBSPlugin):
             return
         read_ids = await self._fetch_read_ids(session.db, area_id, session.auth.user_id)
         await self._show_message_index(term, area_name, messages, read_ids=read_ids,
-                                        idle_timeout=float(session.cfg.idle_timeout) or None)
+                                        idle_timeout=float(session.cfg.idle_timeout) or None,
+                                        callsign=session.auth.callsign)
 
     # ── Read a single message ─────────────────────────────────────────────────
 
@@ -675,6 +680,12 @@ class BulletinsPlugin(BBSPlugin):
                 term.warn("AUTH required to post. Type 'A' at main menu to authenticate.")
             )
             return
+        # Check active/approved status when enforce_active is enabled
+        if self._enforce_active and not session.auth.approved:
+            await term.sendln(
+                term.warn("Your account is pending sysop approval. Contact the sysop to enable posting access.")
+            )
+            return
         is_authenticated_post = session.auth.is_authenticated
 
         # Area selection if none chosen yet
@@ -691,11 +702,36 @@ class BulletinsPlugin(BBSPlugin):
             return
 
         # Gather To: (default ALL) — skip prompt when pre-supplied via command (e.g. "S W1AW")
+        async def _validate_to_call(candidate: str) -> bool:
+            """Return True if candidate is ALL or a registered user callsign."""
+            if candidate == "ALL":
+                return True
+            if not _CALLSIGN_RE.match(candidate):
+                await term.sendln(term.warn(
+                    f"{candidate!r} is not a valid callsign. Use ALL or a callsign like W1AW or N0CALL-1."
+                ))
+                return False
+            async with db.execute(
+                "SELECT 1 FROM users WHERE callsign=? COLLATE NOCASE LIMIT 1",
+                (candidate,),
+            ) as cur:
+                if await cur.fetchone():
+                    return True
+            await term.sendln(term.warn(
+                f"{candidate} is not a registered user on this BBS. Use ALL or a known callsign."
+            ))
+            return False
+
+        if to_call and not await _validate_to_call(to_call):
+            to_call = None
         if to_call:
             await term.sendln(f"To: {term.style(to_call, 'accent', bold=True)}")
         else:
-            await term.send("To [ALL]: ")
-            to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
+            while True:
+                await term.send("To [ALL]: ")
+                to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
+                if await _validate_to_call(to_call):
+                    break
 
         # Gather body — /EX on its own line ends input (classic BBS convention)
         await term.sendln(term.label(f"Enter message body ({self._max_body} bytes max).", 'meta'))
@@ -829,8 +865,10 @@ async def _count_unread(
     callsign: Optional[str] = None,
     is_sysop: bool = False,
 ) -> int:
-    """Count messages not yet read by *user_id*, applying the same visibility
-    rules as :meth:`BulletinsPlugin._fetch_messages`.
+    """Count messages not yet read by *user_id* in *area_id*.
+
+    Applies the same visibility rules as _fetch_messages.  Messages sent by
+    *callsign* are never counted as unread — the sender wrote them.
     """
     if is_sysop or not callsign:
         vis_sql = ""
@@ -838,6 +876,10 @@ async def _count_unread(
     else:
         vis_sql = "AND (m.to_call='ALL' OR m.from_call=? OR m.to_call=?)"
         vis_args = (callsign, callsign)
+
+    # Never count messages sent by this user as unread — they wrote them.
+    sender_sql = " AND m.from_call!=?" if callsign else ""
+    sender_args: tuple = (callsign,) if callsign else ()
 
     if not user_id:
         async with db.execute(
@@ -851,8 +893,8 @@ async def _count_unread(
     async with db.execute(
         f"""SELECT COUNT(*) FROM bulletin_messages m
            LEFT JOIN read_receipts r ON r.message_id=m.id AND r.user_id=?
-           WHERE m.area_id=? AND m.deleted=0 AND r.message_id IS NULL {vis_sql}""",
-        (user_id, area_id) + vis_args,
+           WHERE m.area_id=? AND m.deleted=0 AND r.message_id IS NULL {vis_sql}{sender_sql}""",
+        (user_id, area_id) + vis_args + sender_args,
     ) as cur:
         row = await cur.fetchone()
     return int(row[0]) if row else 0

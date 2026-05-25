@@ -7,7 +7,7 @@ framebuffer screen (default: 480×320 @ /dev/fb0).
 Subscribes to the plugin event bus:
   heard.station         — updates the scrolling RF log
   session.disconnected  — updates the "last 3 connections" section
-  bulletin.new_message  — increments area new-message counter
+  bulletin.new_message  — increments area new-message counter (corrected on next DB refresh)
 
 Bulletin area totals and last-connection history are pre-loaded from the
 SQLite database on startup so the display is useful immediately.
@@ -24,7 +24,8 @@ Configuration (bbs.yaml plugins.display section or web panel)
   backlight_path     :            # /sys/class/backlight/.../brightness (optional)
   backlight_max      : 255        # max value written to backlight_path
   font_path          :            # path to TTF/TTC font (empty = auto-detect)
-  bulletin_new_hours : 24         # messages posted within this window are "new"
+  bulletin_new_hours : 24         # fallback: messages posted within this window are "new"
+                                  #   (only used when the sysop has no user account in the DB)
   max_heard_scroll   : 20         # length of the scrolling RF heard deque
 
 The plugin registers in the PluginRegistry but has no BBS menu entry
@@ -141,7 +142,9 @@ class DisplayPlugin(BBSPlugin):
         self._last_conns_refresh:   float = 0.0   # set after _preload_last_conns
         # Single-slot consecutive-dedup cache (Paracon _last_unproto pattern)
         self._last_heard: Optional[dict] = None
-
+        # Sysop callsign injected by PluginRegistry; used to count unread messages
+        self._sysop_callsign: str = cfg.get("_bbs_sysop", "")
+        self._sysop_user_id: Optional[int] = None
         # Renderer (initialised lazily once we know font_path from DB)
         self._renderer: Optional[Renderer] = None
 
@@ -486,28 +489,69 @@ class DisplayPlugin(BBSPlugin):
         except Exception as exc:
             logger.debug("Could not preload last connections: %s", exc)
 
+    async def _resolve_sysop_user_id(self, db: aiosqlite.Connection) -> Optional[int]:
+        """Look up and cache the sysop's user_id by callsign."""
+        if self._sysop_user_id is not None:
+            return self._sysop_user_id
+        if not self._sysop_callsign:
+            return None
+        async with db.execute(
+            "SELECT id FROM users WHERE callsign = ? COLLATE NOCASE LIMIT 1",
+            (self._sysop_callsign,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            self._sysop_user_id = int(row[0])
+        return self._sysop_user_id
+
     async def _refresh_bulletin_counts(self) -> None:
-        """Query total + new message counts for all bulletin areas."""
+        """Query total + new message counts for all bulletin areas.
+
+        When the sysop has a user account, "new" means messages they have not
+        yet read (based on read_receipts).  Falls back to a time-window count
+        (bulletin_new_hours) when no matching user is found in the database.
+        """
         hours = float(self._settings.get("bulletin_new_hours", "24"))
         cutoff = time.time() - hours * 3600
         try:
             async with aiosqlite.connect(self._db_path, timeout=30) as db:
                 db.row_factory = aiosqlite.Row
-                async with db.execute(
-                    """
-                    SELECT
-                        a.name,
-                        COUNT(m.id)                                        AS total,
-                        SUM(CASE WHEN m.created_at > ? THEN 1 ELSE 0 END) AS new_count
-                    FROM   bulletin_areas   a
-                    LEFT JOIN bulletin_messages m
-                           ON m.area_id = a.id AND m.deleted = 0
-                    GROUP  BY a.id, a.name
-                    ORDER  BY a.name
-                    """,
-                    (cutoff,),
-                ) as cur:
-                    rows = await cur.fetchall()
+                sysop_uid = await self._resolve_sysop_user_id(db)
+                if sysop_uid is not None:
+                    async with db.execute(
+                        """
+                        SELECT
+                            a.name,
+                            COUNT(m.id)                                                           AS total,
+                            SUM(CASE WHEN r.message_id IS NULL
+                                          AND m.from_call != ? THEN 1 ELSE 0 END)                AS new_count
+                        FROM   bulletin_areas   a
+                        LEFT JOIN bulletin_messages m
+                               ON m.area_id = a.id AND m.deleted = 0
+                        LEFT JOIN read_receipts r
+                               ON r.message_id = m.id AND r.user_id = ?
+                        GROUP  BY a.id, a.name
+                        ORDER  BY a.name
+                        """,
+                        (self._sysop_callsign, sysop_uid),
+                    ) as cur:
+                        rows = await cur.fetchall()
+                else:
+                    async with db.execute(
+                        """
+                        SELECT
+                            a.name,
+                            COUNT(m.id)                                        AS total,
+                            SUM(CASE WHEN m.created_at > ? THEN 1 ELSE 0 END) AS new_count
+                        FROM   bulletin_areas   a
+                        LEFT JOIN bulletin_messages m
+                               ON m.area_id = a.id AND m.deleted = 0
+                        GROUP  BY a.id, a.name
+                        ORDER  BY a.name
+                        """,
+                        (cutoff,),
+                    ) as cur:
+                        rows = await cur.fetchall()
                 self._bulletin_areas = {
                     row["name"].upper(): BulletinArea(
                         name=row["name"].upper(),

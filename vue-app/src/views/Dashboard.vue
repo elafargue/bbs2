@@ -5,7 +5,6 @@ import socket from '../socket.js'
 const bbsCallsign = ref('')
 const users = ref([])
 const plugins = ref([])
-const logLines = ref([])
 
 const userHeaders = [
   { title: 'Callsign',   key: 'callsign'    },
@@ -17,15 +16,13 @@ const userHeaders = [
 onMounted(async () => {
   // Fetch initial state via REST so navigating back always shows fresh data.
   // (admin_dashboard_init only fires once on initial page load, not on re-navigation.)
-  const [usersRes, pluginsRes, logRes, meRes] = await Promise.all([
+  const [usersRes, pluginsRes, meRes] = await Promise.all([
     fetch('/api/activity/users'),
     fetch('/api/plugins'),
-    fetch('/api/activity?n=500'),
     fetch('/api/admin/me'),
   ])
   if (usersRes.ok)  users.value    = await usersRes.json()
   if (pluginsRes.ok) plugins.value = await pluginsRes.json()
-  if (logRes.ok)  { const d = await logRes.json(); logLines.value = d.lines || [] }
   if (meRes.ok)   { const d = await meRes.json(); bbsCallsign.value = d.callsign || '' }
 
   // Socket listeners keep data live after the initial fetch.
@@ -34,21 +31,15 @@ onMounted(async () => {
     if (data.bbs_callsign) bbsCallsign.value = data.bbs_callsign
     if (data.users)   users.value    = data.users
     if (data.plugins) plugins.value  = data.plugins
-    if (data.log)     logLines.value = data.log
   })
   socket.on('users_snapshot',      (snap)  => { users.value   = snap  })
   socket.on('plugin_stats_update', (stats) => { plugins.value = stats })
-  socket.on('bbs_log_line', (data) => {
-    logLines.value.push(data.line)
-    if (logLines.value.length > 1000) logLines.value.shift()
-  })
 })
 
 onUnmounted(() => {
   socket.off('admin_dashboard_init')
   socket.off('users_snapshot')
   socket.off('plugin_stats_update')
-  socket.off('bbs_log_line')
 })
 </script>
 
@@ -106,26 +97,6 @@ onUnmounted(() => {
               </template>
             </v-list-item>
           </v-list>
-        </v-card>
-      </v-col>
-    </v-row>
-
-    <!-- Live log -->
-    <v-row>
-      <v-col cols="12">
-        <v-card>
-          <v-card-title>
-            <v-icon start>mdi-text-box-outline</v-icon>
-            Live Activity Log
-          </v-card-title>
-          <v-card-text>
-            <div
-              class="log-box"
-              style="height:240px; overflow-y:auto; font-family:monospace; font-size:0.8rem;"
-            >
-              <div v-for="(line, i) in logLines" :key="i">{{ line }}</div>
-            </div>
-          </v-card-text>
         </v-card>
       </v-col>
     </v-row>

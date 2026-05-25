@@ -26,14 +26,27 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_spa(path: str):
-    """Serve the Vue SPA for all non-API routes."""
-    from flask import send_from_directory
+    """Serve the Vue SPA for all non-API routes.
+
+    Cache strategy:
+    - index.html: no-cache (always revalidate so stale chunk references never
+      cause "Importing a module script failed" errors after a frontend rebuild).
+    - Hashed assets (assets/*.js, assets/*.css): 1-year immutable cache, since
+      Vite embeds a content hash in every filename.
+    """
+    from flask import send_from_directory, make_response
     import os
     static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
     full = os.path.join(static_dir, path)
     if path and os.path.isfile(full):
-        return send_from_directory(static_dir, path)
-    return send_from_directory(static_dir, "index.html")
+        resp = make_response(send_from_directory(static_dir, path, max_age=0))
+        if path.startswith("assets/"):
+            # Content-hash filenames are immutable; cache aggressively.
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+    resp = make_response(send_from_directory(static_dir, "index.html", max_age=0))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 

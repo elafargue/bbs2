@@ -100,17 +100,10 @@ def on_join_admin(data):
         emit("bbs_status", {"online": False})
         return
 
-    # Load full persistent log history from DB; fall back to in-memory buffer
-    db_path = bbs_engine.cfg.db_path
-    log_lines = _read_activity_log(str(db_path), 2000)
-    if not log_lines:
-        log_lines = bbs_engine.recent_log_lines(500)
-
     # Send current state snapshot to the newly-joined sysop
     emit("admin_dashboard_init", {
         "users": bbs_engine.connected_users_snapshot(),
         "plugins": bbs_engine.plugin_stats_snapshot(),
-        "log": log_lines,
         "bbs_callsign": bbs_engine.cfg.full_callsign,
     })
 

@@ -157,7 +157,10 @@ class PluginRegistry:
                     continue
 
                 # Respect enabled flag from config
-                section = plugin_cfg.get(plugin.name, {})
+                # Make a copy and inject BBS-level globals so plugins can access
+                # them without needing the full BBSConfig object.
+                section = dict(plugin_cfg.get(plugin.name, {}))
+                section["_bbs_sysop"] = self._cfg.sysop
                 if not section.get("enabled", True):
                     logger.info("Plugin %s disabled in config", plugin.name)
                     plugin.enabled = False

@@ -5,7 +5,10 @@ import { ref, onMounted } from 'vue'
 const areas    = ref([])
 const loading  = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
-
+// Plugin settings
+const enforceActive        = ref(false)
+const settingsLoading      = ref(false)
+const settingsSaving       = ref(false)
 // Create dialog
 const createDialog = ref(false)
 const createForm   = ref({ name: '', description: '', is_default: false })
@@ -37,7 +40,31 @@ async function loadAreas() {
   if (res.ok) areas.value = await res.json()
   loading.value = false
 }
+async function loadSettings() {
+  settingsLoading.value = true
+  const res = await fetch('/api/bulletins/settings')
+  if (res.ok) {
+    const data = await res.json()
+    enforceActive.value = !!data.enforce_active
+  }
+  settingsLoading.value = false
+}
 
+async function saveSettings() {
+  settingsSaving.value = true
+  const res = await fetch('/api/bulletins/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enforce_active: enforceActive.value }),
+  })
+  settingsSaving.value = false
+  if (res.ok) {
+    notify('Setting saved — takes full effect on next server restart', 'info')
+  } else {
+    const d = await res.json()
+    notify(d.error || 'Save failed', 'error')
+  }
+}
 // ── Create ────────────────────────────────────────────────────────────────────
 function openCreate() {
   createForm.value = { name: '', description: '', is_default: false }
@@ -126,10 +153,33 @@ function notify(text, color = 'success') {
 }
 
 onMounted(loadAreas)
+onMounted(loadSettings)
 </script>
 
 <template>
   <v-container fluid>
+    <!-- ── Plugin Settings ── -->
+    <v-card class="mb-4" variant="outlined">
+      <v-card-title class="text-subtitle-1">
+        <v-icon class="mr-2" size="small">mdi-cog</v-icon>Plugin Settings
+      </v-card-title>
+      <v-card-text>
+        <v-switch
+          v-model="enforceActive"
+          label="Require sysop approval before users can post"
+          color="primary"
+          :loading="settingsLoading"
+          hide-details
+          @update:model-value="saveSettings"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          When enabled, new user accounts are created as <em>pending</em> and cannot post
+          to bulletins until a sysop approves them in the Users page.
+          Takes full effect on the next server restart.
+        </div>
+      </v-card-text>
+    </v-card>
+
     <v-row align="center" class="mb-2">
       <v-col>
         <div class="text-h5 font-weight-bold">

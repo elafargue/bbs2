@@ -79,7 +79,7 @@ def main() -> None:
 
     # ── BBS Engine ────────────────────────────────────────────────────────────
     from bbs.core.engine import BBSEngine
-    engine = BBSEngine(cfg)
+    engine = BBSEngine(cfg, cfg_path=args.config)
 
     # Make engine visible to web interface
     import server.app as server_app

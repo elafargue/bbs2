@@ -9,6 +9,9 @@ PATCH  /api/bulletins/areas/<id>         — update name / description / default
 DELETE /api/bulletins/areas/<id>         — delete area (cascades messages)
 POST   /api/bulletins/areas/<id>/default — set as default area (clears others)
 DELETE /api/bulletins/areas/<id>/default — clear default flag
+
+GET    /api/bulletins/settings           — get plugin config settings (enforce_active)
+PATCH  /api/bulletins/settings           — update plugin config settings
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import sqlite3
 
 from flask import jsonify, request, session
 
+from bbs.config import update_yaml_setting
 from server.app import app
 
 _AREA_NAME_RE = re.compile(r'^[A-Z0-9][A-Z0-9\-]{0,19}$')
@@ -204,3 +208,61 @@ def delete_bulletin_area(area_id: int):
         return jsonify({"ok": True, "deleted": row[0]})
     finally:
         db.close()
+
+
+# ── Plugin settings ───────────────────────────────────────────────────────────
+
+def _get_bulletins_plugin():
+    """Return the live BulletinsPlugin instance, or None."""
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        return None
+    return bbs_engine.plugin_registry.get("bulletins")
+
+
+@app.route("/api/bulletins/settings", methods=["GET"])
+def get_bulletin_settings():
+    err = _require_sysop()
+    if err:
+        return err
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        return jsonify({"error": "BBS engine not running"}), 503
+    enforce_active = bool(
+        bbs_engine.cfg.plugins.get("bulletins", {}).get("enforce_active", False)
+    )
+    return jsonify({"enforce_active": enforce_active})
+
+
+@app.route("/api/bulletins/settings", methods=["PATCH"])
+def update_bulletin_settings():
+    err = _require_sysop()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    if "enforce_active" not in data:
+        return jsonify({"error": "Missing field: enforce_active"}), 400
+    enforce_active = bool(data["enforce_active"])
+
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        return jsonify({"error": "BBS engine not running"}), 503
+
+    # Persist to bbs.yaml
+    try:
+        update_yaml_setting(
+            bbs_engine.cfg_path,
+            ["plugins", "bulletins", "enforce_active"],
+            enforce_active,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"Failed to save config: {exc}"}), 500
+
+    # Update live config dict and plugin instance so the change takes
+    # effect immediately without a restart
+    bbs_engine.cfg.plugins.setdefault("bulletins", {})["enforce_active"] = enforce_active
+    plugin = _get_bulletins_plugin()
+    if plugin is not None:
+        plugin._enforce_active = enforce_active
+
+    return jsonify({"enforce_active": enforce_active})
