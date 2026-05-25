@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import socket from './socket.js'
@@ -15,8 +15,27 @@ const navItems = [
   { title: 'Plugins',    icon: 'mdi-puzzle',           to: '/plugins'  },
   { title: 'Activity',   icon: 'mdi-text-box-outline', to: '/activity' },
   { title: 'Terminal',   icon: 'mdi-console',          to: '/terminal' },
-  { title: 'Display',    icon: 'mdi-monitor',          to: '/display'  },
 ]
+
+const pluginNavMap = {
+  display:   { title: 'Display',   icon: 'mdi-monitor',             to: '/display'   },
+  bulletins: { title: 'Bulletins', icon: 'mdi-bulletin-board',      to: '/bulletins' },
+  chat:      { title: 'Chat',      icon: 'mdi-forum',               to: '/chat'      },
+  heard:     { title: 'Heard',     icon: 'mdi-ear-hearing',         to: '/heard'     },
+  info:      { title: 'Info',      icon: 'mdi-information-outline', to: '/info'      },
+}
+
+const pluginList = ref([])
+const pluginNavItems = computed(() =>
+  pluginList.value
+    .filter(p => p.enabled && pluginNavMap[p.name])
+    .map(p => pluginNavMap[p.name])
+)
+
+async function loadPluginNav() {
+  const res = await fetch('/api/plugins')
+  if (res.ok) pluginList.value = await res.json()
+}
 
 onMounted(async () => {
   const res = await fetch('/api/admin/me')
@@ -25,15 +44,22 @@ onMounted(async () => {
     drawer.value = !mobile.value
     socket.connect()
     socket.emit('join_admin', {})
+    await loadPluginNav()
+    window.addEventListener('plugins-updated', loadPluginNav)
   } else {
     router.push('/login')
   }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('plugins-updated', loadPluginNav)
 })
 
 async function logout() {
   await fetch('/api/admin/logout', { method: 'POST' })
   socket.disconnect()
   isSysop.value = false
+  pluginList.value = []
   drawer.value = false
   router.push('/login')
 }
@@ -59,6 +85,19 @@ async function logout() {
           exact
         />
       </v-list>
+      <template v-if="pluginNavItems.length">
+        <v-divider class="mt-1 mb-1" />
+        <v-list density="compact" nav>
+          <v-list-item
+            v-for="item in pluginNavItems"
+            :key="item.to"
+            :prepend-icon="item.icon"
+            :title="item.title"
+            :to="item.to"
+            exact
+          />
+        </v-list>
+      </template>
       <template #append>
         <v-divider />
         <v-list density="compact" nav>

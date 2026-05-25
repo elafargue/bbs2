@@ -1,17 +1,33 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import BulletinAreas from './Bulletins.vue'
-import InfoEditor from './InfoEditor.vue'
-import HeardConfig from './HeardConfig.vue'
-import ChatRooms from './ChatRooms.vue'
 
 const plugins = ref([])
 const loading = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
-const areasDialog = ref(false)
-const infoDialog = ref(false)
-const heardDialog = ref(false)
-const chatDialog = ref(false)
+
+const pluginRoutes = {
+  display:   '/display',
+  bulletins: '/bulletins',
+  chat:      '/chat',
+  heard:     '/heard',
+  info:      '/info',
+}
+
+const pluginIcons = {
+  display:   'mdi-monitor',
+  bulletins: 'mdi-bulletin-board',
+  chat:      'mdi-forum',
+  heard:     'mdi-ear-hearing',
+  info:      'mdi-information-outline',
+  lastconn:  'mdi-history',
+}
+
+function statsLine(p) {
+  const skip = new Set(['name', 'display_name', 'enabled'])
+  const entries = Object.entries(p).filter(([k]) => !skip.has(k))
+  if (!entries.length) return null
+  return entries.map(([k, v]) => `${k}: ${v}`).join('  ·  ')
+}
 
 async function loadPlugins() {
   loading.value = true
@@ -33,6 +49,7 @@ async function toggle(plugin) {
     color: res.ok ? 'success' : 'error',
   }
   await loadPlugins()
+  window.dispatchEvent(new Event('plugins-updated'))
 }
 
 onMounted(loadPlugins)
@@ -41,152 +58,50 @@ onMounted(loadPlugins)
 <template>
   <v-container fluid>
     <v-card>
-      <v-card-title>
+      <v-card-title class="d-flex align-center">
         <v-icon start>mdi-puzzle</v-icon>
         Plugin Management
         <v-spacer />
         <v-btn icon="mdi-refresh" variant="text" :loading="loading" @click="loadPlugins" />
       </v-card-title>
-      <v-card-text>
-        <v-row>
-          <v-col
-            v-for="p in plugins"
-            :key="p.name"
-            cols="12"
-            sm="6"
-            md="4"
-          >
-            <v-card variant="outlined">
-              <v-card-title>
-                {{ p.display_name || p.name }}
-                <v-chip
-                  size="small"
-                  class="ml-2"
-                  :color="p.enabled ? 'success' : 'error'"
-                >{{ p.enabled ? 'Enabled' : 'Disabled' }}</v-chip>
-              </v-card-title>
-              <v-card-subtitle>{{ p.name }}</v-card-subtitle>
-              <v-card-text>
-                <pre
-                  v-if="Object.keys(p).filter(k => !['name','display_name','enabled'].includes(k)).length"
-                  class="text-body-2"
-                  style="white-space:pre-wrap;"
-                >{{ JSON.stringify(Object.fromEntries(Object.entries(p).filter(([k]) => !['name','display_name','enabled'].includes(k))), null, 2) }}</pre>
-              </v-card-text>
-              <v-card-actions>
-                <v-btn
-                  :color="p.enabled ? 'error' : 'success'"
-                  variant="tonal"
-                  @click="toggle(p)"
-                >
-                  {{ p.enabled ? 'Disable' : 'Enable' }}
-                </v-btn>
-                <v-btn
-                  v-if="p.name === 'bulletins'"
-                  variant="tonal"
-                  color="primary"
-                  append-icon="mdi-bulletin-board"
-                  @click="areasDialog = true"
-                >
-                  Areas
-                </v-btn>
-                <v-btn
-                  v-if="p.name === 'info'"
-                  variant="tonal"
-                  color="primary"
-                  append-icon="mdi-information-outline"
-                  @click="infoDialog = true"
-                >
-                  Edit Info
-                </v-btn>
-                <v-btn
-                  v-if="p.name === 'heard'"
-                  variant="tonal"
-                  color="primary"
-                  append-icon="mdi-radio-tower"
-                  @click="heardDialog = true"
-                >
-                  Heard Log
-                </v-btn>
-                <v-btn
-                  v-if="p.name === 'chat'"
-                  variant="tonal"
-                  color="primary"
-                  append-icon="mdi-forum"
-                  @click="chatDialog = true"
-                >
-                  Rooms
-                </v-btn>
-              </v-card-actions>
-            </v-card>
-          </v-col>
-        </v-row>
-      </v-card-text>
+      <v-divider />
+      <v-list lines="two">
+        <v-list-item
+          v-for="p in plugins"
+          :key="p.name"
+          :prepend-icon="pluginIcons[p.name] || 'mdi-puzzle-outline'"
+        >
+          <v-list-item-title>{{ p.display_name || p.name }}</v-list-item-title>
+          <v-list-item-subtitle>
+            <span class="text-caption" style="font-family: monospace;">{{ p.name }}</span>
+            <span v-if="statsLine(p)" class="text-caption text-medium-emphasis ml-2">· {{ statsLine(p) }}</span>
+          </v-list-item-subtitle>
+          <template #append>
+            <div class="d-flex align-center ga-2">
+              <v-chip
+                size="small"
+                :color="p.enabled ? 'success' : 'default'"
+                variant="tonal"
+              >{{ p.enabled ? 'Enabled' : 'Disabled' }}</v-chip>
+              <v-btn
+                :color="p.enabled ? 'error' : 'success'"
+                variant="tonal"
+                size="small"
+                @click="toggle(p)"
+                >{{ p.enabled ? 'Disable' : 'Enable' }}</v-btn>
+              <v-btn
+                v-if="pluginRoutes[p.name]"
+                variant="tonal"
+                color="primary"
+                size="small"
+                prepend-icon="mdi-cog"
+                :to="pluginRoutes[p.name]"
+              >Configure</v-btn>
+            </div>
+          </template>
+        </v-list-item>
+      </v-list>
     </v-card>
-
-    <!-- Bulletin Areas modal -->
-    <v-dialog v-model="areasDialog" max-width="860" scrollable>
-      <v-card>
-        <v-card-title class="d-flex align-center">
-          <v-icon start>mdi-bulletin-board</v-icon>
-          Bulletin Areas
-          <v-spacer />
-          <v-btn icon="mdi-close" variant="text" @click="areasDialog = false" />
-        </v-card-title>
-        <v-divider />
-        <v-card-text class="pa-4">
-          <BulletinAreas />
-        </v-card-text>
-      </v-card>
-    </v-dialog>
-
-    <!-- BBS Info message editor modal -->
-    <v-dialog v-model="infoDialog" max-width="700" scrollable>
-      <v-card>
-        <v-card-title class="d-flex align-center">
-          <v-icon start>mdi-information-outline</v-icon>
-          BBS Info Message
-          <v-spacer />
-          <v-btn icon="mdi-close" variant="text" @click="infoDialog = false" />
-        </v-card-title>
-        <v-divider />
-        <v-card-text class="pa-4">
-          <InfoEditor />
-        </v-card-text>
-      </v-card>
-    </v-dialog>
-
-    <!-- Heard Stations log + config modal -->
-    <v-dialog v-model="heardDialog" :max-width="'95vw'" scrollable>
-      <v-card>
-        <v-card-title class="d-flex align-center">
-          <v-icon start>mdi-radio-tower</v-icon>
-          Heard Stations
-          <v-spacer />
-          <v-btn icon="mdi-close" variant="text" @click="heardDialog = false" />
-        </v-card-title>
-        <v-divider />
-        <v-card-text class="pa-4">
-          <HeardConfig />
-        </v-card-text>
-      </v-card>
-    </v-dialog>
-
-    <!-- Chat rooms management modal -->
-    <v-dialog v-model="chatDialog" max-width="900" scrollable>
-      <v-card>
-        <v-card-title class="d-flex align-center">
-          <v-icon start>mdi-forum</v-icon>
-          Chat Rooms
-          <v-spacer />
-          <v-btn icon="mdi-close" variant="text" @click="chatDialog = false" />
-        </v-card-title>
-        <v-divider />
-        <v-card-text class="pa-4">
-          <ChatRooms />
-        </v-card-text>
-      </v-card>
-    </v-dialog>
 
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="3000">
       {{ snackbar.text }}

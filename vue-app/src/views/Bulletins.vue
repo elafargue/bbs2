@@ -129,9 +129,13 @@ onMounted(loadAreas)
 </script>
 
 <template>
-  <div>
-    <v-row class="mb-2" align="center">
-      <v-col><h2 class="text-h5">Bulletin Areas</h2></v-col>
+  <v-container fluid>
+    <v-row align="center" class="mb-2">
+      <v-col>
+        <div class="text-h5 font-weight-bold">
+          <v-icon class="mr-2">mdi-bulletin-board</v-icon>Bulletin Areas
+        </div>
+      </v-col>
       <v-col cols="auto">
         <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">New Area</v-btn>
       </v-col>
@@ -236,5 +240,5 @@ onMounted(loadAreas)
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="3000">
       {{ snackbar.text }}
     </v-snackbar>
-  </div>
+  </v-container>
 </template>

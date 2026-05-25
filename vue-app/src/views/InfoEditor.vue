@@ -36,7 +36,17 @@ onMounted(load)
 </script>
 
 <template>
-  <v-container fluid class="pa-0">
+  <v-container fluid>
+    <v-row align="center" class="mb-2">
+      <v-col>
+        <div class="text-h5 font-weight-bold">
+          <v-icon class="mr-2">mdi-information-outline</v-icon>BBS Info
+        </div>
+        <div class="text-caption text-medium-emphasis">
+          Message displayed to users when they type 'I' at the main menu.
+        </div>
+      </v-col>
+    </v-row>
     <v-textarea
       v-model="message"
       label="BBS Info message"

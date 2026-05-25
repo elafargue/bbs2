@@ -168,7 +168,15 @@ onMounted(load)
 </script>
 
 <template>
-  <v-container fluid class="pa-0">
+  <v-container fluid>
+    <!-- Page title -->
+    <v-row align="center" class="mb-2">
+      <v-col>
+        <div class="text-h5 font-weight-bold">
+          <v-icon class="mr-2">mdi-ear-hearing</v-icon>Heard Stations
+        </div>
+      </v-col>
+    </v-row>
     <!-- Settings row -->
     <v-row align="center" class="mb-2">
       <v-col cols="12" sm="5">

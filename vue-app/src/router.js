@@ -8,6 +8,10 @@ const routes = [
   { path: '/activity',  component: () => import('./views/Activity.vue') },
   { path: '/terminal',  component: () => import('./views/Terminal.vue') },
   { path: '/display',   component: () => import('./views/Display.vue') },
+  { path: '/bulletins', component: () => import('./views/Bulletins.vue') },
+  { path: '/chat',      component: () => import('./views/ChatRooms.vue') },
+  { path: '/heard',     component: () => import('./views/HeardConfig.vue') },
+  { path: '/info',      component: () => import('./views/InfoEditor.vue') },
   { path: '/login',     component: () => import('./views/Login.vue') },
 ]
 

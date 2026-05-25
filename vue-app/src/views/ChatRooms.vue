@@ -121,8 +121,19 @@ onMounted(loadRooms)
 </script>
 
 <template>
-  <!-- Rooms table -->
-  <v-data-table
+  <v-container fluid>
+    <v-row align="center" class="mb-2">
+      <v-col>
+        <div class="text-h5 font-weight-bold">
+          <v-icon class="mr-2">mdi-forum</v-icon>Chat Rooms
+        </div>
+      </v-col>
+      <v-col cols="auto">
+        <v-btn icon="mdi-refresh" variant="text" :loading="loading" @click="loadRooms" />
+      </v-col>
+    </v-row>
+    <!-- Rooms table -->
+    <v-data-table
     :headers="[
       { title: 'Room',         key: 'name',           sortable: true  },
       { title: 'Description',  key: 'description',    sortable: false },
@@ -135,14 +146,6 @@ onMounted(loadRooms)
     density="compact"
     class="elevation-0"
   >
-    <template #top>
-      <div class="d-flex align-center pa-2">
-        <span class="text-subtitle-2 text-medium-emphasis">Chat Rooms</span>
-        <v-spacer />
-        <v-btn icon="mdi-refresh" variant="text" size="small" :loading="loading" @click="loadRooms" />
-      </div>
-    </template>
-
     <template #item.name="{ item }">
       <v-btn
         variant="text"
@@ -282,4 +285,5 @@ onMounted(loadRooms)
   <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="3000">
     {{ snackbar.text }}
   </v-snackbar>
+  </v-container>
 </template>
