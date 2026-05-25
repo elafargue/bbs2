@@ -317,13 +317,13 @@ class TestOnDisconnected:
             })
         assert plugin._last_conns[0].callsign == "N6YP"
 
-    async def test_max_three_kept(self, tmp_path):
+    async def test_max_four_kept(self, tmp_path):
         plugin = await _make_plugin(tmp_path)
-        for call in ("A1A", "B2B", "C3C", "D4D"):
+        for call in ("A1A", "B2B", "C3C", "D4D", "E5E"):
             await plugin._on_disconnected({
                 "callsign": call, "transport": "tcp", "timestamp": time.time(),
             })
-        assert len(plugin._last_conns) == 3
+        assert len(plugin._last_conns) == 4
 
     async def test_duplicate_callsign_deduplicated(self, tmp_path):
         plugin = await _make_plugin(tmp_path)

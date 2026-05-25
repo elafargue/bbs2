@@ -236,6 +236,10 @@ class _KISSBaseTransport(Transport):
         """Send a beacon immediately on start, then every beacon_interval seconds."""
         try:
             while self._running:
+                if self._sessions:
+                    # Don't beacon while a user is connected — save air time.
+                    await asyncio.sleep(self._beacon_interval)
+                    continue
                 self._send_beacon()
                 logger.debug("%s beacon sent", self.transport_id)
                 await asyncio.sleep(self._beacon_interval)

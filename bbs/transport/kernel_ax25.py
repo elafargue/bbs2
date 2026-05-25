@@ -346,6 +346,7 @@ class KernelAX25Transport(Transport):
         self._beacon_path: list[str] = [
             p.strip() for p in raw_path.split(",") if p.strip()
         ]
+        self._active_sessions: int = 0
 
     async def start(self, on_connect: ConnectionCallback) -> None:
         self._on_connect = on_connect
@@ -425,6 +426,10 @@ class KernelAX25Transport(Transport):
         loop = asyncio.get_running_loop()
         try:
             while self._running:
+                if self._active_sessions:
+                    # Don't beacon while a user is connected — save air time.
+                    await asyncio.sleep(self._beacon_interval)
+                    continue
                 await loop.run_in_executor(None, self._send_beacon)
                 logger.debug("kernel_ax25 beacon sent")
                 await asyncio.sleep(self._beacon_interval)
@@ -436,6 +441,7 @@ class KernelAX25Transport(Transport):
     ) -> None:
         assert self._on_connect is not None
         client_sock.setblocking(False)
+        self._active_sessions += 1
         try:
             reader, writer = await _socket_to_streams(client_sock)
             conn = Connection(
@@ -450,6 +456,7 @@ class KernelAX25Transport(Transport):
                 "Error handling kernel_ax25 connection from %s", remote_addr
             )
         finally:
+            self._active_sessions -= 1
             try:
                 client_sock.close()
             except OSError:

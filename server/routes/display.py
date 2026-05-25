@@ -3,16 +3,18 @@ server/routes/display.py — REST API for the framebuffer display plugin.
 
 All endpoints require sysop login.
 
-GET  /api/display/settings    — return current settings dict
-PUT  /api/display/settings    — update settings; body: {key: value, ...}
-GET  /api/display/status      — current runtime state (last_conns, bulletins, etc.)
-POST /api/display/wake         — reset idle timer / wake from dim or off
+GET  /api/display/settings      — return current settings dict
+PUT  /api/display/settings      — update settings; body: {key: value, ...}
+GET  /api/display/status        — current runtime state (last_conns, bulletins, etc.)
+GET  /api/display/snapshot.png  — current frame rendered as a PNG image
+POST /api/display/wake          — reset idle timer / wake from dim or off
 """
 from __future__ import annotations
 
+import io
 import sqlite3
 
-from flask import jsonify, request, session
+from flask import jsonify, request, session, Response
 
 from server.app import app
 
@@ -87,6 +89,29 @@ def display_get_status():
     if perr:
         return perr
     return jsonify(plugin.get_stats())
+
+
+@app.route("/api/display/snapshot.png", methods=["GET"])
+def display_snapshot():
+    """Render the current display state to a PNG and return it."""
+    err = _require_sysop()
+    if err:
+        return err
+    plugin, perr = _get_plugin()
+    if perr:
+        return perr
+
+    frame = plugin._render_frame()
+    if frame is None:
+        return jsonify({"error": "Rendering unavailable (Pillow not installed)"}), 503
+
+    buf = io.BytesIO()
+    frame.save(buf, format="PNG")
+    return Response(
+        buf.getvalue(),
+        mimetype="image/png",
+        headers={"Cache-Control": "no-store, no-cache"},
+    )
 
 
 @app.route("/api/display/wake", methods=["POST"])

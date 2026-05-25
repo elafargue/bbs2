@@ -138,6 +138,7 @@ class DisplayPlugin(BBSPlugin):
         self._is_dimmed: bool = False
         self._is_off:    bool = False
         self._last_bulletin_refresh: float = 0.0
+        self._last_conns_refresh:   float = 0.0   # set after _preload_last_conns
         # Single-slot consecutive-dedup cache (Paracon _last_unproto pattern)
         self._last_heard: Optional[dict] = None
 
@@ -146,6 +147,7 @@ class DisplayPlugin(BBSPlugin):
 
         # Pre-load historical data
         await self._preload_last_conns()
+        self._last_conns_refresh = time.monotonic()   # don't re-query immediately
         await self._refresh_bulletin_counts()
 
         # Background render task (started after set_event_bus)
@@ -153,10 +155,11 @@ class DisplayPlugin(BBSPlugin):
 
     def set_event_bus(self, bus: "PluginEventBus") -> None:
         super().set_event_bus(bus)
-        bus.subscribe("heard.station",        self._on_heard)
-        bus.subscribe("session.connected",    self._on_connected)
-        bus.subscribe("session.disconnected", self._on_disconnected)
-        bus.subscribe("bulletin.new_message", self._on_bulletin)
+        bus.subscribe("heard.station",           self._on_heard)
+        bus.subscribe("session.connected",       self._on_connected)
+        bus.subscribe("session.authenticated",   self._on_authenticated)
+        bus.subscribe("session.disconnected",    self._on_disconnected)
+        bus.subscribe("bulletin.new_message",    self._on_bulletin)
 
         if not self.enabled:
             return
@@ -286,6 +289,22 @@ class DisplayPlugin(BBSPlugin):
         )
         self._last_activity_ts = time.monotonic()
 
+    async def _on_authenticated(self, payload: dict[str, Any]) -> None:
+        """Update the active-session entry with the now-known callsign."""
+        callsign    = payload.get("callsign", "")
+        remote_addr = payload.get("remote_addr", "?")
+        if not callsign:
+            return
+        existing = self._active_sessions.pop(remote_addr, None)
+        if existing is not None:
+            self._active_sessions[remote_addr] = LastConn(
+                callsign=callsign,
+                transport=existing.transport,
+                timestamp=existing.timestamp,
+                active=True,
+            )
+        self._last_activity_ts = time.monotonic()
+
     async def _on_disconnected(self, payload: dict[str, Any]) -> None:
         callsign  = payload.get("callsign", "")
         remote_addr = payload.get("remote_addr", callsign)
@@ -300,7 +319,8 @@ class DisplayPlugin(BBSPlugin):
             conn = LastConn(callsign=callsign, transport=transport, timestamp=ts)
             # Move to front; remove older entry for the same station if present
             existing = [c for c in self._last_conns if c.callsign != callsign]
-            self._last_conns = deque([conn] + existing, maxlen=3)
+            maxlen = self._last_conns.maxlen or 4
+            self._last_conns = deque([conn] + existing, maxlen=maxlen)
         self._last_activity_ts = time.monotonic()
 
     async def _on_bulletin(self, payload: dict[str, Any]) -> None:
@@ -327,6 +347,7 @@ class DisplayPlugin(BBSPlugin):
                 await asyncio.sleep(interval)
 
                 await self._maybe_refresh_bulletins()
+                await self._maybe_refresh_last_conns()
                 self._update_idle_state()
 
                 if self._is_off:
@@ -503,6 +524,43 @@ class DisplayPlugin(BBSPlugin):
         """Re-query bulletin counts every 60 seconds."""
         if time.monotonic() - self._last_bulletin_refresh > 60:
             await self._refresh_bulletin_counts()
+
+    async def _maybe_refresh_last_conns(self) -> None:
+        """Re-sync last-connections from the DB every 60 seconds.
+
+        This keeps the display accurate if sessions disconnect while the
+        plugin isn't running, or if connections happened before the plugin
+        subscribed to events.
+        """
+        if time.monotonic() - self._last_conns_refresh <= 60:
+            return
+        try:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """
+                    SELECT callsign, transport, last_seen
+                    FROM   connection_log
+                    WHERE  callsign != ''
+                    ORDER  BY last_seen DESC
+                    LIMIT  4
+                    """
+                ) as cur:
+                    rows = await cur.fetchall()
+            # Rebuild _last_conns, but skip any callsign that is still live in
+            # _active_sessions (those are shown separately at render time).
+            active_calls = {lc.callsign for lc in self._active_sessions.values()}
+            self._last_conns.clear()
+            for row in rows:
+                if row["callsign"] not in active_calls:
+                    self._last_conns.append(LastConn(
+                        callsign=row["callsign"],
+                        transport=row["transport"],
+                        timestamp=float(row["last_seen"]),
+                    ))
+        except Exception as exc:
+            logger.debug("Could not refresh last connections: %s", exc)
+        self._last_conns_refresh = time.monotonic()
 
     # ── Web API helpers (called from Flask thread via run_coroutine_threadsafe) ─
 

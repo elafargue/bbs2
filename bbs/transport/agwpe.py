@@ -678,6 +678,10 @@ class AGWPETransport(Transport):
             return
         try:
             while self._running:
+                if self._sessions:
+                    # Don't beacon while a user is connected — save air time.
+                    await asyncio.sleep(self._beacon_interval)
+                    continue
                 try:
                     payload = self._beacon_text.encode("ascii", errors="replace")
                     if self._beacon_path:

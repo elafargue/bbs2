@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -9,6 +9,9 @@ const loading  = ref(false)
 const saving   = ref(false)
 const waking   = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
+
+const snapshotTs = ref(Date.now())
+let snapshotTimer = null
 
 // Editable copy of settings (strings kept as strings for form binding)
 const form = ref({
@@ -91,7 +94,14 @@ async function wake() {
   if (res.ok) await load()
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  snapshotTimer = setInterval(() => { snapshotTs.value = Date.now() }, 5000)
+})
+
+onUnmounted(() => {
+  if (snapshotTimer) clearInterval(snapshotTimer)
+})
 </script>
 
 <template>
@@ -125,11 +135,11 @@ onMounted(load)
       </v-col>
     </v-row>
 
-    <!-- Status cards -->
-    <v-row v-if="status" class="mb-4">
-      <!-- Display state -->
-      <v-col cols="12" sm="4">
-        <v-card variant="outlined">
+    <!-- Live preview + status in one row -->
+    <v-row class="mb-4" align="start">
+      <!-- Display state (narrow column) -->
+      <v-col v-if="status" cols="12" sm="auto">
+        <v-card variant="outlined" height="100%">
           <v-card-text class="text-center pa-3">
             <v-icon
               size="36"
@@ -149,52 +159,27 @@ onMounted(load)
         </v-card>
       </v-col>
 
-      <!-- Last connections -->
-      <v-col cols="12" sm="4">
+      <!-- Live preview -->
+      <v-col cols="12" sm="auto">
         <v-card variant="outlined">
-          <v-card-title class="text-subtitle-2 pb-0">Last Connections</v-card-title>
+          <v-card-title class="text-subtitle-2 pb-0 d-flex align-center">
+            <v-icon size="small" class="mr-1">mdi-television-play</v-icon>
+            Live Preview
+            <span class="text-caption text-medium-emphasis ml-2">(auto-refreshes every 5s)</span>
+            <v-btn
+              icon="mdi-refresh"
+              size="x-small"
+              variant="text"
+              class="ml-auto"
+              @click="snapshotTs = Date.now()"
+            />
+          </v-card-title>
           <v-card-text class="pa-2">
-            <div
-              v-for="c in (status.last_conns || [])"
-              :key="c.callsign"
-              class="text-body-2"
-            >
-              <strong>{{ c.callsign }}</strong>
-              <span class="text-medium-emphasis ml-2">{{ fmtTs(c.timestamp) }}</span>
-              <v-chip size="x-small" class="ml-1" label>{{ c.transport }}</v-chip>
-            </div>
-            <div v-if="!status.last_conns?.length" class="text-caption text-disabled">
-              No connections recorded yet.
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-      <!-- Bulletin counts -->
-      <v-col cols="12" sm="4">
-        <v-card variant="outlined">
-          <v-card-title class="text-subtitle-2 pb-0">Bulletins</v-card-title>
-          <v-card-text class="pa-2">
-            <div
-              v-for="a in (status.bulletin_areas || [])"
-              :key="a.name"
-              class="d-flex justify-space-between text-body-2"
-            >
-              <span>{{ a.name }}</span>
-              <span>
-                {{ a.total }}
-                <v-chip
-                  v-if="a.new > 0"
-                  size="x-small"
-                  color="orange"
-                  class="ml-1"
-                  label
-                >+{{ a.new }} new</v-chip>
-              </span>
-            </div>
-            <div v-if="!status.bulletin_areas?.length" class="text-caption text-disabled">
-              No bulletin areas.
-            </div>
+            <img
+              :src="`/api/display/snapshot.png?t=${snapshotTs}`"
+              alt="Display snapshot"
+              style="display:block; image-rendering:pixelated; border:1px solid rgba(255,255,255,0.1); border-radius:4px;"
+            />
           </v-card-text>
         </v-card>
       </v-col>

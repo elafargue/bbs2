@@ -153,6 +153,15 @@ class BBSSession:
                         logger.exception(
                             "Failed to record connect for %s", self.auth.callsign
                         )
+                    await self.plugin_registry.event_bus.publish(
+                        "session.authenticated", {
+                            "callsign":    self.auth.callsign,
+                            "remote_addr": self.remote_addr,
+                            "transport":   self.conn.transport_id,
+                            "auth_level":  self.auth.level.name,
+                            "timestamp":   time.time(),
+                        }
+                    )
                 if self.state != SessionState.DISCONNECTED:
                     self.state = SessionState.ACTIVE
                     await self._main_loop()
