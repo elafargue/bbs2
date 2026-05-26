@@ -89,6 +89,7 @@ def _make_test_config(db_path: str, tcp_port: int) -> BBSConfig:
         },
         logging={"level": "WARNING", "file": ""},
         write_timeout=30,
+        inter_frame_delay_by_hops=[],
     )
 
 

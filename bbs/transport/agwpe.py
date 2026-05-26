@@ -93,7 +93,8 @@ _TCP_READ_TIMEOUT = 120  # seconds
 # The Via section is absent for direct (non-digipeated) frames.
 # The actual AX.25 info payload follows >[HH:MM:SS]\r — everything between
 # <...> is AGWPE frame-control metadata, not the payload.
-_MONITOR_VIA_RE  = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
+_MONITOR_VIA_RE   = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
+_MONITOR_SABM_RE  = re.compile(r"<[^>]*\bSABME?\b", re.IGNORECASE)
 _AGWPE_PAYLOAD_RE = re.compile(r">\[[\d:]+\]\r?(.*)", re.DOTALL)
 
 
@@ -177,7 +178,7 @@ def _build_unproto_via_frame(
 
     Data layout for 'V':
       1 byte    : count of via addresses
-      N × 10 bytes : via callsigns, each null-padded to 10 bytes (same as header fields)
+      N x 10 bytes : via callsigns, each null-padded to 10 bytes (same as header fields)
       followed immediately by the payload bytes.
     """
     fmt = "B" + len(via_path) * "10s"
@@ -342,6 +343,9 @@ class AGWPETransport(Transport):
         self._write_timeout: int = int(cfg.get("write_timeout", 30))
         # Optional path for logging raw 'U' monitor strings (useful for test-data capture).
         self._monitor_log: str = cfg.get("monitor_log", "").strip()
+        # Maps callsign → hop count derived from monitored SABM/SABME frames;
+        # consumed when the corresponding 'C' (connect) event arrives.
+        self._pending_hop_counts: dict[str, int] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -532,12 +536,11 @@ class AGWPETransport(Transport):
                     self._registered.set()
                 # Enable frame monitoring so 'U' (UI) frames arrive with
                 # source, dest, and via path already parsed in TNC2 format.
-                if self._heard_observer is not None:
-                    writer.write(_build_frame(self._agw_port, "m", "", ""))
-                    assert self._drain_lock is not None
-                    async with self._drain_lock:
-                        await writer.drain()
-                    logger.info("agwpe: monitoring enabled for heard-station tracking")
+                writer.write(_build_frame(self._agw_port, "m", "", ""))
+                assert self._drain_lock is not None
+                async with self._drain_lock:
+                    await writer.drain()
+                logger.info("agwpe: monitoring enabled for hop-count tracking and heard-station logging")
             else:
                 logger.warning(
                     "agwpe: callsign registration FAILED for %s on port %d",
@@ -567,6 +570,7 @@ class AGWPETransport(Transport):
                 reader=sess.reader,
                 writer=sess.writer,       # type: ignore[arg-type]
                 transport_id=self.transport_id,
+                hop_count=self._pending_hop_counts.pop(call_from.upper(), 0),
             )
             assert self._on_connect is not None
             task = asyncio.create_task(
@@ -601,8 +605,19 @@ class AGWPETransport(Transport):
                 )
 
         elif kind == "U":
-            # Monitored UI frame — AGWPE already parsed src/dest into the header;
-            # extract the via path from the TNC2 monitor string in the payload.
+            # Monitored frame — AGWPE already parsed src/dest into the 36-byte header.
+            # 1. Check for SABM/SABME directed at us to cache the hop count for the
+            #    upcoming 'C' (connect) event.  Runs regardless of heard plugin state.
+            if payload and call_to.upper() == self._local_call.upper():
+                try:
+                    _sabm_text = payload.decode("ascii", errors="replace")
+                    if _MONITOR_SABM_RE.search(_sabm_text):
+                        _via = _parse_via(_sabm_text)
+                        if len(self._pending_hop_counts) < 200:  # bound cache size
+                            self._pending_hop_counts[call_from.upper()] = len(_via)
+                except Exception:
+                    pass
+            # 2. Heard-station tracking (optional — requires heard plugin).
             if self._heard_observer is None:
                 return
             if call_from.upper() == self._local_call.upper():

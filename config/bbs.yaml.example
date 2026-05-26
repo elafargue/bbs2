@@ -16,6 +16,13 @@ bbs:
   # session is torn down.  Protects against stations that vanish off the air
   # without sending a disconnect (common on AX.25 / RF links).
   write_timeout: 30
+  # Per-hop inter-frame delay (milliseconds).  Each list index is a hop count
+  # (0 = direct, 1 = one digipeater, 2 = two, …).  The last entry is used for
+  # all higher hop counts.  Hop count is detected automatically from the
+  # SABM/SABME frame seen in AGWPE monitoring; non-AGWPE transports always
+  # get index 0.  Leave as [] to disable.
+  # Suggested starting values for 1200-baud AX.25:
+  inter_frame_delay_by_hops: []   # e.g. [0, 0, 100, 250, 400]
 
 transports:
   # Enable one or more transports. The BBS listens on all enabled transports simultaneously.

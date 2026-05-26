@@ -33,6 +33,7 @@ class Connection:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     transport_id: str
+    hop_count: int = 0
 
     async def send(self, data: bytes) -> None:
         """Write *data* to the peer and drain the buffer."""

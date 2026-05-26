@@ -114,6 +114,7 @@ class Terminal:
         must_echo: bool = False,
         eol: str = "\r\n",
         write_timeout: int = 30,
+        inter_frame_delay: float = 0.0,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -124,6 +125,7 @@ class Terminal:
         self._must_echo = must_echo  # True for web sessions: can't be suppressed by callers
         self._eol = eol
         self._write_timeout = write_timeout
+        self._inter_frame_delay = inter_frame_delay
         self._buf = bytearray()
         # Tracks which menu titles have already been shown full in this session.
         self._shown_menus: set[str] = set()
@@ -153,6 +155,7 @@ class Terminal:
         must_echo: bool = False,
         eol: str = "\r\n",
         write_timeout: int = 30,
+        inter_frame_delay: float = 0.0,
     ) -> "Terminal":
         """Return a Terminal using the requested color mode."""
         return cls(
@@ -165,6 +168,7 @@ class Terminal:
             must_echo=must_echo,
             eol=eol,
             write_timeout=write_timeout,
+            inter_frame_delay=inter_frame_delay,
         )
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -269,6 +273,8 @@ class Terminal:
                 raise ConnectionResetError(
                     f"write timeout after {self._write_timeout}s — remote station unresponsive"
                 )
+            if self._inter_frame_delay > 0 and self._buf:
+                await asyncio.sleep(self._inter_frame_delay)
 
     async def send(self, text: str) -> None:
         """Write and immediately flush *text*."""

@@ -107,6 +107,12 @@ class BBSSession:
             _ax25_transports = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe")
             _is_ax25 = self.conn.transport_id in _ax25_transports
             _is_web = self.conn.transport_id == "web"
+            _delay_list = self.cfg.inter_frame_delay_by_hops
+            if _is_ax25 and _delay_list:
+                _idx = min(self.conn.hop_count, len(_delay_list) - 1)
+                _inter_frame_delay = _delay_list[_idx] / 1000.0
+            else:
+                _inter_frame_delay = 0.0
             self.term = await Terminal.create(
                 self.conn.reader,
                 self.conn.writer,
@@ -122,6 +128,7 @@ class BBSSession:
                 # saved setting after login).
                 color_mode="truecolor" if _is_web else "off",
                 write_timeout=self.cfg.write_timeout,
+                inter_frame_delay=_inter_frame_delay,
             )
 
             # Launch a watchdog that cancels this task when the session is
