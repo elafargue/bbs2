@@ -39,6 +39,7 @@ class InfoPlugin(BBSPlugin):
     name = "info"
     display_name = "BBS Info"
     menu_key = "I"
+    help_text = "Station information, contact details, and static reference pages."
     min_auth_level_name = "IDENTIFIED"
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:

@@ -132,6 +132,7 @@ class ChatPlugin(BBSPlugin):
     name = "chat"
     display_name = "Chat"
     menu_key = "C"
+    help_text = "Real-time text chat with other connected stations."
     min_auth_level_name = "IDENTIFIED"
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:

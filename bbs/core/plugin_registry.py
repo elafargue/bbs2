@@ -59,6 +59,8 @@ class BBSPlugin(ABC):
     display_name: str = ""
     #: Single letter / short string shown in menu (e.g. "B", "C")
     menu_key: str = ""
+    #: One-line description shown in the ? Help screen
+    help_text: str = ""
     #: Minimum AuthLevel required to see this plugin in the menu
     #: Import lazily to avoid circular import
     min_auth_level_name: str = "IDENTIFIED"  # name instead of enum to avoid circular

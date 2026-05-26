@@ -30,6 +30,7 @@ import aiosqlite
 from bbs.ax25.address import _CALLSIGN_RE
 from bbs.core.auth import AuthLevel
 from bbs.core.plugin_registry import BBSPlugin
+from bbs.core.session import PathLength
 
 if TYPE_CHECKING:
     from bbs.core.session import BBSSession
@@ -109,6 +110,7 @@ class BulletinsPlugin(BBSPlugin):
     name = "bulletins"
     display_name = "Bulletins"
     menu_key = "BU"
+    help_text = "Read and post messages in topic areas. Authentication required to post."
     min_auth_level_name = "IDENTIFIED"
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
@@ -467,10 +469,19 @@ class BulletinsPlugin(BBSPlugin):
         lines = ["", term.label("BULLETIN AREAS", "meta"), term.note("-" * 40)]
         for i, row in enumerate(areas, 1):
             name_padded = f"{row['name']:<10}"
-            lines.append(
-                f"  {i:2}. {term.style(name_padded, 'accent', bold=True)} {row['description']}"
-            )
-        lines += ["", "Enter area number (or ENTER to cancel): "]
+            if session.path_length is PathLength.SHORT:
+                lines.append(
+                    f"  {i:2}. {term.style(name_padded, 'accent', bold=True)} {row['description']}"
+                )
+            else:
+                lines.append(
+                    f"  {i:2}. {term.style(name_padded, 'accent', bold=True)}"
+                )
+        area_prompt = (
+            "Area #: " if session.path_length is PathLength.LONG
+            else "Enter area number (or ENTER to cancel): "
+        )
+        lines += ["", area_prompt]
         await term.paginate(lines[:-1], timeout=float(session.cfg.idle_timeout) or None)
         await term.send(term.prompt(lines[-1]))
 
@@ -544,8 +555,17 @@ class BulletinsPlugin(BBSPlugin):
         read_ids: Optional[set] = None,
         idle_timeout: Optional[float] = None,
         callsign: Optional[str] = None,
+        path_length: PathLength = PathLength.SHORT,
     ) -> None:
-        hdr = f"{'#':<6} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
+        if path_length is PathLength.LONG:
+            hdr      = f"{'#':<6} {'TO':<7} {'FROM':<9} {'DATE':<15} SUBJECT"
+            date_fmt = "%y-%m-%d %H:%M"
+        elif path_length is PathLength.MEDIUM:
+            hdr      = f"{'#':<6} {'ST':<2} {'TO':<7} {'FROM':<9} {'DATE':<16} SUBJECT"
+            date_fmt = "%Y-%m-%d %H:%M"
+        else:
+            hdr      = f"{'#':<6} {'ST':<2} {'SIZE':<6} {'TO':<7} {'FROM':<9} {'DATE':<20} SUBJECT"
+            date_fmt = "%Y-%m-%d %H:%M:%S"
         sep = "-" * len(hdr)
         lines = [
             "",
@@ -557,24 +577,38 @@ class BulletinsPlugin(BBSPlugin):
             to = str(m["to_call"]).upper()
             st = "P" if any(c.isdigit() for c in to) else "B"
             size = len(m["body"]) if m["body"] else 0
-            date = time.strftime("%m/%d/%Y %H:%M:%S", time.localtime(m["created_at"]))
+            date = time.strftime(date_fmt, time.localtime(m["created_at"]))
             subj = str(m["subject"])[:self._max_subject]
             from_disp = m["from_call"] + ("*" if m["authenticated"] else "")
             is_sender = callsign and m["from_call"].upper() == callsign.upper()
             unread    = read_ids is not None and m["id"] not in read_ids and not is_sender
             num_disp  = f"{m['msg_number']:<4}{'*' if unread else ' '} "
             num_color = "warning" if unread else "accent"
-            st_str    = f"{st:<2}"
             from_str  = f"{from_disp:<9}"
-            date_str  = f"{date:<20}"
             is_auth   = bool(m["authenticated"])
             from_tone = "success" if is_auth else "orange"
-            lines.append(
-                f"{term.style(num_disp, num_color, bold=True)}"
-                f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
-                f"{size:<6} {to:<7} {term.style(from_str, from_tone, bold=True)} "
-                f"{term.note(date_str)} {subj}"
-            )
+            if path_length is PathLength.LONG:
+                lines.append(
+                    f"{term.style(num_disp, num_color, bold=True)}"
+                    f"{to:<7} {term.style(from_str, from_tone, bold=True)} "
+                    f"{term.note(f'{date:<15}')} {subj}"
+                )
+            elif path_length is PathLength.MEDIUM:
+                st_str = f"{st:<2}"
+                lines.append(
+                    f"{term.style(num_disp, num_color, bold=True)}"
+                    f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
+                    f"{to:<7} {term.style(from_str, from_tone, bold=True)} "
+                    f"{term.note(f'{date:<16}')} {subj}
+                )
+            else:
+                st_str = f"{st:<2}"
+                lines.append(
+                    f"{term.style(num_disp, num_color, bold=True)}"
+                    f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
+                    f"{size:<6} {to:<7} {term.style(from_str, from_tone, bold=True)} "
+                    f"{term.note(f'{date:<20}')} {subj}"
+                )
         lines.append("")
         await term.paginate(lines, timeout=idle_timeout)
 
@@ -593,7 +627,8 @@ class BulletinsPlugin(BBSPlugin):
         read_ids = await self._fetch_read_ids(session.db, area_id, session.auth.user_id)
         await self._show_message_index(term, area_name, messages, read_ids=read_ids,
                                         idle_timeout=float(session.cfg.idle_timeout) or None,
-                                        callsign=session.auth.callsign)
+                                        callsign=session.auth.callsign,
+                                        path_length=session.path_length)
 
     # ── Read a single message ─────────────────────────────────────────────────
 

@@ -45,6 +45,22 @@ class SessionState(Enum):
     DISCONNECTED = auto()
 
 
+class PathLength(str, Enum):
+    """Characterises the RF path length of an incoming AX.25 connection.
+
+    SHORT  — direct or single-hop; full verbosity.
+    MEDIUM — 1-2 digipeaters; reduced verbosity.
+    LONG   — 3+ digipeaters; minimal output.
+
+    Non-AX.25 transports (TCP, web) always report SHORT.
+    Thresholds are set in bbs.yaml via path_length_medium_hops and
+    path_length_long_hops.  Plugins can branch on session.path_length.
+    """
+    SHORT  = "short"
+    MEDIUM = "medium"
+    LONG   = "long"
+
+
 class BBSSession:
     """
     Represents one live user session.
@@ -74,6 +90,7 @@ class BBSSession:
         self.state = SessionState.CONNECTED
         self.connected_at = time.time()
         self._last_activity = time.time()
+        self.path_length: PathLength = PathLength.SHORT
 
         # Per-session scratch space for plugins (keyed by plugin name)
         self.plugin_state: dict = {}
@@ -107,12 +124,14 @@ class BBSSession:
             _ax25_transports = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe")
             _is_ax25 = self.conn.transport_id in _ax25_transports
             _is_web = self.conn.transport_id == "web"
-            _delay_list = self.cfg.inter_frame_delay_by_hops
-            if _is_ax25 and _delay_list:
-                _idx = min(self.conn.hop_count, len(_delay_list) - 1)
-                _inter_frame_delay = _delay_list[_idx] / 1000.0
-            else:
-                _inter_frame_delay = 0.0
+            if _is_ax25:
+                _hops = self.conn.hop_count
+                if _hops >= self.cfg.path_length_long_hops:
+                    self.path_length = PathLength.LONG
+                elif _hops >= self.cfg.path_length_medium_hops:
+                    self.path_length = PathLength.MEDIUM
+                else:
+                    self.path_length = PathLength.SHORT
             self.term = await Terminal.create(
                 self.conn.reader,
                 self.conn.writer,
@@ -128,7 +147,6 @@ class BBSSession:
                 # saved setting after login).
                 color_mode="truecolor" if _is_web else "off",
                 write_timeout=self.cfg.write_timeout,
-                inter_frame_delay=_inter_frame_delay,
             )
 
             # Launch a watchdog that cancels this task when the session is
@@ -207,13 +225,24 @@ class BBSSession:
     # ── Greeting ─────────────────────────────────────────────────────────────
 
     async def _greet(self) -> None:
-        await self.term.sendln()
-        await self.term.send_header(f" {self.cfg.name} ")
-        await self.term.sendln(
-            f"{self.term.label('Sysop:')} {self.cfg.sysop}  {self.term.label('QTH:')} {self.cfg.location}"
-        )
-        await self.term.sendln(self.term.field("BBS:", self.cfg.full_callsign, "meta"))
-        await self.term.sendln()
+        if self.path_length is PathLength.LONG:
+            # Minimal: station ID only — every byte counts on a 3+ hop path
+            await self.term.sendln(self.cfg.full_callsign + ' BBS')
+        elif self.path_length is PathLength.MEDIUM:
+            # One-liner: callsign + sysop, no header box or blank lines
+            await self.term.sendln(
+                f"{self.term.label(self.cfg.full_callsign, 'accent')}  "
+                f"{self.term.label('BBS - Sysop:', 'meta')} {self.cfg.sysop}"
+            )
+        else:
+            # SHORT — full banner
+            await self.term.sendln()
+            await self.term.send_header(f" {self.cfg.name} ")
+            await self.term.sendln(
+                f"{self.term.label('Sysop:')} {self.cfg.sysop}  {self.term.label('QTH:')} {self.cfg.location}"
+            )
+            await self.term.sendln(self.term.field("BBS:", self.cfg.full_callsign, "meta"))
+            await self.term.sendln()
 
     # ── Identification ────────────────────────────────────────────────────────
 
@@ -239,21 +268,33 @@ class BBSSession:
                 self.db, base_call, from_ax25=True
             )
             await self._apply_user_preferences()
-            await self.term.sendln(
-                f"{self.term.label('Welcome,', 'success')} {self.term.style(display_call, 'accent', bold=True)}!"
-            )
-            if created:
-                enforce_active = bool(
-                    self.cfg.plugins.get("bulletins", {}).get("enforce_active", False)
+            if self.path_length is PathLength.LONG:
+                # Callsign only — every byte counts on a 3+ hop path
+                await self.term.sendln(display_call)
+            elif self.path_length is PathLength.MEDIUM:
+                # Callsign + access level on one line, no new-account notice
+                level_label = self.auth_service.level_label(self.auth.level)
+                await self.term.sendln(
+                    f"{self.term.style(display_call, 'accent', bold=True)} "
+                    f"{self.term.note(f'[{level_label}]')}"
                 )
-                if enforce_active:
-                    await self.term.sendln(
-                        self.term.note("(New account created — sysop approval required before posting to bulletins.)")
+            else:
+                # SHORT — full welcome
+                await self.term.sendln(
+                    f"{self.term.label('Welcome,', 'success')} {self.term.style(display_call, 'accent', bold=True)}!"
+                )
+                if created:
+                    enforce_active = bool(
+                        self.cfg.plugins.get("bulletins", {}).get("enforce_active", False)
                     )
-                else:
-                    await self.term.sendln(
-                        self.term.note("(New account created.)")
-                    )
+                    if enforce_active:
+                        await self.term.sendln(
+                            self.term.note("(New account created — sysop approval required before posting to bulletins.)")
+                        )
+                    else:
+                        await self.term.sendln(
+                            self.term.note("(New account created.)")
+                        )
         elif self.conn.transport_id == "web":
             # Web terminal is sysop-only; identify automatically as the BBS
             # sysop callsign so the session is always tracked in connection_log.
@@ -301,11 +342,12 @@ class BBSSession:
                         self.term.note("(New account created.)")
                     )
 
-        level_label = self.auth_service.level_label(self.auth.level)
-        await self.term.sendln(
-            self.term.field("Access level:", level_label, "meta")
-        )
-        await self.term.sendln()
+        if self.path_length is PathLength.SHORT:
+            level_label = self.auth_service.level_label(self.auth.level)
+            await self.term.sendln(
+                self.term.field("Access level:", level_label, "meta")
+            )
+            await self.term.sendln()
 
     # ── Main menu loop ────────────────────────────────────────────────────────
 
@@ -327,7 +369,20 @@ class BBSSession:
                 ("?", "Help"),
             ]
 
-            await self.term.send_menu(self.cfg.name, menu_items, prompt="> ", enter_hint=True)
+            if self.path_length is PathLength.LONG:
+                # Ultra-compact: space-separated keys + inline prompt.
+                # Targets ≤ 128 bytes for the worst-case menu output.
+                keys = " ".join(key for key, _ in menu_items if key)
+                await self.term.send(f"{keys} >")
+            elif self.path_length is PathLength.MEDIUM:
+                # Compact: KEY:Description pairs on one line, no header.
+                # Targets ≤ 256 bytes for the worst-case menu output.
+                items_str = "  ".join(f"{key}:{desc}" for key, desc in menu_items if key)
+                await self.term.sendln()
+                await self.term.sendln(items_str)
+                await self.term.send("> ")
+            else:
+                await self.term.send_menu(self.cfg.name, menu_items, prompt="> ", enter_hint=True)
 
             # Pass the remaining idle time rather than the full idle_timeout so
             # that a station which consistently types just under the limit is still
@@ -337,14 +392,17 @@ class BBSSession:
             )
             choice_raw = await self.term.readline(max_len=8, timeout=remaining)
 
-            # Empty input (bare Enter) redraws the full menu; it does not disconnect.
+            # Empty input (bare Enter) redraws the menu; it does not disconnect.
             # Actual idle timeout is detected at the top of the loop via idle_seconds.
             # EOF (connection closed) must break here — otherwise readline() returns
             # "" immediately on every call and the loop spins, flooding the event loop.
             if not choice_raw:
                 if self.conn.reader.at_eof():
                     break
-                self.term.reset_menu_state(self.cfg.name)
+                # SHORT path: reset so the next iteration redraws the full menu.
+                # MEDIUM/LONG always show compact, so no state to reset.
+                if self.path_length is PathLength.SHORT:
+                    self.term.reset_menu_state(self.cfg.name)
                 continue
 
             self.touch()
@@ -439,21 +497,36 @@ class BBSSession:
     # ── Help ─────────────────────────────────────────────────────────────────
 
     async def _show_help(self) -> None:
-        lines = [
-            "BBS HELP",
-            "--------",
-            "Select a menu item by typing its letter and pressing ENTER.",
-            "",
-            "A  - Authenticate: prove your callsign with an OTP code.",
-            "     Required for sysop auth or authenticated messages.",
-            "     Your secret is set out-of-band by the sysop, reach out to them",
-            "     to request it.",
-            "",
-            "CO - Color output mode: Off, ANSI 16-color, or truecolor.",
-            "",
-            "B  - Bye / disconnect.",
+        # Determine column widths from the current menu items
+        plugin_items = self.plugin_registry.menu_items(self.auth.level)
+        key_w = max((len(k) for k, _ in plugin_items), default=2)
+        key_w = max(key_w, 2)  # at least 2 for "CO"
+        indent = " " * (4 + key_w)
 
+        def row(key: str, name: str, desc: str) -> str:
+            return f"  {key:<{key_w}}  {name:<16} {desc}"
+
+        lines: list[str] = ["BBS HELP", "--------", ""]
+
+        if plugin_items:
+            lines.append("Plugin commands:")
+            for key, display_name in plugin_items:
+                plugin = self.plugin_registry.get_by_key(key)
+                desc = (plugin.help_text if plugin and plugin.help_text else display_name)
+                lines.append(row(key, display_name, desc))
+            lines.append("")
+
+        lines += [
+            "System commands:",
+            row("A",  "Auth",  "Prove your callsign with a one-time code (TOTP)."),
+            f"{indent}Contact the sysop out-of-band to obtain your secret key.",
+            f"{indent}Required for sysop access and authenticated bulletin posts.",
+            row("CO", "Color", "Set terminal color: Off / ANSI 16-color / 24-bit truecolor."),
+            f"{indent}Preference is saved per-callsign after login.",
+            row("B",  "Bye",   "Disconnect from the BBS."),
+            row("?",  "Help",  "This screen."),
         ]
+
         await self.term.paginate(lines, timeout=float(self.cfg.idle_timeout) or None)
 
     async def _apply_user_preferences(self) -> None:

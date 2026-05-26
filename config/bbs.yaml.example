@@ -16,13 +16,14 @@ bbs:
   # session is torn down.  Protects against stations that vanish off the air
   # without sending a disconnect (common on AX.25 / RF links).
   write_timeout: 30
-  # Per-hop inter-frame delay (milliseconds).  Each list index is a hop count
-  # (0 = direct, 1 = one digipeater, 2 = two, …).  The last entry is used for
-  # all higher hop counts.  Hop count is detected automatically from the
-  # SABM/SABME frame seen in AGWPE monitoring; non-AGWPE transports always
-  # get index 0.  Leave as [] to disable.
-  # Suggested starting values for 1200-baud AX.25:
-  inter_frame_delay_by_hops: []   # e.g. [0, 0, 100, 250, 400]
+  # Path length thresholds (hop count) used to select verbosity of BBS output.
+  # Hop count is detected from the SABM/SABME frame seen in AGWPE monitoring;
+  # non-AX.25 transports always use SHORT (full verbosity).
+  #   SHORT  — 0 to (medium_hops - 1): full banner and welcome text.
+  #   MEDIUM — medium_hops to (long_hops - 1): abbreviated one-liner.
+  #   LONG   — long_hops and above: minimal callsign-only output.
+  path_length_medium_hops: 2   # 1+ digipeater hops → medium verbosity
+  path_length_long_hops: 4    # 3+ digipeater hops → minimal verbosity
 
 transports:
   # Enable one or more transports. The BBS listens on all enabled transports simultaneously.

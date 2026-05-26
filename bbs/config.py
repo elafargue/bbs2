@@ -23,7 +23,8 @@ class BBSConfig:
     max_users: int
     idle_timeout: int
     write_timeout: int
-    inter_frame_delay_by_hops: list[int]
+    path_length_medium_hops: int
+    path_length_long_hops: int
 
     # Sub-sections as raw dicts (validated at use-site)
     transports: dict[str, Any]
@@ -105,7 +106,8 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
         max_users=int(bbs.get("max_users", 20)),
         idle_timeout=int(bbs.get("idle_timeout", 300)),
         write_timeout=int(bbs.get("write_timeout", 30)),
-        inter_frame_delay_by_hops=list(bbs.get("inter_frame_delay_by_hops", [])),
+        path_length_medium_hops=int(bbs.get("path_length_medium_hops", 1)),
+        path_length_long_hops=int(bbs.get("path_length_long_hops", 3)),
         transports=raw.get("transports", {}),
         database=raw.get("database", {}),
         auth=raw.get("auth", {}),

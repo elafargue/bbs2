@@ -31,6 +31,7 @@ class LastConnectionsPlugin(BBSPlugin):
     name = "lastconn"
     display_name = "Last Connections"
     menu_key = "LC"
+    help_text = "Recent connection log showing callsign, transport, and time."
     min_auth_level_name = "IDENTIFIED"
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:

@@ -220,6 +220,7 @@ class HeardPlugin(BBSPlugin):
     name = "heard"
     display_name = "Heard Stations"
     menu_key = "H"
+    help_text = "Log of recently heard AX.25 stations with path and signal info."
     min_auth_level_name = "IDENTIFIED"
 
     def __init__(self) -> None:
