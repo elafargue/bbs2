@@ -32,6 +32,9 @@ const deleting       = ref(false)
 const graphData    = ref(null)
 const graphLoading = ref(false)
 
+// Log search
+const search = ref('')
+
 function fmtTs(unix) {
   if (!unix) return '—'
   return new Date(unix * 1000).toLocaleString()
@@ -94,6 +97,12 @@ async function clearAll() {
     await load()
     graphData.value = null  // invalidate graph
   }
+}
+
+function refresh() {
+  if (activeTab.value === 'network') return loadGraph()
+  if (activeTab.value === 'map') return Promise.all([load(), loadGraph()])
+  return load()
 }
 
 async function showPaths(callsign) {
@@ -191,7 +200,7 @@ onMounted(load)
           density="compact"
         />
       </v-col>
-      <v-col cols="12" sm="3">
+      <v-col cols="12" sm="5" class="d-flex ga-2">
         <v-btn
           color="primary"
           variant="tonal"
@@ -201,8 +210,6 @@ onMounted(load)
         >
           Save
         </v-btn>
-      </v-col>
-      <v-col cols="12" sm="4" class="d-flex justify-end ga-2">
         <v-btn
           color="error"
           variant="tonal"
@@ -212,7 +219,9 @@ onMounted(load)
         >
           Clear all
         </v-btn>
-        <v-btn icon="mdi-refresh" variant="text" :loading="loading || graphLoading" @click="['network','map'].includes(activeTab) ? loadGraph() : load()" />
+      </v-col>
+      <v-col cols="12" sm="2" class="d-flex justify-end">
+        <v-btn icon="mdi-refresh" variant="text" :loading="loading || graphLoading" @click="refresh" />
       </v-col>
     </v-row>
 
@@ -226,7 +235,19 @@ onMounted(load)
     <v-window v-model="activeTab">
       <!-- Log tab -->
       <v-window-item value="log">
+        <v-text-field
+          v-model="search"
+          prepend-inner-icon="mdi-magnify"
+          label="Search callsign…"
+          variant="outlined"
+          density="compact"
+          clearable
+          hide-details
+          class="mb-2"
+          style="max-width: 320px"
+        />
         <v-data-table
+          :search="search"
           :headers="[
             { title: 'Callsign',    key: 'callsign',    sortable: true },
             { title: 'Dest',        key: 'dest',        sortable: true },
@@ -318,39 +339,23 @@ onMounted(load)
 
       <!-- Network tab -->
       <v-window-item value="network">
-        <div class="mb-2 d-flex align-center ga-2">
+        <div class="mb-2">
           <span class="text-caption text-medium-emphasis">
             Only confirmed hops are shown (up to the last ★ in each path).
             Drag nodes to reposition. Hover for details.
           </span>
-          <v-spacer />
-          <v-btn
-            size="small"
-            variant="tonal"
-            prepend-icon="mdi-refresh"
-            :loading="graphLoading"
-            @click="loadGraph"
-          >Refresh</v-btn>
         </div>
         <NetworkGraph :graph-data="graphData" :loading="graphLoading" />
       </v-window-item>
 
       <!-- Map tab (geographic) -->
       <v-window-item value="map">
-        <div class="mb-2 d-flex align-center ga-2">
+        <div class="mb-2">
           <span class="text-caption text-medium-emphasis">
             Stations are plotted at their stored coordinates.
             RF hop edges are drawn when both endpoints have coordinates.
             Faded markers are outside the current max-age window.
           </span>
-          <v-spacer />
-          <v-btn
-            size="small"
-            variant="tonal"
-            prepend-icon="mdi-refresh"
-            :loading="graphLoading || loading"
-            @click="Promise.all([load(), loadGraph()])"
-          >Refresh</v-btn>
         </div>
         <HeardGeoMap :stations="stations" :graph-data="graphData" :loading="graphLoading || loading" />
       </v-window-item>

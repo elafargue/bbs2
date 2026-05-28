@@ -548,13 +548,26 @@ class AGWPETransport(Transport):
                 )
 
         elif kind == "C":
-            # Incoming connected call — create a new session
+            # Incoming connected call — create a new session.
+            # Per AX.25 spec, when a TNC receives a SABM while already connected it
+            # sends UA back and resets its sequence counters — i.e. it treats the
+            # SABM as a reconnect.  Direwolf does this correctly, so a duplicate 'C'
+            # here means the remote TNC has already reset its AX.25 state.  We must
+            # mirror that: tear down the stale BBS session and start a fresh one.
+            # Silently ignoring it (the old behaviour) left the two sides with
+            # mismatched sequence numbers, causing the connection to go idle.
             if key in self._sessions:
                 logger.warning(
-                    "agwpe: duplicate 'C' for %s (key=%s) — ignoring; existing sessions: %s",
+                    "agwpe: duplicate 'C' for %s (key=%s) — AX.25 reconnect detected; "
+                    "tearing down old session and starting fresh; existing sessions: %s",
                     call_from, key, list(self._sessions.keys()),
                 )
-                return
+                old_sess = self._sessions.pop(key, None)
+                if old_sess:
+                    old_sess.feed_eof()
+                old_task = self._session_tasks.pop(key, None)
+                if old_task and not old_task.done():
+                    old_task.cancel()
             logger.info(
                 "agwpe: incoming connection from %s; total sessions will be %d",
                 call_from, len(self._sessions) + 1,

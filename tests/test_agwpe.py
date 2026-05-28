@@ -349,15 +349,52 @@ class TestAGWPETransportDispatch:
         data = await asyncio.wait_for(sess.reader.read(100), timeout=1.0)
         assert data == b""
 
-    async def test_duplicate_connect_ignored(self):
-        """A second 'C' for the same station does not replace the session."""
+    async def test_duplicate_connect_replaces_session(self):
+        """A second 'C' (AX.25 reconnect) replaces the old session with a new one."""
         await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
         sess1 = self.transport._sessions[(0, "W6ELA-7")]
 
         await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
         sess2 = self.transport._sessions[(0, "W6ELA-7")]
 
-        assert sess1 is sess2
+        assert sess1 is not sess2
+
+    async def test_duplicate_connect_feeds_eof_to_old_session(self):
+        """The old session's reader gets EOF when a duplicate 'C' arrives."""
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+        sess1 = self.transport._sessions[(0, "W6ELA-7")]
+
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+
+        data = await asyncio.wait_for(sess1.reader.read(100), timeout=1.0)
+        assert data == b"", "old session reader should have received EOF"
+
+    async def test_duplicate_connect_on_connect_called_twice(self):
+        """_on_connect is invoked for each 'C', including the reconnect."""
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+        # Yield so the first session task starts running.
+        await asyncio.sleep(0)
+
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+        await asyncio.sleep(0)
+
+        assert len(self.received) == 2
+        assert all(c.remote_addr == "W6ELA-7" for c in self.received)
+
+    async def test_duplicate_connect_data_goes_to_new_session(self):
+        """Data frames after a reconnect are delivered to the new session, not the old."""
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+        sess1 = self.transport._sessions[(0, "W6ELA-7")]
+
+        await self.transport._dispatch("C", 0, "W6ELA-7", "N0CALL-1", 0, b"", self.fake_writer)  # type: ignore
+        sess2 = self.transport._sessions[(0, "W6ELA-7")]
+
+        await self.transport._dispatch("D", 0, "W6ELA-7", "N0CALL-1", _PID_NO_L3, b"fresh\r", self.fake_writer)  # type: ignore
+
+        data = await asyncio.wait_for(sess2.reader.read(100), timeout=1.0)
+        assert data == b"fresh\r"
+        # Old session should not have received any data (only EOF).
+        assert sess1.reader._buffer == bytearray()
 
     async def test_data_for_unknown_session_dropped(self):
         """'D' without a prior 'C' is silently discarded — no crash."""
