@@ -1,0 +1,78 @@
+# Multi-Direwolf audio chain test rig — 4-node example
+#
+# Topology:  N6TEST ←→ HMKR ←→ KRDG ←→ W6ELA-1
+#            station   digi    digi    bbs
+#
+# Usage:
+#   python tests/rig/radio_rig.py --config tests/rig/rig.yaml
+#
+# Then start bbs2 separately with agwpe.port: 8000 in config/bbs.yaml,
+# and connect your AGWPE client (e.g. tests/rig/radio_rig.py --connect)
+# to localhost:8001 using AGWPE 'v' frame for via-path connects.
+
+rig:
+  audio:
+    sample_rate: 44100   # Hz — Direwolf default; must match ARATE in dw conf
+    channels: 1          # mono
+    sample_bits: 16      # signed little-endian PCM
+
+  # AX.25 / CSMA tuning passed through to every Direwolf instance.
+  # Each key becomes a `KEY value` line in the generated dw-*.conf — see the
+  # Direwolf User Guide for the full option list. Comment a line out to fall
+  # back to Direwolf's own default for that option.
+  #
+  # Window size (max unacknowledged I-frames before requiring an ACK):
+  #   maxframe   — AX.25 v2.0 mod-8  sessions, range 1-7   (Direwolf default 4)
+  #   emaxframe  — AX.25 v2.2 mod-128 sessions, range 1-63 (Direwolf default higher)
+  # T1 retry timer:
+  #   frack      — seconds before retransmit if no ACK. Omit to auto-compute
+  #                from topology (n_hops × per-hop budget, clamped to 4-15).
+  # Other commonly-tuned options (uncomment to set):
+  #   retry      — max AX.25 retries before giving up                 (default 10)
+  #   txdelay    — ms between PTT-on and first audio bit              (default 30)
+  #   txtail     — ms of audio after last bit before PTT-off          (default 10)
+  #   persist    — CSMA persistence value 0-255 (higher = more eager) (default 63)
+  #   slottime   — ms between CSMA retries when channel busy          (default 10)
+  direwolf:
+    maxframe: 4
+    emaxframe: 4
+    # frack: 12
+
+  nodes:
+    - callsign: N6TEST
+      type: station       # AGWPE client (test scripts) connect here
+      agwpe_port: 8001
+
+    - callsign: HMKR
+      type: digi          # connected-mode digipeater; no AGWPE
+
+    - callsign: KRDG
+      type: digi
+
+    - callsign: W6ELA-1
+      type: bbs           # bbs2 connects here
+      agwpe_port: 8000
+
+  # RF reachability. Each link defines a bidirectional audio path between
+  # two nodes with its own propagation delay and loss rate. Only listed
+  # pairs hear each other directly — unlisted pairs are out of range.
+  #
+  #   Chain   (linear, hidden-transmitter scenarios): list only neighbors
+  #   Mesh    (true shared channel, all hear all):    list every pair
+  #   Hybrid  (mix and match):                        list whichever pairs apply
+  #
+  # delay_ms here is RF propagation between the two stations (real packet
+  # radio is microseconds; a few ms is plenty). Digipeater processing time
+  # is added separately by Direwolf itself when it decodes and retransmits.
+  links:
+    - between: [N6TEST, HMKR]
+      delay_ms: 5
+      loss_rate: 0.0      # 0.0 = no loss; 1.0 = all packets dropped
+
+    - between: [HMKR, KRDG]
+      delay_ms: 5
+      loss_rate: 0.0
+
+    - between: [KRDG, W6ELA-1]
+      delay_ms: 5
+      loss_rate: 0.0      # set to e.g. 0.1 to simulate 10% loss on this hop
