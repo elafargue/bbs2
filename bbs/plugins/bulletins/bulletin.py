@@ -599,7 +599,7 @@ class BulletinsPlugin(BBSPlugin):
                     f"{term.style(num_disp, num_color, bold=True)}"
                     f"{term.style(st_str, 'warning' if st == 'P' else 'meta', bold=st == 'P')} "
                     f"{to:<7} {term.style(from_str, from_tone, bold=True)} "
-                    f"{term.note(f'{date:<16}')} {subj}
+                    f"{term.note(f'{date:<16}')} {subj} "
                 )
             else:
                 st_str = f"{st:<2}"
