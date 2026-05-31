@@ -169,6 +169,8 @@ class BulletinsPlugin(BBSPlugin):
             if session.auth.is_sysop:
                 items.insert(-1, ("SA", "Sysop: manage areas"))
             raw = await term.prompt_menu("BULLETINS", items)
+            session.touch()
+            session.log_command("bulletins", raw)
             choice, numarg = _parse_cmd(raw)
 
             if choice == "Q":
@@ -293,6 +295,8 @@ class BulletinsPlugin(BBSPlugin):
                 ("Q",   "Back"),
             ]
             raw = await term.prompt_menu("SYSOP: AREAS", items)
+            session.touch()
+            session.log_command("bulletins:sysop-areas", raw)
             cmd, numarg = _parse_cmd(raw)
             if cmd == "Q":
                 break
@@ -732,6 +736,7 @@ class BulletinsPlugin(BBSPlugin):
         # Gather subject
         await term.send(f"Subject ({self._max_subject} chars max): ")
         subject = (await term.readline(max_len=self._max_subject)).strip()
+        session.touch()
         if not subject:
             await term.sendln(term.note("Cancelled."))
             return
@@ -765,6 +770,7 @@ class BulletinsPlugin(BBSPlugin):
             while True:
                 await term.send("To [ALL]: ")
                 to_call = (await term.readline(max_len=10)).upper().strip() or "ALL"
+                session.touch()
                 if await _validate_to_call(to_call):
                     break
 
@@ -777,6 +783,7 @@ class BulletinsPlugin(BBSPlugin):
         while True:
             await term.send("> ")
             line = await term.readline(max_len=body_line_max, echo=False)
+            session.touch()
             if line.strip().upper() == "/EX":
                 break
             total_bytes += len(line) + 1

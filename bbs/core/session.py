@@ -90,6 +90,7 @@ class BBSSession:
         self.state = SessionState.CONNECTED
         self.connected_at = time.time()
         self._last_activity = time.time()
+        self._last_command_ts = self.connected_at
         self.path_length: PathLength = PathLength.SHORT
 
         # Per-session scratch space for plugins (keyed by plugin name)
@@ -109,6 +110,29 @@ class BBSSession:
 
     def touch(self) -> None:
         self._last_activity = time.time()
+
+    def log_command(self, menu: str, command: str) -> None:
+        """Emit an INFO log line for a menu command issued by the user.
+
+        The "+<n>s" field is the wall-clock gap since the previous logged
+        command (or since connect, for the first one) — useful for spotting
+        sessions that hit the idle watchdog mid-menu.
+
+        Used for diagnosing idle watchdog fires — message bodies and other
+        free-text input must never be passed in here.
+        """
+        now = time.time()
+        elapsed = now - self._last_command_ts
+        self._last_command_ts = now
+        logger.info(
+            "session %s:%s [%s] +%.1fs %s cmd: %s",
+            self.conn.transport_id,
+            self.conn.remote_addr,
+            self.auth.callsign or "?",
+            elapsed,
+            menu,
+            command,
+        )
 
     # ── Main session coroutine ────────────────────────────────────────────────
 
@@ -227,7 +251,7 @@ class BBSSession:
     async def _greet(self) -> None:
         if self.path_length is PathLength.LONG:
             # Minimal: station ID only — every byte counts on a 3+ hop path
-            await self.term.sendln(self.cfg.full_callsign + ' BBS')
+            await self.term.sendln(self.cfg.full_callsign + ' BBS (compact mode)')
         elif self.path_length is PathLength.MEDIUM:
             # One-liner: callsign + sysop, no header box or blank lines
             await self.term.sendln(
@@ -270,7 +294,9 @@ class BBSSession:
             await self._apply_user_preferences()
             if self.path_length is PathLength.LONG:
                 # Callsign only — every byte counts on a 3+ hop path
-                await self.term.sendln(display_call)
+                await self.term.sendln(
+                    f"Welcome {display_call}!"
+                )
             elif self.path_length is PathLength.MEDIUM:
                 # Callsign + access level on one line, no new-account notice
                 level_label = self.auth_service.level_label(self.auth.level)
@@ -407,6 +433,7 @@ class BBSSession:
 
             self.touch()
             choice = choice_raw.strip().upper()
+            self.log_command("main", choice)
 
             if choice in ("B", "BYE"):
                 break

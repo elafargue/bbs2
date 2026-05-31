@@ -71,21 +71,29 @@ rig:
   # radio is microseconds; a few ms is plenty). Digipeater processing time
   # is added separately by Direwolf itself when it decodes and retransmits.
   links:
-    - between: [N6TEST, HMKR]
+    - between: [N6TEST, WOODY]
       delay_ms: 5
       loss_rate: 0.0      # 0.0 = no loss; 1.0 = all packets dropped
 
-    - between: [HMKR, KRDG]
+    # - between: [N6TEST, HMKR]
+    #   delay_ms: 5
+    #   loss_rate: 0.0      # 0.0 = no loss; 1.0 = all packets dropped
+
+    # - between: [HMKR, KRDG]
+    #   delay_ms: 5
+    #   loss_rate: 0.0
+
+    # - between: [KRDG, KBANN]
+    #   delay_ms: 5
+    #   loss_rate: 0.0
+
+    - between: [KRDG, WOODY]
       delay_ms: 5
       loss_rate: 0.0
 
-    - between: [KRDG, KBANN]
-      delay_ms: 5
-      loss_rate: 0.0
-
-    - between: [KBANN, WOODY]
-      delay_ms: 5
-      loss_rate: 0.0
+    # - between: [KBANN, WOODY]
+    #   delay_ms: 5
+    #   loss_rate: 0.0
 
     - between: [WOODY, W6ELA-1]
       delay_ms: 5

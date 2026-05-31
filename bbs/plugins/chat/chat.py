@@ -333,6 +333,7 @@ class ChatPlugin(BBSPlugin):
                 if line.startswith("/"):
                     cmd_parts = line.split(None, 2)
                     cmd = cmd_parts[0].upper()
+                    session.log_command("chat", cmd)
 
                     if cmd == "/QUIT":
                         break

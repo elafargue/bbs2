@@ -606,6 +606,8 @@ class HeardPlugin(BBSPlugin):
                 menu.insert(0, ("C", f"Configure (max age: {self._max_age_hours}h)"))
 
             action = await term.prompt_menu("HEARD STATIONS", menu, max_len=4, timeout=120)
+            session.touch()
+            session.log_command("heard", action)
 
             # ── Dispatch ────────────────────────────────────────────────────
             if action == "Q":
@@ -748,6 +750,8 @@ class HeardPlugin(BBSPlugin):
                  ("Q", "Back")],
                 max_len=4, timeout=60,
             )
+            session.touch()
+            session.log_command("heard:configure", choice)
             if choice == "Q":
                 break
             elif choice == "A":
