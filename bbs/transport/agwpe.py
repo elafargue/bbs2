@@ -30,8 +30,11 @@ Protocol reference: http://www.sv2agw.com/downloads/develop.zip
                Receive: CallFrom = remote  →  send: CallFrom = our call, CallTo = remote
   'T' (0x54) — Send unproto (UI) frame — used for periodic beacons
   'm' (0x6D) — Enable monitoring of all received frames
-  'U' (0x55) — Monitored UI frame (AGWPE monitor format, e.g.:
+  'U' (0x55) — Monitored UI / UNPROTO frame (AGWPE monitor format, e.g.:
                "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN* <UI pid=F0 ...>")
+  'S' (0x53) — Monitored supervisory + non-UI U-frames (SABM, SABME, UA, DM,
+               RR, RNR, REJ, …). Same text format as 'U'; the angle-bracket
+               metadata names the actual frame type, e.g. "<SABME PF=1 >".
 
 ── Design notes ─────────────────────────────────────────────────────────────
 One TCP connection is maintained to AGWPE.  Multiple simultaneous AX.25
@@ -617,10 +620,13 @@ class AGWPETransport(Transport):
                     call_from, key, list(self._sessions.keys()),
                 )
 
-        elif kind == "U":
-            # Monitored frame — AGWPE already parsed src/dest into the 36-byte header.
-            # 1. Check for SABM/SABME directed at us to cache the hop count for the
-            #    upcoming 'C' (connect) event.  Runs regardless of heard plugin state.
+        elif kind in ("U", "S"):
+            # Monitored frame. Direwolf splits these by frame class:
+            #   'U' — UI / unproto frames
+            #   'S' — supervisory + all non-UI U-frames (SABM, SABME, UA, DM, …)
+            # SABM/SABME for an incoming connection arrives under 'S', so the
+            # hop-count cache MUST observe both kinds to populate before 'C'.
+            # 1. Cache the via-path length when a SABM/SABME is directed at us.
             if payload and call_to.upper() == self._local_call.upper():
                 try:
                     _sabm_text = payload.decode("ascii", errors="replace")
@@ -630,7 +636,10 @@ class AGWPETransport(Transport):
                             self._pending_hop_counts[call_from.upper()] = len(_via)
                 except Exception:
                     pass
-            # 2. Heard-station tracking (optional — requires heard plugin).
+            # 2. Heard-station tracking is UI-frame only — that's the scope of
+            #    "stations heard on the air". Skip for 'S' kind.
+            if kind != "U":
+                return
             if self._heard_observer is None:
                 return
             if call_from.upper() == self._local_call.upper():

@@ -49,6 +49,12 @@ rig:
     - callsign: KRDG
       type: digi
 
+    - callsign: KBANN
+      type: digi
+
+    - callsign: WOODY
+      type: digi
+
     - callsign: W6ELA-1
       type: bbs           # bbs2 connects here
       agwpe_port: 8000
@@ -73,6 +79,14 @@ rig:
       delay_ms: 5
       loss_rate: 0.0
 
-    - between: [KRDG, W6ELA-1]
+    - between: [KRDG, KBANN]
+      delay_ms: 5
+      loss_rate: 0.0
+
+    - between: [KBANN, WOODY]
+      delay_ms: 5
+      loss_rate: 0.0
+
+    - between: [WOODY, W6ELA-1]
       delay_ms: 5
       loss_rate: 0.0      # set to e.g. 0.1 to simulate 10% loss on this hop

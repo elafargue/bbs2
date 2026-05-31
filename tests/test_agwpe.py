@@ -579,3 +579,101 @@ class TestAGWPELoginFrame:
         assert h["kind"] == "X"
         assert h["call_from"] == "N0CALL-1"
         assert h["data_len"] == 0
+
+
+# ─── Hop-count caching from monitored SABM/SABME frames ──────────────────────
+
+def _make_sabm_monitor_text(call_from: str, call_to: str, via: list[str]) -> bytes:
+    """Build a Direwolf-style AGWPE monitor payload for a SABME frame.
+
+    Direwolf sends this under datakind 'S' (Supervisory + non-UI U-frames).
+    Each digi that handled the frame gets a trailing '*'.
+    """
+    via_str = f" Via {','.join(v + '*' for v in via)}" if via else ""
+    text = f" 1:Fm {call_from} To {call_to}{via_str} <SABME PF=1 >[12:34:56]\r\r\x00"
+    return text.encode("ascii")
+
+
+class TestHopCountFromMonitoredSABM:
+    """SABM/SABME monitor frames cache the via-path length so the upcoming
+    'C' (Connected) event can attach the correct hop_count to Connection.
+
+    Regression coverage for: bbs2 used to only check datakind 'U', but
+    Direwolf sends SABMs under datakind 'S' — so hop_count silently stayed 0
+    on every incoming connection no matter how many digis were in the path."""
+
+    def setup_method(self):
+        self.transport = _make_transport()
+        self.transport._running = True
+        self.fake_writer = _FakeWriter()
+        self.received: list[Connection] = []
+
+        async def _on_connect(conn: Connection) -> None:
+            self.received.append(conn)
+            try:
+                while await conn.reader.read(1024):
+                    pass
+            except Exception:
+                pass
+
+        self.transport._on_connect = _on_connect
+        self.transport._drain_lock = asyncio.Lock()
+
+    async def _send_sabm(self, kind: str, call_from: str, via: list[str]) -> None:
+        payload = _make_sabm_monitor_text(call_from, "N0CALL-1", via)
+        await self.transport._dispatch(
+            kind, 0, call_from, "N0CALL-1", 0, payload, self.fake_writer,  # type: ignore[arg-type]
+        )
+
+    async def _send_connect(self, call_from: str) -> None:
+        await self.transport._dispatch(
+            "C", 0, call_from, "N0CALL-1", 0, b"", self.fake_writer,  # type: ignore[arg-type]
+        )
+
+    async def test_sabm_under_S_caches_hop_count(self):
+        """Direwolf sends SABM under datakind 'S' — that path must populate the cache."""
+        await self._send_sabm("S", "W6ELA-7", ["HMKR", "KRDG", "KBANN", "WOODY"])
+        assert self.transport._pending_hop_counts.get("W6ELA-7") == 4
+
+    async def test_sabm_under_U_also_caches_hop_count(self):
+        """Some monitor implementations may deliver SABM under 'U'; accept that too."""
+        await self._send_sabm("U", "W6ELA-7", ["HMKR", "KRDG"])
+        assert self.transport._pending_hop_counts.get("W6ELA-7") == 2
+
+    async def test_connect_after_sabm_attaches_hop_count(self):
+        """'S' then 'C' → Connection.hop_count reflects the cached via-length."""
+        await self._send_sabm("S", "W6ELA-7", ["HMKR", "KRDG", "KBANN"])
+        await self._send_connect("W6ELA-7")
+        await asyncio.sleep(0)  # let session task start
+        assert len(self.received) == 1
+        assert self.received[0].hop_count == 3
+        # The cache entry is consumed on use.
+        assert "W6ELA-7" not in self.transport._pending_hop_counts
+
+    async def test_direct_sabm_no_via_yields_zero_hops(self):
+        await self._send_sabm("S", "W6ELA-7", [])
+        await self._send_connect("W6ELA-7")
+        await asyncio.sleep(0)
+        assert self.received[0].hop_count == 0
+
+    async def test_connect_without_prior_sabm_defaults_to_zero(self):
+        """If the SABM monitor was missed (e.g. race), hop_count silently defaults to 0."""
+        await self._send_connect("W6ELA-7")
+        await asyncio.sleep(0)
+        assert self.received[0].hop_count == 0
+
+    async def test_sabm_for_other_callsign_not_cached(self):
+        """SABM directed at another callsign on the same channel must not pollute our cache."""
+        payload = _make_sabm_monitor_text("W6ELA-7", "SOMEONE-ELSE", ["HMKR", "KRDG"])
+        await self.transport._dispatch(
+            "S", 0, "W6ELA-7", "SOMEONE-ELSE", 0, payload, self.fake_writer,  # type: ignore[arg-type]
+        )
+        assert "W6ELA-7" not in self.transport._pending_hop_counts
+
+    async def test_non_sabm_S_frame_does_not_cache(self):
+        """A non-SABM 'S' frame (e.g. RR, UA, DM) must not populate the cache."""
+        text = " 1:Fm W6ELA-7 To N0CALL-1 Via HMKR*,KRDG* <RR P=0 R=2 >[12:34:56]\r\r\x00"
+        await self.transport._dispatch(
+            "S", 0, "W6ELA-7", "N0CALL-1", 0, text.encode("ascii"), self.fake_writer,  # type: ignore[arg-type]
+        )
+        assert "W6ELA-7" not in self.transport._pending_hop_counts
