@@ -36,6 +36,7 @@ rig:
   direwolf:
     maxframe: 4
     emaxframe: 4
+    output_gain: 0.25
     # frack: 12
 
   nodes:
@@ -79,9 +80,9 @@ rig:
     #   delay_ms: 5
     #   loss_rate: 0.0      # 0.0 = no loss; 1.0 = all packets dropped
 
-    # - between: [HMKR, KRDG]
-    #   delay_ms: 5
-    #   loss_rate: 0.0
+    - between: [N6TEST, KRDG]
+      delay_ms: 5
+      loss_rate: 0.0
 
     # - between: [KRDG, KBANN]
     #   delay_ms: 5

@@ -282,7 +282,7 @@ async def start_direwolf(
     log_path: str,
 ) -> asyncio.subprocess.Process:
     proc = await asyncio.create_subprocess_exec(
-        "direwolf", "-c", conf_path, "-t", "0",
+        "direwolf", "-c", conf_path, "-t", "0", "-q", "d",
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

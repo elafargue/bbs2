@@ -14,17 +14,13 @@ from typing import Any, TYPE_CHECKING
 
 from bbs.core.auth import AuthLevel
 from bbs.core.plugin_registry import BBSPlugin
+from bbs.core.session import PathLength
 from bbs.db.connections import get_recent_connections
 
 if TYPE_CHECKING:
     from bbs.core.session import BBSSession
 
 _AUTH_LABELS = {0: "anon", 1: "ident", 2: "auth", 3: "sysop"}
-
-
-def _fmt_ts(ts: int) -> str:
-    """Format a Unix timestamp as a compact local datetime string."""
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 class LastConnectionsPlugin(BBSPlugin):
@@ -52,39 +48,70 @@ class LastConnectionsPlugin(BBSPlugin):
             await term.sendln()
             return
 
-        header = f"LAST CONNECTIONS  (past {days} days, {len(rows)} stations)"
+        # Compact rendering on long RF paths: fewer rows, narrower timestamps,
+        # and drop the lowest-value columns (Auth, then Transport).
+        pl = session.path_length
+        total_rows = len(rows)
+        compact_limit = 10 if pl is PathLength.LONG else 20 if pl is PathLength.MEDIUM else None
+        truncated = compact_limit is not None and total_rows > compact_limit
+        if compact_limit is not None:
+            rows = rows[:compact_limit]
+
+        first_date_only = pl is not PathLength.SHORT   # MEDIUM and LONG: date only
+        last_date_only  = pl is PathLength.LONG        # LONG only
+        show_transport  = pl is not PathLength.LONG
+        show_auth       = pl is PathLength.SHORT
+
+        col_call   = 9
+        col_first  = 10 if first_date_only else 16
+        col_last   = 10 if last_date_only  else 16
+        col_trn    = 12
+        first_fmt  = "%Y-%m-%d" if first_date_only else "%Y-%m-%d %H:%M"
+        last_fmt   = "%Y-%m-%d" if last_date_only  else "%Y-%m-%d %H:%M"
+        active_lbl = "* Active *" if last_date_only else "** Active **"
+
+        if truncated:
+            header = f"LAST CONNECTIONS  (last {len(rows)} stations)"
+        else:
+            header = f"LAST CONNECTIONS  (past {days} days, {len(rows)} stations)"
         await term.sendln(term.label(header, "meta"))
         await term.sendln(term.note("-" * min(len(header), term.width)))
 
         lines = []
-        col_call = 9
-        col_ts = 16
-        col_trn = 12
         for row in rows:
             call = str(row["callsign"]).upper().ljust(col_call)[:col_call]
-            first = _fmt_ts(row["first_seen"]).ljust(col_ts)[:col_ts]
-            last = (
-                "** Active **".ljust(col_ts)[:col_ts]
-                if row.get("connected")
-                else _fmt_ts(row["last_seen"]).ljust(col_ts)[:col_ts]
-            )
-            trn = str(row["transport"]).ljust(col_trn)[:col_trn]
-            lvl = _AUTH_LABELS.get(row["auth_level"], "?")
+            first = time.strftime(
+                first_fmt, time.localtime(row["first_seen"])
+            ).ljust(col_first)[:col_first]
             if row.get("connected"):
+                last = active_lbl.ljust(col_last)[:col_last]
                 last_disp = term.ok(last)
                 call_disp = term.style(call, "accent", bold=True)
             else:
+                last = time.strftime(
+                    last_fmt, time.localtime(row["last_seen"])
+                ).ljust(col_last)[:col_last]
                 last_disp = term.note(last)
                 call_disp = call
-            lines.append(f"{call_disp} {term.note(first)} {last_disp} {trn} {lvl}")
+            parts = [call_disp, term.note(first), last_disp]
+            if show_transport:
+                parts.append(str(row["transport"]).ljust(col_trn)[:col_trn])
+            if show_auth:
+                parts.append(_AUTH_LABELS.get(row["auth_level"], "?"))
+            lines.append(" ".join(parts))
 
         # Column header
-        col_hdr = (
-            f"{'CALLSIGN':<{col_call}} "
-            f"{'FIRST SEEN':<{col_ts}} "
-            f"{'LAST SEEN':<{col_ts}} "
-            f"{'TRANSPORT':<{col_trn}} AUTH"
-        )
+        hdr_parts = [
+            f"{'CALLSIGN':<{col_call}}",
+            f"{'FIRST SEEN':<{col_first}}",
+            f"{'LAST SEEN':<{col_last}}",
+        ]
+        if show_transport:
+            hdr_parts.append(f"{'TRANSPORT':<{col_trn}}")
+        if show_auth:
+            hdr_parts.append("AUTH")
+        col_hdr = " ".join(hdr_parts)
+
         await term.sendln(term.label(col_hdr, "meta"))
         await term.sendln(term.note("-" * min(len(col_hdr), term.width)))
         await term.flush()
