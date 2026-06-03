@@ -14,10 +14,14 @@ Sysop:  can configure max_age_hours interactively or via the web UI.
 """
 from __future__ import annotations
 
+import logging
+import re
 import time
 from typing import Any, TYPE_CHECKING
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 from bbs.core.auth import AuthLevel
 from bbs.core.plugin_registry import BBSPlugin
@@ -41,6 +45,8 @@ CREATE TABLE IF NOT EXISTS heard_stations (
     comment     TEXT    NOT NULL DEFAULT '',
     source      TEXT    NOT NULL DEFAULT 'heard',
     last_direct_heard INTEGER NOT NULL DEFAULT 0,
+    nodename        TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+    position_source TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (callsign, transport)
 );
 CREATE TABLE IF NOT EXISTS heard_paths (
@@ -98,6 +104,44 @@ def _merge_via(stored: str, incoming: str) -> str:
         _base(s) + ("*" if s.endswith("*") or n.endswith("*") else "")
         for s, n in zip(stored_parts, incoming_parts)
     )
+
+
+# ── <MAP:lat,lon,call[,nodename]> location-beacon tag ─────────────────────────
+
+_MAP_TAG_RE = re.compile(
+    r"<MAP:\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,"            # lat
+    r"\s*([+-]?\d+(?:\.\d+)?)\s*,"         # lon
+    r"\s*([A-Z0-9\-]+)"                    # callsign
+    r"(?:\s*,\s*([A-Z0-9\-/]+))?"           # optional nodename (may use XXXX/YYYY for dual-alias nodes)
+    r"\s*>",
+    re.IGNORECASE,
+)
+
+
+def _parse_map_tag(info: str) -> tuple[float, float, str, str] | None:
+    """
+    Parse a ``<MAP:lat,lon,callsign[,nodename]>`` tag from a packet's info field.
+
+    Returns ``(lat, lon, callsign_upper, nodename_upper)`` for the first valid
+    tag found, or ``None`` if no tag is present or the coordinates are out of
+    range.  ``nodename`` is the empty string when the 3-argument form is used.
+    """
+    if not info:
+        return None
+    m = _MAP_TAG_RE.search(info)
+    if not m:
+        return None
+    try:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+    except ValueError:
+        return None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        return None
+    callsign = m.group(3).upper()
+    nodename = (m.group(4) or "").upper()
+    return lat, lon, callsign, nodename
 
 
 # ── ASCII network map helpers ─────────────────────────────────────────────────
@@ -242,6 +286,18 @@ class HeardPlugin(BBSPlugin):
             try:
                 await db.execute(
                     "ALTER TABLE heard_stations ADD COLUMN last_direct_heard INTEGER NOT NULL DEFAULT 0"
+                )
+            except Exception:
+                pass  # column already exists
+            try:
+                await db.execute(
+                    "ALTER TABLE heard_stations ADD COLUMN nodename TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
+                )
+            except Exception:
+                pass  # column already exists
+            try:
+                await db.execute(
+                    "ALTER TABLE heard_stations ADD COLUMN position_source TEXT NOT NULL DEFAULT ''"
                 )
             except Exception:
                 pass  # column already exists
@@ -463,6 +519,41 @@ class HeardPlugin(BBSPlugin):
                     """,
                     (src_up, transport, via_base, merged_path_via, ts, ts, merged_path_via),
                 )
+            # ── <MAP:lat,lon,call[,nodename]> location-beacon tag ────────────
+            # Honour the tag only when its callsign matches the frame source —
+            # the protocol says "Only use your own callsign and your own node
+            # name", and matching prevents trivial spoofing.  We compare on the
+            # base callsign (stripping any -SSID suffix) so that e.g. a frame
+            # from KC7HEX-10 may legitimately carry "<MAP:...,KC7HEX,NODE>".
+            # When honoured, beacon coordinates override any prior value
+            # (manual or beacon): a station's own broadcast is the freshest
+            # authoritative source.
+            parsed_map = _parse_map_tag(info)
+            if parsed_map is not None:
+                lat, lon, map_call, nodename = parsed_map
+                if map_call.split("-", 1)[0] == src_up.split("-", 1)[0]:
+                    await db.execute(
+                        """
+                        UPDATE heard_stations
+                           SET lat             = ?,
+                               lon             = ?,
+                               nodename        = ?,
+                               position_source = 'beacon'
+                         WHERE callsign = ? AND transport = ?
+                        """,
+                        (lat, lon, nodename, src_up, transport),
+                    )
+                    logger.info(
+                        "MAP beacon: %s%s @ %.4f,%.4f via %s",
+                        src_up,
+                        f" ({nodename})" if nodename else "",
+                        lat, lon, transport,
+                    )
+                else:
+                    logger.warning(
+                        "MAP beacon ignored: src %s does not match tag callsign %s — info: %r",
+                        src_up, map_call, info,
+                    )
             await db.commit()
 
         # Notify subscribers after the DB write so the data is consistent.

@@ -124,14 +124,25 @@ function renderLayers() {
     const s       = info.station
     const expired = s.expired ?? false
 
+    const titleHtml = s.nodename
+      ? `<strong>${callsign}</strong> <span style="color:#9CA3AF">(${s.nodename})</span>`
+      : `<strong>${callsign}</strong>`
+    const sourceLabel = s.position_source === 'beacon'
+      ? 'self-reported via beacon'
+      : s.position_source === 'manual'
+        ? 'set by sysop'
+        : null
     const popupLines = [
-      `<strong>${callsign}</strong>`,
+      titleHtml,
       `Type: ${info.type}`,
       s.transport ? `Transport: ${s.transport}` : null,
       s.last_heard ? `Last heard: ${new Date(s.last_heard * 1000).toLocaleString()}` : null,
       s.count ? `Count: ${s.count}` : null,
+      sourceLabel ? `Position: ${sourceLabel}` : null,
       s.comment ? `Comment: ${s.comment}` : null,
     ].filter(Boolean).join('<br/>')
+
+    const tooltipText = s.nodename ? `${callsign} (${s.nodename})` : callsign
 
     L.circleMarker([info.lat, info.lon], {
       radius:      cfg.radius,
@@ -142,7 +153,7 @@ function renderLayers() {
       opacity:     expired ? 0.45 : 1.0,
     })
       .bindPopup(popupLines, { maxWidth: 260 })
-      .bindTooltip(callsign, { permanent: false, direction: 'top', offset: [0, -cfg.radius - 2] })
+      .bindTooltip(tooltipText, { permanent: false, direction: 'top', offset: [0, -cfg.radius - 2] })
       .addTo(markersLayer)
   }
 
@@ -201,7 +212,8 @@ watch([() => props.stations, () => props.graphData], renderLayers, { deep: true 
     >
       <span style="color:#9CA3AF;font-size:14px;">No stations with coordinates yet.</span>
       <span style="color:#6B7280;font-size:12px;margin-top:6px;">
-        Use the pencil icon in the Log tab to add lat/lon to a station.
+        Stations appear here when they beacon a <code style="color:#9CA3AF;">&lt;MAP:lat,lon,CALL[,NODE]&gt;</code> tag,
+        or after a sysop adds lat/lon via the pencil icon in the Log tab.
       </span>
     </div>
 

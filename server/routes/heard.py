@@ -56,7 +56,7 @@ def heard_list():
         cur = db.execute(
             """
             SELECT callsign, dest, transport, via, first_heard, last_heard, count,
-                   lat, lon, comment, source
+                   lat, lon, comment, source, nodename, position_source
             FROM heard_stations
             ORDER BY last_heard DESC
             LIMIT ?
@@ -127,7 +127,7 @@ def heard_clear():
 
 @app.route("/api/heard/<callsign>", methods=["PUT"])
 def heard_update(callsign: str):
-    """Update lat, lon, and comment for a heard station (matched by callsign + transport)."""
+    """Update lat, lon, nodename, and comment for a heard station (matched by callsign + transport)."""
     err = _require_sysop()
     if err:
         return err
@@ -137,6 +137,7 @@ def heard_update(callsign: str):
     lat       = data.get("lat")
     lon       = data.get("lon")
     comment   = str(data.get("comment", ""))
+    nodename  = str(data.get("nodename", "")).strip().upper()
 
     if lat is not None:
         try:
@@ -157,13 +158,19 @@ def heard_update(callsign: str):
     if not db:
         return jsonify({"error": "BBS engine not running"}), 503
     try:
+        # Manual edits set position_source='manual' so the UI can distinguish
+        # sysop-entered coordinates from those self-reported by a <MAP:...> beacon.
         cur = db.execute(
             """
             UPDATE heard_stations
-               SET lat = ?, lon = ?, comment = ?
+               SET lat = ?, lon = ?, comment = ?, nodename = ?,
+                   position_source = CASE
+                       WHEN ? IS NOT NULL OR ? IS NOT NULL THEN 'manual'
+                       ELSE position_source
+                   END
              WHERE callsign = ? AND transport = ?
             """,
-            (lat, lon, comment, callsign, transport),
+            (lat, lon, comment, nodename, lat, lon, callsign, transport),
         )
         if cur.rowcount == 0:
             return jsonify({"error": "Station not found"}), 404

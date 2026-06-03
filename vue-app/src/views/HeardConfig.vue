@@ -18,9 +18,9 @@ const pathsCall    = ref('')
 const pathsRows    = ref([])
 const pathsLoading = ref(false)
 
-// Edit station (lat / lon / comment)
+// Edit station (lat / lon / nodename / comment)
 const editDialog = ref(false)
-const editItem   = ref({ callsign: '', transport: '', lat: '', lon: '', comment: '' })
+const editItem   = ref({ callsign: '', transport: '', lat: '', lon: '', nodename: '', comment: '' })
 const editSaving = ref(false)
 
 // Delete station
@@ -117,15 +117,17 @@ async function showPaths(callsign) {
 
 function openEdit(item) {
   editItem.value = {
-    callsign:    item.callsign,
-    transport:   item.transport,
-    source:      item.source,
-    first_heard: item.first_heard,
-    last_heard:  item.last_heard,
-    count:       item.count,
-    lat:         item.lat != null ? String(item.lat) : '',
-    lon:         item.lon != null ? String(item.lon) : '',
-    comment:     item.comment ?? '',
+    callsign:        item.callsign,
+    transport:       item.transport,
+    source:          item.source,
+    first_heard:     item.first_heard,
+    last_heard:      item.last_heard,
+    count:           item.count,
+    lat:             item.lat != null ? String(item.lat) : '',
+    lon:             item.lon != null ? String(item.lon) : '',
+    nodename:        item.nodename ?? '',
+    comment:         item.comment ?? '',
+    position_source: item.position_source ?? '',
   }
   editDialog.value = true
 }
@@ -133,13 +135,14 @@ function openEdit(item) {
 async function saveEdit() {
   editSaving.value = true
   const { callsign, transport } = editItem.value
-  const lat     = editItem.value.lat !== '' ? Number(editItem.value.lat) : null
-  const lon     = editItem.value.lon !== '' ? Number(editItem.value.lon) : null
-  const comment = editItem.value.comment
+  const lat      = editItem.value.lat !== '' ? Number(editItem.value.lat) : null
+  const lon      = editItem.value.lon !== '' ? Number(editItem.value.lon) : null
+  const comment  = editItem.value.comment
+  const nodename = editItem.value.nodename
   const res = await fetch(`/api/heard/${encodeURIComponent(callsign)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transport, lat, lon, comment }),
+    body: JSON.stringify({ transport, lat, lon, comment, nodename }),
   })
   const data = await res.json()
   snackbar.value = {
@@ -265,6 +268,7 @@ onMounted(load)
         >
           <template #item.callsign="{ item }">
             <span :class="item.transport === '' && item.source !== 'heard' ? 'text-medium-emphasis' : ''">{{ item.callsign }}</span>
+            <span v-if="item.nodename" class="ml-1 text-caption text-medium-emphasis">({{ item.nodename }})</span>
             <v-chip
               v-if="item.transport === '' && item.source !== 'heard'"
               size="x-small"
@@ -407,12 +411,27 @@ onMounted(load)
             </v-col>
             <v-col cols="12" class="mt-2">
               <v-text-field
+                v-model="editItem.nodename"
+                label="Node name"
+                hint="Optional alias (e.g. AUBNOD). Set automatically when a station beacons a &lt;MAP:...&gt; tag."
+                persistent-hint
+                density="compact"
+              />
+            </v-col>
+            <v-col cols="12" class="mt-2">
+              <v-text-field
                 v-model="editItem.comment"
                 label="Comment"
                 hint="Optional note about this station"
                 persistent-hint
                 density="compact"
               />
+            </v-col>
+            <v-col v-if="editItem.position_source" cols="12" class="mt-1 text-caption text-medium-emphasis">
+              Position source:
+              <span v-if="editItem.position_source === 'beacon'">self-reported via &lt;MAP:...&gt; beacon</span>
+              <span v-else-if="editItem.position_source === 'manual'">set by sysop</span>
+              <span v-else>{{ editItem.position_source }}</span>
             </v-col>
           </v-row>
         </v-card-text>
