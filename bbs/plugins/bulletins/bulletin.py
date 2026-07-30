@@ -152,13 +152,13 @@ class BulletinsPlugin(BBSPlugin):
                     db, current_area_id, session.auth.user_id,
                     callsign=session.auth.callsign, is_sysop=session.auth.is_sysop,
                 )
-                area_label = f"{current_area_name} ({unread} new)"
+                title = f"BULLETINS / {current_area_name} ({unread} New)"
             else:
-                area_label = "(no area selected)"
+                title = "BULLETINS / (no area selected)"
 
             items: list[tuple[str, str]] = [
                 ("A",     "Areas (list/select)"),
-                ("L",     f"List messages  [{area_label}]"),
+                ("L [#]", "List messages (from # or newest)"),
                 ("R#",   "Read message number #"),
                 ("S [call]", "Send message"),
                 ("Q",     "Back to main menu"),
@@ -168,7 +168,7 @@ class BulletinsPlugin(BBSPlugin):
                 items.insert(4, ("D#", "Delete message number #"))
             if session.auth.is_sysop:
                 items.insert(-1, ("SA", "Sysop: manage areas"))
-            raw = await term.prompt_menu("BULLETINS", items)
+            raw = await term.prompt_menu(title, items)
             session.touch()
             session.log_command("bulletins", raw)
             choice, numarg = _parse_cmd(raw)
@@ -185,7 +185,10 @@ class BulletinsPlugin(BBSPlugin):
                 if not current_area_id:
                     await term.sendln("Select an area first (A).")
                 else:
-                    await self._list_messages(session, current_area_id, current_area_name)
+                    start_num = int(numarg) if numarg and numarg.isdigit() else None
+                    await self._list_messages(
+                        session, current_area_id, current_area_name, start_num
+                    )
             elif choice == "R":
                 if not current_area_id:
                     await term.sendln("Select an area first (A).")
@@ -619,7 +622,8 @@ class BulletinsPlugin(BBSPlugin):
     # ── List messages (interactive) ───────────────────────────────────────────
 
     async def _list_messages(
-        self, session: "BBSSession", area_id: int, area_name: str
+        self, session: "BBSSession", area_id: int, area_name: str,
+        start_num: Optional[int] = None,
     ) -> None:
         term = session.term
         messages = await self._fetch_messages(
@@ -628,6 +632,15 @@ class BulletinsPlugin(BBSPlugin):
         if not messages:
             await term.sendln(term.note(f"No messages in {area_name}."))
             return
+        # 'L <n>' — start the listing at message #n and go older (helps users
+        # on slow paths resume a long list instead of re-scrolling from newest).
+        if start_num is not None:
+            messages = [m for m in messages if m["msg_number"] <= start_num]
+            if not messages:
+                await term.sendln(
+                    term.note(f"No messages at or before #{start_num} in {area_name}.")
+                )
+                return
         read_ids = await self._fetch_read_ids(session.db, area_id, session.auth.user_id)
         await self._show_message_index(term, area_name, messages, read_ids=read_ids,
                                         idle_timeout=float(session.cfg.idle_timeout) or None,

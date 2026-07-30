@@ -7,8 +7,8 @@ Design goals
 • Explicit color modes: ASCII-only, classic ANSI 16-color, or truecolor.
 • Buffered output: writes are accumulated and flushed in chunks ≤ MAX_CHUNK
     bytes so the radio layer isn't flooded with tiny packets.
-• Paging: paginate() inserts a "[MORE]" prompt every page_height lines and
-    waits for SPACE/ENTER/Q.
+• Paging: paginate() inserts a "[Enter=More  Q=Stop]" prompt every
+    page_height lines and waits for SPACE/ENTER (continue) or Q (stop).
 • Line-at-a-time input: readline() handles both CR and LF line endings,
     echoes characters (for TCP; AX.25 connected-mode handles its own echo),
     and respects a maximum line length.
@@ -241,11 +241,12 @@ class Terminal:
         return f"{self.label(label, tone)} {value}"
 
     def _more_style(self) -> str:
+        label = "[Enter=More  Q=Stop]"
         if self.supports_truecolor:
-            return f"{BOLD}{bg_rgb(34, 47, 62)}{fg_rgb(245, 248, 252)}[MORE]{RESET} "
+            return f"{BOLD}{bg_rgb(34, 47, 62)}{fg_rgb(245, 248, 252)}{label}{RESET} "
         if self.ansi:
-            return f"{BOLD}{bg(BLUE)}{fg(15)}[MORE]{RESET} "
-        return "[MORE] "
+            return f"{BOLD}{bg(BLUE)}{fg(15)}{label}{RESET} "
+        return f"{label} "
 
     def write(self, text: str) -> None:
         """Buffer *text* for transmission (does not flush immediately)."""
@@ -442,8 +443,8 @@ class Terminal:
                 if not ch:  # timeout or EOF → abort paging
                     await self.sendln()
                     return False
-                # Consume complementary line ending (\r\n or \n\r)
                 if ch in ("\r", "\n"):
+                    # Bare ENTER (continue): consume the complementary CR/LF.
                     complement = b"\n" if ch == "\r" else b"\r"
                     try:
                         peek = await asyncio.wait_for(self._reader.read(1), timeout=0.05)
@@ -451,12 +452,38 @@ class Terminal:
                             self._reader.feed_data(peek)
                     except asyncio.TimeoutError:
                         pass
+                else:
+                    # A command char such as 'Q'.  A line-mode AX.25 terminal
+                    # sends it together with a trailing ENTER as one packet
+                    # ("Q\r" / "Q\r\n"); swallow that trailing CR/LF so it does
+                    # not leak into the next read and cause a spurious redraw.
+                    await self._swallow_trailing_eol()
                 await self.sendln()
                 if ch.upper() == "Q":
                     return False
                 count = 0
         await self.flush()
         return True
+
+    async def _swallow_trailing_eol(self) -> None:
+        """Non-blocking: consume a trailing CR and/or LF left in the buffer.
+
+        Line-mode terminals (typical over AX.25) send a command character with
+        the ENTER that submitted it as one packet — e.g. "Q\\r".  After reading
+        the command char we swallow that trailing CR/LF so it is not read as a
+        stray ENTER by the next input call.  The short read timeout keeps this a
+        no-op for char-at-a-time terminals (web / raw telnet).
+        """
+        for _ in range(2):  # at most a CR+LF pair
+            try:
+                b = await asyncio.wait_for(self._reader.read(1), timeout=0.05)
+            except asyncio.TimeoutError:
+                return
+            if not b:
+                return
+            if b not in (b"\r", b"\n"):
+                self._reader.feed_data(b)  # not part of the ENTER — put it back
+                return
 
     # ── Input ─────────────────────────────────────────────────────────────────
 

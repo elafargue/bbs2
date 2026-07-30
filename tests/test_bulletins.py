@@ -960,14 +960,14 @@ class TestHelp:
         await logged_in_client.wait_for(">")
 
     async def _get_help_text(self, client: BbsTestClient) -> str:
-        """Send '?' and collect the full help output, dismissing any [MORE] prompts."""
+        """Send '?' and collect the full help output, dismissing any paging prompts."""
         await client.sendln("BU")
         await client.wait_for(BULL_PROMPT)
         await client.sendln("?")
-        # Dismiss each [MORE] page until the menu prompt reappears
+        # Dismiss each paging prompt until the menu prompt reappears
         full = ""
         while True:
-            chunk = await client.wait_for(r"\[MORE\]|Enter choice:", regex=True)
+            chunk = await client.wait_for(r"Q=Stop|Enter choice:", regex=True)
             full += chunk
             if "Enter choice:" in chunk:
                 break
@@ -1208,3 +1208,56 @@ class TestCountUnread:
         finally:
             await db.close()
 
+
+
+class TestListFromIndex:
+    """`L <n>` lists messages from #n and older (helps slow-path users)."""
+
+    async def _collect_listing(self, c: BbsTestClient) -> str:
+        """Collect a (possibly paginated) listing until the menu prompt,
+        dismissing each paging prompt with a space."""
+        full = ""
+        for _ in range(50):
+            chunk = await c.wait_for(r"Q=Stop|Enter choice:", regex=True)
+            full += chunk
+            if "Enter choice:" in chunk:
+                return full
+            await c.sendln(" ")
+        return full
+
+    async def test_list_from_index_filters_newer(self, bbs_server: _BbsServerHandle):
+        db_path = str(bbs_server.engine.cfg.db_path)
+        async with aiosqlite.connect(db_path) as db:
+            area_row = await (await db.execute(
+                "SELECT id FROM bulletin_areas ORDER BY id LIMIT 1"
+            )).fetchone()
+            area_id = area_row[0]
+            nums = []
+            for subj in ("LIDXOLD", "LIDXMID", "LIDXNEW"):
+                nrow = await (await db.execute(
+                    "SELECT COALESCE(MAX(msg_number),0)+1 "
+                    "FROM bulletin_messages WHERE area_id=?", (area_id,),
+                )).fetchone()
+                n = nrow[0]
+                await db.execute(
+                    "INSERT INTO bulletin_messages "
+                    "(area_id, msg_number, subject, from_call, to_call, body, authenticated) "
+                    "VALUES (?,?,?,?,?,?,1)",
+                    (area_id, n, subj, "W1AAA", "ALL", "body"),
+                )
+                await db.commit()
+                nums.append(n)
+        _old, mid_n, _new = nums
+
+        async with BbsTestClient(bbs_server.host, bbs_server.port) as c:
+            await c.do_login("W1LIDX")
+            await c.sendln("BU")
+            await c.wait_for(BULL_PROMPT)
+            await _select_area(c, 1)
+            await c.sendln(f"L {mid_n}")
+            text = await self._collect_listing(c)
+            assert "LIDXMID" in text        # at the index → shown
+            assert "LIDXOLD" in text        # older → shown
+            assert "LIDXNEW" not in text    # newer → filtered out
+            await c.sendln("Q")
+            await c.wait_for(">")
