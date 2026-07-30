@@ -122,6 +122,21 @@ _DEFAULT_TTL: int = 25
 # clamped to this ceiling.
 _MAX_WINDOW: int = 7
 
+# Maximum number of concurrent circuits on one crosslink — bounded by the
+# 1-byte circuit-index space (0–255).  A CONNECT REQ that arrives when the
+# table is full is refused with a CONNECT ACK + CHOKE (see
+# NetromCircuitManager._send_connect_refusal) rather than raising, so a
+# misbehaving neighbor cannot take the whole transport down and the
+# originator learns immediately instead of timing out.
+_MAX_LOCAL_CIRCUITS: int = 256
+
+# Ceiling on the inbound MORE_FOLLOWS reassembly buffer.  A peer that keeps
+# setting MORE_FOLLOWS and never sends a terminating fragment would otherwise
+# grow the buffer without bound.  64 KiB is orders of magnitude above any
+# legitimate BBS message (bulletins cap at a few KiB), so hitting it means the
+# peer is broken or hostile — we drop the partial rather than accumulate.
+_MAX_REASSEMBLY_BYTES: int = 64 * 1024
+
 
 class CircuitState(IntEnum):
     """Lifecycle states of one NETROM circuit."""
@@ -430,13 +445,25 @@ class NetromCircuit:
     # ── Inbound: handle decoded L3 frames ────────────────────────────────────
 
     def handle_information(self, frame: Information) -> None:
-        # Reassembly: stash and wait for non-MORE_FOLLOWS to flush.
-        self._reassembly.extend(frame.info)
-        if not frame.header.more_follows:
-            payload = bytes(self._reassembly)
+        if len(self._reassembly) + len(frame.info) > _MAX_REASSEMBLY_BYTES:
+            # A MORE_FOLLOWS run that never terminates — drop the partial to
+            # keep memory bounded.  We still ACK below so the peer's send
+            # window keeps advancing rather than wedging on this circuit.
+            logger.warning(
+                "netrom: circuit %d/%d reassembly exceeded %d bytes without a "
+                "terminating fragment — dropping partial message from %s",
+                self.local_idx, self.local_id, _MAX_REASSEMBLY_BYTES,
+                self.origin_node_call,
+            )
             self._reassembly.clear()
-            if payload:
-                self.reader.feed_data(payload)
+        else:
+            # Reassembly: stash and wait for non-MORE_FOLLOWS to flush.
+            self._reassembly.extend(frame.info)
+            if not frame.header.more_follows:
+                payload = bytes(self._reassembly)
+                self._reassembly.clear()
+                if payload:
+                    self.reader.feed_data(payload)
         # Advance V(R) and ACK.  We don't enforce strict ordering in V1 —
         # AX.25 ARQ underneath delivers in-order, and out-of-order at NETROM
         # would imply a multi-hop path with reordering, which is rare.
@@ -600,10 +627,13 @@ class NetromCircuitManager:
     # ── Allocation ───────────────────────────────────────────────────────────
 
     def _allocate_local_idx(self) -> int:
-        for i in range(256):
+        for i in range(_MAX_LOCAL_CIRCUITS):
             if i not in self._used_local_idx:
                 self._used_local_idx.add(i)
                 return i
+        # Callers on the inbound path pre-check capacity and refuse the
+        # CONNECT REQ gracefully, so this is a backstop for the (unused)
+        # originate path only.
         raise RuntimeError("netrom circuit table full (256 local indices in use)")
 
     def _allocate_local_id(self) -> int:
@@ -650,6 +680,31 @@ class NetromCircuitManager:
             # local idx/id — that's the lookup key.
             circuit.handle_connect_ack(frame)
 
+    def _send_connect_refusal(self, req: ConnectRequest) -> None:
+        """Refuse an inbound CONNECT REQ without allocating a circuit.
+
+        Sends a CONNECT ACK with the refusal (CHOKE) bit set so the
+        originator learns the node cannot accept the circuit right now
+        (e.g. the circuit table is full) instead of timing out.  Echoes
+        the originator's idx/id so they can match it to their pending
+        request; the seq slots are 0/0 because no local circuit exists.
+        """
+        if self._ax25_writer.is_closing():
+            return
+        header = L3Header(
+            origin_call  = self._local_call,
+            dest_call    = req.origin_node_call,
+            ttl          = self._default_ttl,
+            circuit_idx  = req.header.circuit_idx,
+            circuit_id   = req.header.circuit_id,
+            tx_seq       = 0,
+            rx_seq       = 0,
+            opcode_flags = OPCODE_CONNECT_ACK | FLAG_CHOKE,
+        )
+        self._ax25_writer.write(
+            encode_l3_frame(header, encode_connect_ack_tail(0))
+        )
+
     async def _handle_connect_request(self, frame: ConnectRequest) -> None:
         remote_key = (frame.header.circuit_idx, frame.header.circuit_id)
 
@@ -662,6 +717,18 @@ class NetromCircuitManager:
                 *remote_key,
             )
             existing._send_connect_ack(existing.accepted_window)
+            return
+
+        # Refuse gracefully when the local circuit table is full instead of
+        # raising out of dispatch (which would bounce the whole transport).
+        if len(self._used_local_idx) >= _MAX_LOCAL_CIRCUITS:
+            logger.warning(
+                "netrom: circuit table full (%d in use) — refusing CONNECT REQ "
+                "from user %s (origin %s) via %s",
+                _MAX_LOCAL_CIRCUITS, frame.user_call,
+                frame.origin_node_call, self._via_node,
+            )
+            self._send_connect_refusal(frame)
             return
 
         accepted_window = max(1, min(_MAX_WINDOW, frame.proposed_window))

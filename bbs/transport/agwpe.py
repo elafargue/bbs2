@@ -678,7 +678,20 @@ class AGWPETransport(Transport):
                     )
                     break
 
-            await self._dispatch(kind, port, call_from, call_to, pid, payload, writer)
+            # Isolate per-frame failures: a malformed frame or a bug in one
+            # session's handling must not tear down the whole read loop (which
+            # would drop every connected user and bounce the TCP link).  Log
+            # and move on; only cancellation propagates.
+            try:
+                await self._dispatch(kind, port, call_from, call_to, pid, payload, writer)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "agwpe: error dispatching %r frame from %s→%s (port %d) — "
+                    "dropping frame, transport stays up",
+                    kind, call_from, call_to, port,
+                )
 
         logger.info(
             "agwpe read loop ended after %d frames — TCP connection closed, %d sessions active",

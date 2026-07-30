@@ -228,6 +228,30 @@ class TestConnectRequest:
         await asyncio.sleep(0)
 
 
+class TestCircuitTableFull:
+    async def test_connect_req_refused_when_table_full(self, setup):
+        mgr, ax25, sessions = setup
+        # Saturate the 1-byte local circuit-index space.
+        mgr._used_local_idx.update(range(256))
+        # Must NOT raise — a raise out of dispatch would bounce the whole
+        # AGWPE transport and drop every connected user.
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes(cidx=7, cid=8)))
+        await asyncio.sleep(0)
+        # No circuit opened, no BBS session started.
+        assert mgr.circuit_count == 0
+        assert len(sessions.connections) == 0
+        # A single CONNECT ACK with the refusal (CHOKE) bit was sent back.
+        assert len(ax25.frames) == 1
+        f = decode_l3_frame(ax25.frames[0])
+        assert isinstance(f, ConnectAck)
+        assert f.refused
+        # Refusal echoes the originator's idx/id so they can match it to
+        # their pending request.
+        header = decode_l3_header(ax25.frames[0])
+        assert header.circuit_idx == 7
+        assert header.circuit_id == 8
+
+
 # ── INFORMATION handling ─────────────────────────────────────────────────────
 
 class TestInformation:
@@ -295,6 +319,24 @@ class TestInformation:
         await mgr.dispatch(self._info(circuit, b"baz", more_follows=False))
         data = await asyncio.wait_for(circuit.reader.read(9), timeout=1.0)
         assert data == b"foobarbaz"
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_reassembly_buffer_is_bounded(self, setup):
+        """A never-terminating MORE_FOLLOWS run must not grow memory without
+        bound — the partial is dropped once it exceeds the ceiling."""
+        from bbs.netrom.circuit import _MAX_REASSEMBLY_BYTES
+        mgr, _, sessions = setup
+        circuit = await self._connect(setup)
+        chunk = b"A" * 4096
+        # Feed more MORE_FOLLOWS fragments than the ceiling allows, never
+        # sending a terminating fragment.
+        n = (_MAX_REASSEMBLY_BYTES // len(chunk)) + 5
+        for _ in range(n):
+            await mgr.dispatch(self._info(circuit, chunk, more_follows=True))
+            assert len(circuit._reassembly) <= _MAX_REASSEMBLY_BYTES
+        # Nothing was flushed to the BBS reader (no terminating fragment).
+        assert circuit.reader._buffer.__len__() == 0
         sessions.release_all()
         await asyncio.sleep(0)
 

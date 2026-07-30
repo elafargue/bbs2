@@ -680,3 +680,54 @@ class TestHopCountFromMonitoredSABM:
             "S", 0, "W6ELA-7", "N0CALL-1", 0, text.encode("ascii"), self.fake_writer,  # type: ignore[arg-type]
         )
         assert "W6ELA-7" not in self.transport._pending_hop_counts
+
+
+class TestReadLoopIsolatesDispatchErrors:
+    """A failure handling one frame must not tear down the whole read loop
+    (which would drop every connected user and bounce the TCP link)."""
+
+    async def test_dispatch_exception_does_not_kill_read_loop(self):
+        transport = _make_transport()
+        transport._running = True
+        transport._drain_lock = asyncio.Lock()
+
+        calls: list[str] = []
+
+        async def _boom_then_ok(kind, port, call_from, call_to, pid, payload, writer):
+            calls.append(kind)
+            if len(calls) == 1:
+                raise RuntimeError("simulated per-frame dispatch failure")
+
+        transport._dispatch = _boom_then_ok  # type: ignore[assignment]
+
+        reader = asyncio.StreamReader()
+        _feed_frames(
+            reader,
+            _build_frame(0, "C", "W6ELA-7", "N0CALL-1"),
+            _build_frame(0, "d", "W6ELA-7", "N0CALL-1"),
+        )
+
+        # Should return normally when the reader hits EOF — NOT propagate the
+        # RuntimeError raised while dispatching the first frame.
+        await transport._read_loop(reader, _FakeWriter())  # type: ignore[arg-type]
+
+        # Both frames were dispatched: the exception on the first did not
+        # abort processing of the second.
+        assert calls == ["C", "d"]
+
+    async def test_cancellation_still_propagates(self):
+        """CancelledError must escape the guard so the loop can be torn down."""
+        transport = _make_transport()
+        transport._running = True
+        transport._drain_lock = asyncio.Lock()
+
+        async def _cancel(kind, port, call_from, call_to, pid, payload, writer):
+            raise asyncio.CancelledError()
+
+        transport._dispatch = _cancel  # type: ignore[assignment]
+
+        reader = asyncio.StreamReader()
+        _feed_frames(reader, _build_frame(0, "C", "W6ELA-7", "N0CALL-1"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await transport._read_loop(reader, _FakeWriter())  # type: ignore[arg-type]
