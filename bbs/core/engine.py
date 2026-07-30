@@ -22,12 +22,14 @@ import queue as stdlib_queue
 from concurrent.futures import Future as ConcurrentFuture
 
 from bbs.config import BBSConfig
-from bbs.core.auth import AuthService
+from bbs.core.auth import AuthLevel, AuthService
 from bbs.core.plugin_registry import PluginRegistry
 from bbs.core.session import BBSSession, SessionState
 from bbs.db.connections import prune_old_connections, upsert_connection
 from bbs.db.schema import init_db
 from bbs.netrom.router import NetromRouter
+from bbs.services.bridge import run_service
+from bbs.services.dispatcher import ServiceAction, ServiceDispatcher, ServiceRoute
 from bbs.transport import build_transports
 from bbs.transport.base import Connection
 
@@ -54,6 +56,14 @@ class BBSEngine:
         # Active sessions: session_id → BBSSession
         self._sessions: dict[str, BBSSession] = {}
         self._session_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # ax25d-style external-service hosting (built in run()).
+        self._services: Optional[ServiceDispatcher] = None
+        # Active external-service sessions: id → (Connection, ServiceRoute)
+        self._service_sessions: dict[str, Any] = {}
+        # Live transports (set in run()) — used by reload_services() to refresh
+        # the registered service SSIDs when the config changes via the web UI.
+        self._transports: list = []
 
         # Thread-safe queue → Flask-SocketIO bridge thread consumes this
         # Event dicts: {"type": "user_connected"|"user_disconnected"|"log", ...}
@@ -101,6 +111,7 @@ class BBSEngine:
 
         # Start transports
         transports = build_transports(self.cfg)
+        self._transports = transports
         if not transports:
             logger.warning("No transports enabled! Check bbs.yaml.")
 
@@ -187,6 +198,20 @@ class BBSEngine:
                 netrom_alias if netrom_alias else "(listen-only, no alias set)",
             )
 
+        # Wire ax25d-style external-service hosting.  The dispatcher routes an
+        # inbound connection (by called SSID) to an external program instead of
+        # the internal BBS; register its service SSIDs so transports accept
+        # connects to them (must happen before start()).
+        self._services = ServiceDispatcher(self.cfg.services or {})
+        if self._services.enabled:
+            svc_calls = self._services.route_callsigns()
+            for t in transports:
+                t.set_extra_callsigns(svc_calls)
+            logger.info(
+                "services: external-service dispatch enabled — %d route(s): %s",
+                len(svc_calls), ", ".join(svc_calls),
+            )
+
         transport_tasks = [
             asyncio.create_task(t.start(self._on_connection), name=f"transport:{t.transport_id}")
             for t in transports
@@ -248,6 +273,22 @@ class BBSEngine:
 
     async def _on_connection(self, conn: Connection) -> None:
         """Called by each transport when a new connection arrives."""
+        # ax25d-style dispatch: route to an external program by called SSID,
+        # BEFORE any BBS banner/menu is emitted.
+        if self._services is not None and self._services.enabled:
+            decision = self._services.match(conn)
+            if decision.action is ServiceAction.REFUSE:
+                logger.info(
+                    "services: refusing %s → %s (%s)",
+                    conn.remote_addr, conn.local_addr, decision.reason,
+                )
+                await conn.close()
+                return
+            if decision.action is ServiceAction.EXEC and decision.route is not None:
+                await self._run_external_service(conn, decision.route)
+                return
+            # PASS → fall through to the internal BBS below.
+
         # Enforce max users
         if self.cfg.max_users > 0 and len(self._sessions) >= self.cfg.max_users:
             logger.warning(
@@ -333,6 +374,66 @@ class BBSEngine:
                 f"DISCONNECT {session.remote_addr} "
                 f"(online {int(time.time() - session.connected_at)}s)"
             )
+
+    async def _run_external_service(self, conn: Connection, route: ServiceRoute) -> None:
+        """Bridge *conn* to an external program (ax25d-style), enforcing the
+        service-session cap and journaling the connection (unless quiet)."""
+        assert self._services is not None
+        if len(self._service_sessions) >= self._services.max_sessions:
+            logger.warning(
+                "services: max_sessions (%d) reached — refusing %s → %s",
+                self._services.max_sessions, conn.remote_addr, route.called,
+            )
+            await conn.close()
+            return
+
+        argv = self._services.build_argv(route, conn)
+        sid = f"svc-{id(conn):x}"
+        self._service_sessions[sid] = (conn, route)
+        connected_at = time.time()
+        if not route.quiet:
+            self._emit_log(
+                f"SERVICE {conn.remote_addr} → {route.called} exec {route.exec_path}"
+            )
+        try:
+            await run_service(conn, route, argv)
+        finally:
+            self._service_sessions.pop(sid, None)
+            if not route.quiet:
+                if conn.remote_addr and self.cfg.connection_log_days != 0:
+                    try:
+                        await upsert_connection(
+                            str(self.cfg.db_path),
+                            callsign=conn.remote_addr,
+                            transport=f"service:{route.called}",
+                            connected_at=connected_at,
+                            auth_level=AuthLevel.IDENTIFIED.value,
+                            connected=0,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to record service connection for %s", conn.remote_addr
+                        )
+                self._emit_log(
+                    f"SERVICE-END {conn.remote_addr} → {route.called} "
+                    f"(online {int(time.time() - connected_at)}s)"
+                )
+
+    def reload_services(self) -> None:
+        """Rebuild the service dispatcher from ``self.cfg.services`` and refresh
+        the SSID registration list on transports.
+
+        Safe to call from the web thread: the dispatcher is swapped by an
+        atomic reference assignment, so an in-flight ``match()`` on the asyncio
+        loop always sees a consistent table.  Routing/lockout/flag changes take
+        effect immediately; a *newly added* service SSID is registered with the
+        radio on the next transport (re)connect (or a restart).
+        """
+        self._services = ServiceDispatcher(self.cfg.services or {})
+        svc_calls = self._services.route_callsigns() if self._services.enabled else []
+        for t in self._transports:
+            t.set_extra_callsigns(svc_calls)
+        logger.info("services: reloaded — %d route(s)", len(svc_calls))
 
     # ── Event bridge ──────────────────────────────────────────────────────────
 

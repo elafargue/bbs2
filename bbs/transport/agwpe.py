@@ -471,6 +471,11 @@ class AGWPETransport(Transport):
         # matches NORCAL convention of PACLEN=128.
         self._netrom_info_mtu: int = 108
 
+        # Additional callsign-SSIDs to register with AGWPE (beyond the BBS
+        # callsign) so callers can reach ax25d-style external services on
+        # those SSIDs.  Populated via set_extra_callsigns() before start().
+        self._extra_callsigns: list[str] = []
+
     def set_netrom_nodes_interval(self, seconds: int) -> None:
         self._netrom_nodes_interval = max(60, seconds)
 
@@ -505,6 +510,23 @@ class AGWPETransport(Transport):
         ``_netrom_info_mtu`` for the rationale.
         """
         self._netrom_info_mtu = max(1, int(mtu))
+
+    def set_extra_callsigns(self, calls: list[str]) -> None:
+        """Register extra callsign-SSIDs to accept (ax25d-style services).
+
+        Each is registered with AGWPE via its own 'X' frame in start() so
+        Direwolf routes inbound connects for those SSIDs to us; the incoming
+        'C' then carries the service SSID as ``call_to`` for the dispatcher.
+        The BBS callsign itself is always registered and need not be listed.
+        """
+        seen = {self._local_call.upper()}
+        out: list[str] = []
+        for c in calls:
+            cu = str(c).upper().strip()
+            if cu and cu not in seen:
+                seen.add(cu)
+                out.append(cu)
+        self._extra_callsigns = out
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -551,6 +573,14 @@ class AGWPETransport(Transport):
                 writer.write(
                     _build_frame(self._agw_port, "X", self._local_call, "")
                 )
+                # Register any extra service SSIDs (ax25d-style hosting) so
+                # Direwolf also routes connects for those to us.
+                for _svc_call in self._extra_callsigns:
+                    writer.write(
+                        _build_frame(self._agw_port, "X", _svc_call, "")
+                    )
+                    logger.info("agwpe: registering service callsign %s on port %d",
+                                _svc_call, self._agw_port)
                 await asyncio.wait_for(writer.drain(), timeout=30)
 
                 assert self._drain_lock is not None
@@ -766,8 +796,15 @@ class AGWPETransport(Transport):
                 call_from, len(self._sessions) + 1,
             )
             assert self._drain_lock is not None
+            # Source outbound frames from the callsign the caller actually
+            # dialed (``call_to``), NOT the fixed BBS callsign.  For a service
+            # SSID (ax25d-style hosting) the connected-mode stream at the TNC is
+            # keyed on that SSID; sending replies from the BBS callsign instead
+            # leaves Direwolf unable to match them to the stream and it silently
+            # drops all output.  For a normal BBS connect, call_to == the BBS
+            # callsign, so this is a no-op there.
             sess = _AGWPESession(
-                call_from, self._local_call, port, writer,
+                call_from, call_to, port, writer,
                 self._drain_lock, self._write_timeout,
             )
             self._sessions[key] = sess
@@ -777,6 +814,7 @@ class AGWPETransport(Transport):
                 writer=sess.writer,       # type: ignore[arg-type]
                 transport_id=self.transport_id,
                 hop_count=self._pending_hop_counts.pop(call_from.upper(), 0),
+                local_addr=call_to,       # which of our SSIDs the caller dialed
             )
             sess.connection = conn
             assert self._on_connect is not None

@@ -34,6 +34,7 @@ class BBSConfig:
     web: dict[str, Any]
     logging: dict[str, Any]
     netrom: dict[str, Any]
+    services: dict[str, Any]
 
     @property
     def full_callsign(self) -> str:
@@ -116,6 +117,7 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
         web=raw.get("web", {}),
         logging=raw.get("logging", {}),
         netrom=raw.get("netrom", {}),
+        services=raw.get("services", {}),
     )
 
 

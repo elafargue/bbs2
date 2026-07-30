@@ -28,12 +28,18 @@ class Connection:
     reader:       asyncio.StreamReader for data arriving from the peer.
     writer:       asyncio.StreamWriter for data to send to the peer.
     transport_id: Short human-readable label for logging ("kernel_ax25", "kiss_tcp", …)
+    local_addr:   The *called* address — which of our callsign-SSIDs (AX.25) or
+                  NET/ROM destination the peer connected to.  Empty when the
+                  transport does not distinguish (e.g. TCP).  Used by the
+                  service dispatcher to route a connection to an external
+                  program vs. the internal BBS.
     """
     remote_addr: str
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     transport_id: str
     hop_count: int = 0
+    local_addr: str = ""
 
     async def send(self, data: bytes) -> None:
         """Write *data* to the peer and drain the buffer."""
@@ -135,6 +141,15 @@ class Transport(ABC):
 
         Default-implementation no-op; AGWPE overrides.  Should be at
         most (TNC PACLEN − 20-byte L3 header).
+        """
+
+    def set_extra_callsigns(self, calls: list[str]) -> None:
+        """Register additional callsign-SSIDs this transport should accept.
+
+        Used by the service dispatcher (ax25d-style hosting): each SSID that
+        maps to an external program must be accepted in addition to the BBS
+        callsign so callers can connect to it.  Default no-op; transports
+        that register callsigns with an external engine (AGWPE) override.
         """
 
     @abstractmethod

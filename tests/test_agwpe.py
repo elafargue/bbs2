@@ -326,6 +326,24 @@ class TestAGWPETransportDispatch:
         )
         assert (0, "W6ELA-7") in self.transport._sessions
 
+    async def test_outbound_frames_sourced_from_called_ssid(self):
+        """Outbound frames must be sourced from the callsign the caller dialed
+        (call_to), not the fixed BBS callsign — otherwise Direwolf can't match
+        them to the connected-mode stream for a service SSID and drops all
+        output. (transport local call here is N0CALL-1; caller dialed W6ELA-9.)"""
+        await self.transport._dispatch(
+            "C", 0, "W6ELA-15", "W6ELA-9", 0, b"", self.fake_writer,  # type: ignore
+        )
+        sess = self.transport._sessions[(0, "W6ELA-15")]
+        assert sess.writer._local == "W6ELA-9"
+        # A real outbound 'D' frame carries CallFrom=W6ELA-9, CallTo=W6ELA-15.
+        self.fake_writer.written.clear()
+        sess.writer.write(b"hi")
+        hdr = _unpack_header(bytes(self.fake_writer.written))
+        assert hdr["kind"] == "D"
+        assert hdr["call_from"] == "W6ELA-9"
+        assert hdr["call_to"] == "W6ELA-15"
+
     async def test_data_frame_feeds_reader(self):
         """'D' frames are fed into the session's StreamReader."""
         # First create the session via 'C'

@@ -229,6 +229,54 @@ netrom:
   # Check your direwolf.conf for `PACLEN` and set accordingly.
   info_mtu: 108
 
+# ─── External services (ax25d-style hosting) ──────────────────────────────────
+# Route an inbound connection to an EXTERNAL PROGRAM based on the callsign-SSID
+# the caller dialed — the userspace replacement for the Linux `ax25d` daemon
+# (which stops working once the kernel AX.25 stack is removed).  A caller who
+# connects to a mapped SSID is handed straight to the program (no BBS menu),
+# with the connection wired to the program's stdin/stdout.  Requires the AGWPE
+# transport for direct AX.25 callers; NET/ROM users are dispatched too (keyed
+# on the L3 destination they reach us on).
+#
+# The program runs as the bbs service user with a MINIMAL environment (a PATH
+# only — enough for a `#!/usr/bin/env python3` shebang to resolve; extend it per
+# route with `env:` below).  Per-connection context is passed via argv using
+# ax25d-compatible %-substitution:
+#   %u/%U  caller callsign without SSID (lower/upper)
+#   %s/%S  caller callsign with SSID (lower/upper)
+#   %d     transport/port label       %%  literal '%'
+#
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ LINE ENDINGS: set `crlf: true` for any line-oriented program (most scripts, │
+# │ anything using readline/fgets/input()).  AX.25 sends a bare CR, not LF, so  │
+# │ without translation such a program blocks forever on its first read and     │
+# │ NEVER RESPONDS (connects fine, then silence).  Leave `false` only for       │
+# │ programs that speak raw AX.25 CR themselves (node, FBB, …).                  │
+# └───────────────────────────────────────────────────────────────────────────┘
+services:
+  enabled: false                  # master switch
+  # Callsigns to always refuse on a service SSID (ax25d 'L'/NOCALL idiom).
+  lockout: [NOCALL, N0CALL]
+  # Cap on concurrent external-program sessions (fork-bomb guard).
+  max_sessions: 10
+  routes:
+    # Each key is a callsign-SSID that callers dial.  It must NOT be the BBS's
+    # own callsign (that goes to the internal BBS).
+    "N0CALL-2":
+      exec: /usr/bin/xfbbd        # absolute path required
+      args: ["xfbbd", "%U"]       # argv incl. argv[0]; %-substituted
+      min_auth: identified        # none | identified   (OTP-gating not yet supported)
+      no_digi: false              # ax25d 'D' — refuse if arrived via a digipeater
+      quiet: false                # ax25d 'Q' — suppress connection logging
+      crlf: true                  # translate LF <-> CR (see the box above)
+      idle_timeout: 600           # reap a silent session after N seconds (0 = off)
+      env:                        # optional; layered on top of the minimal PATH
+        TERM: dumb
+    "N0CALL-3":
+      exec: /usr/sbin/node        # ax25-apps node front-end (speaks raw CR)
+      args: ["node"]
+      crlf: false
+
 logging:
   level: "INFO"     # DEBUG, INFO, WARNING, ERROR
   # Optional file path; leave blank to log to stdout only

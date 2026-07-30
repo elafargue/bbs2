@@ -745,6 +745,9 @@ class NetromCircuitManager:
             reader       = circuit.reader,
             writer       = circuit.writer,        # type: ignore[arg-type]
             transport_id = "netrom",
+            # The L3 destination the user asked to reach (our node call/SSID),
+            # so the service dispatcher can route NET/ROM users by called SSID.
+            local_addr   = frame.header.dest_call,
         )
         task = asyncio.create_task(
             self._run_user_session(circuit, conn),

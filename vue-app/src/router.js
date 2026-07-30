@@ -12,6 +12,7 @@ const routes = [
   { path: '/chat',      component: () => import('./views/ChatRooms.vue') },
   { path: '/heard',     component: () => import('./views/HeardConfig.vue') },
   { path: '/info',      component: () => import('./views/InfoEditor.vue') },
+  { path: '/services',  component: () => import('./views/Services.vue') },
   { path: '/login',     component: () => import('./views/Login.vue') },
 ]
 

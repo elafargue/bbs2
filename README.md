@@ -20,6 +20,7 @@ Welcome, W1AW-7!
 - **Multiple AX.25 transports** — KISS serial, KISS TCP (Dire Wolf), Linux kernel AF_AX25, and AGWPE/AGW Packet Engine
 - **TCP transport** for Telnet access and local development
 - **NET/ROM networking** — learns network topology from NODES broadcasts, advertises a node alias, and accepts inbound L3 connections routed through the NET/ROM mesh (AGWPE transport)
+- **External-service hosting** — an `ax25d` replacement: route callers by callsign-SSID straight to external programs (FBB, `node`, games…) over stdin/stdout, in userspace with no kernel AX.25 stack
 - **Bulletin Board** — threaded messages organized into areas with per-area read/post access levels
 - **Multi-room Chat** — broadcast chat with private messaging and room history
 - **Heard stations** — logs every station heard on the air, with a web map and a network-topology graph
@@ -287,6 +288,40 @@ netrom:
                             # dropped. 108 suits PACLEN 128 (NORCAL/KPC-3 default).
 ```
 
+### `services:` — external-service hosting (ax25d replacement)
+
+The Linux kernel's AX.25/NET/ROM stack is being removed from mainline, which takes `ax25d` — the `inetd`-style daemon hams use to expose FBB, `node`, DXSpider, games, etc. per callsign-SSID — down with it (`ax25d` `bind()`s kernel `AF_AX25` sockets). bbs2 reproduces the ax25d role **in userspace over Direwolf/AGWPE**, so no kernel stack is needed.
+
+When a caller connects to a **mapped callsign-SSID**, bbs2 hands the connection straight to the configured external program (no BBS menu), wiring the connection to the program's **stdin/stdout**. Callers to unmapped SSIDs get the internal BBS as usual. NET/ROM users are dispatched too (keyed on the L3 destination they reach you on).
+
+Close to ax25d: the program runs as the bbs service user with a **minimal environment** (a `PATH` only, so `#!/usr/bin/env` shebangs resolve — extend it per route with `env:`); per-connection context is passed **via argv `%`-substitution** — `%u`/`%U` (caller call w/o SSID, lower/upper), `%s`/`%S` (with SSID), `%d` (port label), `%%` (literal `%`).
+
+> ⚠️ **Line endings — the #1 gotcha.** AX.25 terminates lines with a bare **CR**, not LF. Set **`crlf: true`** for any line-oriented program (most scripts, anything using `readline`/`fgets`/`input()`): without translation it blocks forever on its first read and **never responds** — the connection succeeds, then goes silent. Leave `crlf: false` only for programs that handle raw CR themselves (`node`, FBB, …).
+
+```yaml
+services:
+  enabled: true
+  lockout: [NOCALL, N0CALL]   # always refuse these (ax25d 'L' / NOCALL idiom)
+  max_sessions: 10            # cap on concurrent external sessions
+  routes:
+    "W6ELA-2":                # a callsign-SSID callers dial (not the BBS's own)
+      exec: /usr/bin/xfbbd    # absolute path required
+      args: ["xfbbd", "%U"]   # argv incl. argv[0]; %-substituted
+      min_auth: identified    # none | identified  (OTP-gating not yet supported)
+      no_digi: false          # ax25d 'D' — refuse if arrived via a digipeater
+      quiet: false            # ax25d 'Q' — suppress connection logging
+      crlf: true              # translate LF <-> CR — see the warning above
+      idle_timeout: 600       # reap a silent session after N seconds (0 = off)
+      env:                    # optional; layered on top of the minimal PATH
+        TERM: dumb
+    "W6ELA-3":
+      exec: /usr/sbin/node    # ax25-apps node front-end (speaks raw CR)
+      args: ["node"]
+      crlf: false
+```
+
+> Requires the `agwpe` transport for direct AX.25 callers (bbs2 registers each service SSID with Direwolf, and sources replies from that SSID so the connected-mode stream matches). Programs run with bbs2's privileges — there is no per-route `uid`/setuid (that would need root); this is the one deliberate difference from ax25d.
+
 ### `logging:`
 
 ```yaml
@@ -426,6 +461,9 @@ Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests run wit
 | `tests/test_netrom_circuit.py` | NET/ROM L4 circuit state machine and windowing |
 | `tests/test_netrom_l3.py`, `test_netrom_l3_integration.py` | L3 CONNECT handling end-to-end |
 | `tests/test_heard.py`, `test_heard_graph.py`, `test_heard_map.py` | Heard-station logging, schema, graph/map data |
+| `tests/test_services_dispatcher.py` | ax25d route matching, lockout, no_digi, argv %-subst |
+| `tests/test_services_bridge.py` | Subprocess bridge: byte flow, teardown, env isolation, idle reap |
+| `tests/test_services_engine.py` | Engine dispatch (EXEC/REFUSE/PASS) and max_sessions cap |
 
 ### Project layout
 
@@ -448,6 +486,9 @@ bbs/
   netrom/
     router.py          NODES routing table and NODES broadcast building
     circuit.py         NET/ROM L4 circuit state machine (CONNECT/INFO/DISC)
+  services/
+    dispatcher.py      ax25d-style routing: called SSID → external program
+    bridge.py          Wire a connection to a subprocess's stdin/stdout
   plugins/
     bulletins/         Bulletin board plugin
     chat/              Multi-room chat plugin

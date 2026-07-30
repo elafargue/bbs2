@@ -13,6 +13,7 @@ const navItems = [
   { title: 'Dashboard',  icon: 'mdi-view-dashboard',   to: '/'         },
   { title: 'Users',      icon: 'mdi-account-group',    to: '/users'    },
   { title: 'Plugins',    icon: 'mdi-puzzle',           to: '/plugins'  },
+  { title: 'Services',   icon: 'mdi-lan-connect',      to: '/services' },
   { title: 'Activity',   icon: 'mdi-text-box-outline', to: '/activity' },
   { title: 'Terminal',   icon: 'mdi-console',          to: '/terminal' },
 ]
