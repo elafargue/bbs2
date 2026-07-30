@@ -712,7 +712,7 @@ class BulletinsPlugin(BBSPlugin):
         db = session.db
         # Auth check — radio and web transports trust the caller's identity already;
         # TCP/Telnet users must have passed OTP (AUTHENTICATED) to post.
-        _TRUSTED_TRANSPORTS = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "web")
+        _TRUSTED_TRANSPORTS = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "netrom", "web")
         via_trusted = session.conn.transport_id in _TRUSTED_TRANSPORTS
         if not (via_trusted and session.auth.is_identified) and not session.auth.is_authenticated:
             await term.sendln(

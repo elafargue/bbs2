@@ -36,61 +36,75 @@ let map     = null
 let markersLayer = null
 let edgesLayer   = null
 
+import { NODE_COLORS, RF_EDGE_COLOR, NETROM_EDGE_COLOR }
+  from '../utils/colorScheme'
+
+// Map markers are smaller than the force-graph nodes; sizing is owned here.
 const NODE_CFG = {
-  bbs:     { color: '#F59E0B', radius: 14, weight: 2.5 },
-  digi:    { color: '#3B82F6', radius: 10, weight: 2.0 },
-  both:    { color: '#10B981', radius: 10, weight: 2.0 },
-  station: { color: '#6B7280', radius:  7, weight: 1.5 },
+  bbs:     { color: NODE_COLORS.bbs.fill,     radius: 14, weight: 2.5 },
+  digi:    { color: NODE_COLORS.digi.fill,    radius: 10, weight: 2.0 },
+  both:    { color: NODE_COLORS.both.fill,    radius: 10, weight: 2.0 },
+  station: { color: NODE_COLORS.station.fill, radius:  7, weight: 1.5 },
+  netrom:  { color: NODE_COLORS.netrom.fill,  radius: 10, weight: 2.0 },
 }
-const DEFAULT_CFG = { color: '#6B7280', radius: 7, weight: 1.5 }
+const DEFAULT_CFG = { color: NODE_COLORS.station.fill, radius: 7, weight: 1.5 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Build a lookup of callsign → {lat, lon, type} for stations with coordinates.
  *
- * Type resolution priority:
- *   1. graphData.nodes[callsign].type  — computed from confirmed RF paths (most accurate)
- *   2. source === 'via'               — relay-only node, call it 'digi' even if not in a
- *                                       confirmed path (e.g. unstarred in all frames seen)
- *   3. default                        — 'station'
+ * Type resolution priority (per callsign):
+ *   1. graphData.nodes[callsign].type — computed from confirmed RF heard_paths (most
+ *      accurate; correctly reflects Ka-Node merges since paths are re-attributed)
+ *   2. kanode_alias set — station acts as a digi even if its own transport is non-empty
+ *   3. transport === '' with source === 'heard' — directly-heard digi relay ('both')
+ *   4. transport === '' — relay/digi only
+ *   5. default — 'station'
  *
- * A callsign may have multiple rows (different transports). We group by
- * callsign first, then:
- *   - transport === '' rows are relay nodes (seeded from via paths)
- *   - source === 'heard' on a transport='' row means it was the last-starred
- *     digi (BBS received RF directly from it) — show as 'both' (green)
+ * After a Ka-Node merge (e.g. K6FB absorbs KROCK), other stations' via-paths still
+ * contain 'KROCK' as the intermediate hop because the historical path strings are not
+ * rewritten.  We add alias entries to coordMap so that graph edge lookups for the old
+ * Ka-Node alias automatically resolve to the owning callsign's coordinates.
  */
 function buildCoordMap() {
   const coordMap = {}
   if (!props.stations) return coordMap
   const bbs = props.graphData?.bbs ?? null
 
-  // Group rows by callsign
-  const byCall = {}
   for (const s of props.stations) {
-    if (!byCall[s.callsign]) byCall[s.callsign] = []
-    byCall[s.callsign].push(s)
-  }
+    if (s.lat == null || s.lon == null) continue
+    const callsign = s.callsign.toUpperCase()
 
-  for (const [callsign, rows] of Object.entries(byCall)) {
-    const withCoords = rows.filter(r => r.lat != null && r.lon != null)
-    if (!withCoords.length) continue
-    // Prefer the non-relay row for coordinates (it's the primary heard record)
-    const s = withCoords.find(r => r.transport !== '') ?? withCoords[0]
+    // 1. Use graph-computed type when available
+    const graphType = props.graphData?.nodes?.[callsign]?.type
 
-    // A node is a relay if it has any transport='' row (via-seeded)
-    const isRelayNode = rows.some(r => r.transport === '')
-    // A relay node is 'directly heard' when it was the last starred digi
-    // in a path: on_heard() marks those with source='heard'
-    const isHeardDirect = isRelayNode && rows.some(r => r.transport === '' && r.source === 'heard')
+    // 2. Fallback heuristics from the API row (schema v2: one row per callsign)
+    const isRelayRow    = s.transport === ''
+    const isHeardDirect = isRelayRow && s.source === 'heard'
+    const hasKaNode     = !!s.kanode_alias
 
-    const t = callsign === bbs      ? 'bbs'
-            : isRelayNode && isHeardDirect ? 'both'
-            : isRelayNode           ? 'digi'
-            : 'station'
+    let t
+    if (callsign === bbs)   t = 'bbs'
+    else if (graphType)     t = graphType
+    else if (hasKaNode)     t = s.source === 'heard' ? 'both' : 'digi'
+    else if (isHeardDirect) t = 'both'
+    else if (isRelayRow)    t = 'digi'
+    else                    t = 'station'
 
     coordMap[callsign] = { lat: s.lat, lon: s.lon, type: t, station: s }
   }
+
+  // Add Ka-Node alias entries so graph edges that still reference the old digi
+  // callsign (e.g. KROCK) resolve to the merged owner's coordinates.
+  for (const s of props.stations) {
+    if (!s.kanode_alias) continue
+    const alias = s.kanode_alias.toUpperCase()
+    const owner = s.callsign.toUpperCase()
+    if (coordMap[owner] && !coordMap[alias]) {
+      coordMap[alias] = coordMap[owner]
+    }
+  }
+
   return coordMap
 }
 
@@ -102,10 +116,9 @@ function renderLayers() {
   edgesLayer.clearLayers()
 
   const coordMap = buildCoordMap()
-  const entries  = Object.entries(coordMap)
-  if (!entries.length) return
+  if (!Object.keys(coordMap).length) return
 
-  // ── Edge lines ────────────────────────────────────────────────────────
+  // ── RF edge lines ─────────────────────────────────────────────────────
   if (props.graphData?.edges) {
     for (const edge of props.graphData.edges) {
       const a = coordMap[edge.source]
@@ -113,20 +126,49 @@ function renderLayers() {
       if (!a || !b) continue
       L.polyline(
         [[a.lat, a.lon], [b.lat, b.lon]],
-        { color: '#60A5FA', weight: 2.5, opacity: 0.85 }
+        { color: RF_EDGE_COLOR, weight: 2.5, opacity: 0.85 }
+      ).addTo(edgesLayer)
+    }
+  }
+
+  // ── NETROM routing edges (dashed violet) ──────────────────────────────
+  if (props.graphData?.netrom_edges) {
+    for (const edge of props.graphData.netrom_edges) {
+      const a = coordMap[edge.source]
+      const b = coordMap[edge.target]
+      if (!a || !b) continue
+      const opacity = 0.3 + 0.5 * (edge.quality ?? 128) / 255
+      L.polyline(
+        [[a.lat, a.lon], [b.lat, b.lon]],
+        { color: NETROM_EDGE_COLOR, weight: 1.8, opacity, dashArray: '6 4' }
       ).addTo(edgesLayer)
     }
   }
 
   // ── Station markers ───────────────────────────────────────────────────
-  for (const [callsign, info] of entries) {
+  // Iterate props.stations directly — coordMap may contain Ka-Node alias
+  // entries (e.g. KROCK → K6FB coords) used only for edge resolution; those
+  // must NOT generate their own markers.
+  for (const s of props.stations) {
+    if (s.lat == null || s.lon == null) continue
+    const callsign = s.callsign.toUpperCase()
+    const info     = coordMap[callsign]
+    if (!info) continue
+
     const cfg     = NODE_CFG[info.type] ?? DEFAULT_CFG
-    const s       = info.station
     const expired = s.expired ?? false
 
-    const titleHtml = s.nodename
-      ? `<strong>${callsign}</strong> <span style="color:#9CA3AF">(${s.nodename})</span>`
-      : `<strong>${callsign}</strong>`
+    // When a Ka-Node alias is set, lead with it (that's the RF-visible digi
+    // name) and show the database callsign as the secondary label.
+    // Otherwise fall back to the nodename-in-parens behaviour.
+    const displayName = s.kanode_alias || callsign
+    const subName     = s.kanode_alias ? callsign
+                      : (s.nodename   ? s.nodename : null)
+
+    const titleHtml = subName
+      ? `<strong>${displayName}</strong> <span style="color:#9CA3AF">(${subName})</span>`
+      : `<strong>${displayName}</strong>`
+
     const sourceLabel = s.position_source === 'beacon'
       ? 'self-reported via beacon'
       : s.position_source === 'manual'
@@ -135,6 +177,7 @@ function renderLayers() {
     const popupLines = [
       titleHtml,
       `Type: ${info.type}`,
+      s.netrom_alias ? `NET/ROM: ${s.netrom_alias}` : null,
       s.transport ? `Transport: ${s.transport}` : null,
       s.last_heard ? `Last heard: ${new Date(s.last_heard * 1000).toLocaleString()}` : null,
       s.count ? `Count: ${s.count}` : null,
@@ -142,7 +185,7 @@ function renderLayers() {
       s.comment ? `Comment: ${s.comment}` : null,
     ].filter(Boolean).join('<br/>')
 
-    const tooltipText = s.nodename ? `${callsign} (${s.nodename})` : callsign
+    const tooltipText = subName ? `${displayName} (${subName})` : displayName
 
     L.circleMarker([info.lat, info.lon], {
       radius:      cfg.radius,
@@ -223,19 +266,28 @@ watch([() => props.stations, () => props.graphData], renderLayers, { deep: true 
     <!-- Legend -->
     <div style="position:absolute;bottom:30px;left:10px;z-index:500;background:rgba(17,24,39,.82);border-radius:6px;padding:6px 10px;font-size:11px;color:#9CA3AF;display:flex;flex-direction:column;gap:4px;line-height:1.5;">
       <span style="display:flex;align-items:center;gap:6px;">
-        <svg width="14" height="14"><circle cx="7" cy="7" r="6" fill="#F59E0B" stroke="#B45309" stroke-width="1.5"/></svg>BBS
+        <svg width="14" height="14"><circle cx="7" cy="7" r="6"
+          :fill="NODE_COLORS.bbs.fill" :stroke="NODE_COLORS.bbs.stroke" stroke-width="1.5"/></svg>BBS
       </span>
       <span style="display:flex;align-items:center;gap:6px;">
-        <svg width="14" height="14"><circle cx="7" cy="7" r="6" fill="#3B82F6" stroke="#1D4ED8" stroke-width="1.5"/></svg>Digi
+        <svg width="14" height="14"><circle cx="7" cy="7" r="6"
+          :fill="NODE_COLORS.digi.fill" :stroke="NODE_COLORS.digi.stroke" stroke-width="1.5"/></svg>Digi
       </span>
       <span style="display:flex;align-items:center;gap:6px;">
-        <svg width="14" height="14"><circle cx="7" cy="7" r="6" fill="#10B981" stroke="#065F46" stroke-width="1.5"/></svg>Heard &amp; Digi
+        <svg width="14" height="14"><circle cx="7" cy="7" r="6"
+          :fill="NODE_COLORS.both.fill" :stroke="NODE_COLORS.both.stroke" stroke-width="1.5"/></svg>Heard &amp; Digi
       </span>
       <span style="display:flex;align-items:center;gap:6px;">
-        <svg width="14" height="14"><circle cx="7" cy="7" r="5" fill="#6B7280" stroke="#374151" stroke-width="1.5"/></svg>Station
+        <svg width="14" height="14"><circle cx="7" cy="7" r="5"
+          :fill="NODE_COLORS.station.fill" :stroke="NODE_COLORS.station.stroke" stroke-width="1.5"/></svg>Station
       </span>
       <span style="display:flex;align-items:center;gap:6px;">
-        <svg width="28" height="8"><line x1="0" y1="4" x2="28" y2="4" stroke="#9CA3AF" stroke-width="1.5" stroke-dasharray="4 4"/></svg>RF path
+        <svg width="28" height="8"><line x1="0" y1="4" x2="28" y2="4"
+          :stroke="RF_EDGE_COLOR" stroke-width="2"/></svg>RF path
+      </span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <svg width="28" height="8"><line x1="0" y1="4" x2="28" y2="4"
+          :stroke="NETROM_EDGE_COLOR" stroke-width="1.5" stroke-dasharray="4 2"/></svg>NETROM route
       </span>
     </div>
   </div>

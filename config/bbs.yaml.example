@@ -28,6 +28,20 @@ bbs:
 transports:
   # Enable one or more transports. The BBS listens on all enabled transports simultaneously.
 
+  # ─── KISS transports (kiss_serial / kiss_tcp) ──────────────────────────
+  # ⚠  UI-FRAMES ONLY  ⚠
+  # These transports DO NOT implement AX.25 connected mode. They handle
+  # UI frames only (APRS, beacons, ID broadcasts). A normal BBS client
+  # that sends SABM to connect will time out — no UA reply is generated.
+  #
+  # For real BBS sessions over the air, use ONE of:
+  #   • agwpe        — works everywhere; Direwolf has it on TCP port 8000
+  #   • kernel_ax25  — Linux only; requires kissattach + axports
+  #
+  # Enable kiss_serial / kiss_tcp ONLY if you want APRS-style beacons or
+  # heard-station logging from monitored UI traffic.
+  # ────────────────────────────────────────────────────────────────────────
+
   # KISS over serial port (Dire Wolf /dev/ttyACM0 or hardware TNC)
   kiss_serial:
     enabled: false
@@ -35,6 +49,10 @@ transports:
     baud: 9600
     # AX.25 port number inside KISS frames (0-15)
     port: 0
+    beacon_text: ""
+    beacon_dest: "BEACON"   # historical KISS default was "QST"; use "ID" for Ka-Node style
+    beacon_interval: 20     # minutes
+    beacon_path: ""         # e.g. "WIDE1-1,WIDE2-1"
 
   # KISS over TCP socket (Dire Wolf default: 8001)
   kiss_tcp:
@@ -43,6 +61,10 @@ transports:
     port: 8001
     # AX.25 port number inside KISS frames (0-15)
     ax25_port: 0
+    beacon_text: ""
+    beacon_dest: "BEACON"   # historical KISS default was "QST"; use "ID" for Ka-Node style
+    beacon_interval: 20     # minutes
+    beacon_path: ""         # e.g. "WIDE1-1,WIDE2-1"
 
   # Linux kernel AX.25 (AF_AX25 sockets via axports / kissattach)
   kernel_ax25:
@@ -167,6 +189,45 @@ web:
   sysop_password_hash: ""   # leave blank; set via: bbs2 --set-sysop-password
   # Secret key for Flask sessions — replace with a random string
   secret_key: "CHANGE_ME_BEFORE_RUNNING"
+
+netrom:
+  # NET/ROM node alias (up to 6 characters).  Leave blank to disable NETROM support.
+  alias: ""
+  # How often to broadcast the routing table as a NODES frame (minutes)
+  nodes_interval: 30
+  # Route expiry: a learned route is dropped if its advertiser has been silent
+  # for this many minutes (default 180 = 3 hours, ~3× the default broadcast cadence)
+  route_ttl_minutes: 180
+  # Quality decrement applied when re-advertising a learned route (default 25)
+  hop_cost: 25
+  # Minimum quality required to re-advertise a route after decrement (default 10)
+  min_advert_quality: 10
+  # Polite-client mode (default true).  When true, NODES broadcasts contain
+  # only the 7-byte header (discriminator + alias) — peers add us as a direct
+  # neighbor by RX without us re-broadcasting their route tables back at them.
+  # This is the convention for client/endpoint nodes on networks like NORCAL
+  # 145.05.  Set to false only if you are operating as a high-reachability
+  # transit NETROM node and the network admins have explicitly agreed.
+  advertise_self_only: true
+  # NETROM L3 crosslink classification is automatic: every incoming AX.25
+  # 'C' from a callsign already in our router's adjacent-neighbor set is
+  # treated as a NETROM crosslink (no BBS banner sent, wait for L3 CONNECT
+  # REQ).  Unknown callers get a direct BBS session.  The neighbor set is
+  # populated by NODES broadcasts received on the air and by seed_from_db
+  # on startup, so in steady state every neighbor is classified correctly
+  # on first contact.  Only applies on the agwpe transport for now.
+  #
+  # Outbound NETROM L3 info-MTU (bytes per fragment, NOT including the
+  # 20-byte L3 header).  Must be ≤ (TNC PACLEN − 20) or Direwolf (or any
+  # AX.25 stack honoring PACLEN) will split oversize L3 frames at L2 and
+  # drop the headerless second fragment — visible as chunks missing from
+  # the middle of BBS output on the user's terminal.
+  #   PACLEN  recommended info_mtu
+  #     256          236        (Direwolf default)
+  #     128          108        (NORCAL convention, KPC-3 default)
+  #      64           44        (some hardware TNCs)
+  # Check your direwolf.conf for `PACLEN` and set accordingly.
+  info_mtu: 108
 
 logging:
   level: "INFO"     # DEBUG, INFO, WARNING, ERROR

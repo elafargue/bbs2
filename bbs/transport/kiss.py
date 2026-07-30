@@ -1,22 +1,39 @@
 """
 bbs/transport/kiss.py — KISS transport over serial or TCP.
 
-Used when Dire Wolf (or a hardware TNC) exposes a KISS interface WITHOUT
-kissattach — i.e. AX.25 is NOT attached to a kernel interface.
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  ⚠  UI-FRAMES ONLY  ⚠                                                     ║
+║                                                                           ║
+║  This transport is CONNECTIONLESS. It only handles AX.25 UI frames        ║
+║  (APRS, beacons, ID broadcasts). It does NOT implement the AX.25 v2.0     ║
+║  connected-mode state machine (SABM/UA/I-frames/RR/RNR/REJ).              ║
+║                                                                           ║
+║  A standard BBS client that sends a SABM to connect will TIME OUT — the   ║
+║  transport sees the frame, creates a fake virtual "session," and never    ║
+║  sends a UA reply because there is no AX.25 state machine here.           ║
+║                                                                           ║
+║  For real connected-mode BBS access, use one of:                          ║
+║    • `agwpe`        — works on Linux, macOS, Windows; Direwolf has it     ║
+║                       on TCP port 8000 by default                         ║
+║    • `kernel_ax25`  — Linux only; requires kissattach + axports           ║
+║                                                                           ║
+║  This UI-only transport is useful for:                                    ║
+║    • APRS-style position / status / message beacons                       ║
+║    • Periodic BBS-availability beacons (BEACON, ID, QST destinations)     ║
+║    • Heard-station logging (decoding monitored UI traffic)                ║
+║                                                                           ║
+║  Both serial (kiss_serial) and TCP (kiss_tcp) flavours share the same     ║
+║  UI-only limitation.                                                      ║
+╚═══════════════════════════════════════════════════════════════════════════╝
 
-In this mode we are operating at the raw AX.25 UI-frame level:
+Implementation notes:
   - Each arriving KISS frame is decoded just enough to extract the source
     callsign (bbs/ax25/kiss_frame.py).
   - Each source callsign gets a virtual per-callsign "connection" backed by
-    asyncio queues (since KISS/UI is connectionless, we simulate a connection
-    by tracking conversation state per callsign).
-  - Replies are sent as outgoing KISS UI frames addressed to the remote station.
-
-This is strictly simpler / lower-feature than the kernel AX.25 path (no ARQ,
-no flow control, no multi-hop digipeating state).  For a proper connected-mode
-AX.25 BBS, prefer the kernel_ax25 transport with kissattach.
-
-Both serial and TCP flavours are in this file; they share a common base.
+    asyncio queues — useful only if the remote station is sending UI text
+    we want to log/echo, not for negotiated BBS sessions.
+  - Replies are sent as outgoing AX.25 v2.0 command-mode UI frames addressed
+    to the remote station.
 """
 from __future__ import annotations
 
@@ -48,21 +65,46 @@ logger = logging.getLogger(__name__)
 _SESSION_IDLE_TIMEOUT = 300
 
 
-def _build_ax25_ui_frame(src: str, dest: str, payload: bytes) -> bytes:
-    """Build a raw AX.25 UI frame (no kernel involvement)."""
+def _build_ax25_ui_frame(
+    src: str,
+    dest: str,
+    payload: bytes,
+    via: list[str] | None = None,
+) -> bytes:
+    """Build a raw AX.25 v2.0 UI command frame (no kernel involvement).
 
-    def encode_addr(callsign: str, ssid: int, last: bool) -> bytes:
+    Encodes the C-bit pair as (dest=1, src=0) — i.e. command-mode UI, the
+    standard for modern AX.25 v2.0/v2.2. If `via` is supplied, each callsign
+    is appended to the address field as a digipeater entry with the H
+    (has-been-repeated) bit clear, since we are the originator. The
+    end-of-address bit moves from the source onto the last via.
+    """
+
+    def encode_addr(
+        callsign: str, ssid: int, last: bool, high_bit: bool = False
+    ) -> bytes:
         padded = callsign.upper().ljust(6)[:6]
         encoded = bytes((ord(c) << 1) for c in padded)
+        # Bits 6-5 reserved (always 1) → 0x60. Bit 0 = end-of-address.
+        # Bit 7 holds the C-bit for src/dest or the H-bit for digipeaters.
         ssid_byte = 0x60 | ((ssid & 0x0F) << 1) | (0x01 if last else 0x00)
+        if high_bit:
+            ssid_byte |= 0x80
         return encoded + bytes([ssid_byte])
 
     dest_call, dest_ssid = parse(dest)
     src_call, src_ssid = parse(src)
+    vias = list(via or [])
 
-    addr_field = encode_addr(dest_call, dest_ssid, False) + encode_addr(
-        src_call, src_ssid, True
-    )
+    addr_field = encode_addr(
+        dest_call, dest_ssid, False, high_bit=True
+    ) + encode_addr(src_call, src_ssid, not vias, high_bit=False)
+    for i, v in enumerate(vias):
+        v_call, v_ssid = parse(v)
+        addr_field += encode_addr(
+            v_call, v_ssid, i == len(vias) - 1, high_bit=False
+        )
+
     control = bytes([0x03])  # UI frame
     pid = bytes([PID_NO_LAYER3])
     return addr_field + control + pid + payload
@@ -121,7 +163,14 @@ class _KISSBaseTransport(Transport):
         self._raw_writer: asyncio.StreamWriter | None = None
         self._on_connect: ConnectionCallback | None = None
         self._beacon_text: str = cfg.get("beacon_text", "").strip()
+        self._beacon_dest: str = (
+            cfg.get("beacon_dest", "BEACON").strip().upper() or "BEACON"
+        )
         self._beacon_interval: int = max(1, int(cfg.get("beacon_interval", 20))) * 60
+        raw_path = cfg.get("beacon_path", "")
+        self._beacon_path: list[str] = [
+            p.strip().upper() for p in raw_path.split(",") if p.strip()
+        ]
 
     @abstractmethod
     async def _open_raw_streams(
@@ -136,6 +185,13 @@ class _KISSBaseTransport(Transport):
         reader, writer = await self._open_raw_streams()
         self._raw_writer = writer
         logger.info("%s transport connected", self.transport_id)
+        logger.warning(
+            "%s is UI-FRAMES ONLY — connected-mode clients (SABM) will time out. "
+            "For real BBS sessions use the 'agwpe' transport (Direwolf TCP 8000) "
+            "or 'kernel_ax25' (Linux + kissattach). See bbs/transport/kiss.py "
+            "docstring for details.",
+            self.transport_id,
+        )
 
         beacon_task: asyncio.Task[None] | None = None
         if self._beacon_text:
@@ -143,9 +199,11 @@ class _KISSBaseTransport(Transport):
                 self._beacon_loop(), name=f"{self.transport_id}:beacon"
             )
             logger.info(
-                "%s beacon enabled: every %d min — %s",
+                "%s beacon enabled: every %d min to %s%s — %s",
                 self.transport_id,
                 self._beacon_interval // 60,
+                self._beacon_dest,
+                " via " + ",".join(self._beacon_path) if self._beacon_path else "",
                 self._beacon_text,
             )
 
@@ -223,11 +281,14 @@ class _KISSBaseTransport(Transport):
             logger.info("KISS virtual session ended for %s", src)
 
     def _send_beacon(self) -> None:
-        """Build and write a KISS UI beacon frame to QST (fire-and-forget write)."""
+        """Build and write a KISS UI beacon frame (fire-and-forget write)."""
         if not self._raw_writer or self._raw_writer.is_closing():
             return
         ax25 = _build_ax25_ui_frame(
-            self._local_addr, "QST", self._beacon_text.encode("ascii", errors="replace")
+            self._local_addr,
+            self._beacon_dest,
+            self._beacon_text.encode("ascii", errors="replace"),
+            via=self._beacon_path or None,
         )
         frame = build_kiss_frame(self._kiss_port, ax25)
         self._raw_writer.write(frame)

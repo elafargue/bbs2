@@ -28,7 +28,11 @@ Protocol reference: http://www.sv2agw.com/downloads/develop.zip
                Receive: CallFrom = remote  →  send: CallFrom = our call, CallTo = remote
   'd' (0x64) — Disconnect
                Receive: CallFrom = remote  →  send: CallFrom = our call, CallTo = remote
-  'T' (0x54) — Send unproto (UI) frame — used for periodic beacons
+  'M' (0x4D) — Send unproto (UI) frame — used for periodic beacons and
+               NETROM NODES broadcasts. Note: SV2AGW spec also defines a
+               server→client 'T' confirmation; do NOT confuse the two —
+               sending 'T' as a client command makes Direwolf reject the
+               frame as INVALID.
   'm' (0x6D) — Enable monitoring of all received frames
   'U' (0x55) — Monitored UI / UNPROTO frame (AGWPE monitor format, e.g.:
                "1:Fm W6ELA-1 To BEACON Via KROCK*,KJOHN* <UI pid=F0 ...>")
@@ -59,7 +63,7 @@ import logging
 import socket
 import struct
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # Set this logger to DEBUG in your logging config (or via bbs.yaml) to get
 # per-frame traces.  At INFO level only connection events are emitted.
@@ -70,6 +74,12 @@ from typing import Any, Optional
 import re
 
 from bbs.ax25.address import format_addr, parse
+from bbs.ax25.netrom_frame import (
+    PID_NETROM,
+    decode_l3_frame,
+    looks_like_netrom_l3,
+)
+from bbs.netrom.circuit import NetromCircuitManager
 from bbs.transport.base import Connection, ConnectionCallback, Transport
 
 logger = logging.getLogger(__name__)
@@ -99,6 +109,24 @@ _TCP_READ_TIMEOUT = 120  # seconds
 _MONITOR_VIA_RE   = re.compile(r"\bVia\s+([^<\r\n]+?)\s*<", re.IGNORECASE)
 _MONITOR_SABM_RE  = re.compile(r"<[^>]*\bSABME?\b", re.IGNORECASE)
 _AGWPE_PAYLOAD_RE = re.compile(r">\[[\d:]+\]\r?(.*)", re.DOTALL)
+
+# Used to locate the binary AX.25 info field in a raw AGWPE 'U' monitor frame.
+# The TNC2 header ends with ">[HH:MM:SS]\r" (ASCII); the binary payload follows.
+_BINARY_INFO_RE   = re.compile(rb">\[\d{2}:\d{2}:\d{2}\]\r?")
+
+
+def _extract_binary_info(raw: bytes) -> bytes | None:
+    """
+    Extract the raw binary AX.25 info field from an AGWPE 'U' monitor frame.
+
+    AGWPE 'U' payloads are TNC2-format strings: the ASCII header ends with
+    ">[HH:MM:SS]\\r" and the binary info field follows immediately.
+    Trailing \\r\\r\\x00 bytes are stripped from the result.
+    """
+    m = _BINARY_INFO_RE.search(raw)
+    if not m:
+        return None
+    return raw[m.end():].rstrip(b"\r\x00")
 
 
 def _parse_via(monitor_text: str) -> list[str]:
@@ -221,17 +249,70 @@ class _AGWPEVirtualWriter:
         self._remote = remote_call
         self._port = agw_port
         self._closing = False
+        # Set when the session this writer belongs to has been promoted to a
+        # NETROM crosslink — future close() calls become no-ops so the
+        # underlying AX.25 link stays up for L3 traffic.  write() and
+        # drain() continue to work normally.
+        self._suppress_close = False
+        # Set when we want to silently swallow all subsequent write()
+        # calls.  Used during NETROM promotion to keep the cancelled BBS
+        # task's late writes off the wire — those bytes wouldn't have
+        # proper NETROM L3 framing and would interleave garbage with the
+        # real circuit's traffic from the new NETROM session.
+        self._muted = False
+        # PID byte for outbound AGWPE 'D' frames.  Default 0xF0 (no L3) for
+        # direct BBS use; NETROM crosslinks set 0xCF on promotion so peers'
+        # AX.25 layer routes the payload to their NETROM handler instead of
+        # their session/text handler.
+        self._pid: int = _PID_NO_L3
         self._drain_lock = drain_lock
         self._write_timeout = write_timeout
 
+    def set_pid(self, pid: int) -> None:
+        """Override the AX.25 PID for all subsequent ``write()`` calls.
+
+        Used during NETROM-crosslink promotion to flip the writer from
+        PID=0xF0 (BBS data) to PID=0xCF so outbound L3 frames carry the
+        correct PID on the AX.25 wrapper.  Without this, peers receive
+        valid NETROM L3 bytes but with an AX.25 PID that says "no layer
+        3" — they hand the payload to their session handler instead of
+        the NETROM stack and ignore it.
+        """
+        self._pid = pid & 0xFF
+
+    def mute(self) -> None:
+        """Drop all subsequent write() calls — bytes go nowhere.
+
+        Used during NETROM promotion to stop the cancelled BBS task from
+        emitting unframed bytes onto an AX.25 link the new NETROM circuit
+        is now driving.  Peers' NETROM stacks vary in lenience and some
+        will forward those unframed bytes through to the user, interleaved
+        with our proper L3-encoded INFO frames — visible to the user as
+        garbled or duplicated output.  Muting is cleaner than relying on
+        the receiver to drop malformed L3.
+        """
+        self._muted = True
+
+    def suppress_close(self) -> None:
+        """Mark this writer so that ``close()`` becomes a no-op.
+
+        Used when the AGWPE session has been promoted from direct-BBS to a
+        NETROM crosslink and the BBS session task is being cancelled — its
+        finally block would otherwise cascade into ``conn.close()`` →
+        ``writer.close()`` → an AGWPE ``'d'`` frame that tears down the
+        AX.25 link the NETROM crosslink still needs.
+        """
+        self._suppress_close = True
+
     def write(self, data: bytes) -> None:
-        if data and not self._closing:
-            frame = _build_frame(self._port, "D", self._local, self._remote, _PID_NO_L3, data)
-            self._w.write(frame)
-            logger.debug(
-                "agwpe TX [D] %s→%s  %d bytes: %r",
-                self._local, self._remote, len(data), data[:80],
-            )
+        if self._muted or self._closing or not data:
+            return
+        frame = _build_frame(self._port, "D", self._local, self._remote, self._pid, data)
+        self._w.write(frame)
+        logger.debug(
+            "agwpe TX [D] %s→%s pid=0x%02x %d bytes: %r",
+            self._local, self._remote, self._pid, len(data), data[:80],
+        )
 
     async def drain(self) -> None:
         # Check _closing INSIDE the lock so we never drain a writer that was
@@ -252,14 +333,25 @@ class _AGWPEVirtualWriter:
         return self._closing
 
     def close(self) -> None:
-        if not self._closing:
-            self._closing = True
-            logger.debug("agwpe TX [d] disconnect %s→%s", self._local, self._remote)
-            try:
-                frame = _build_frame(self._port, "d", self._local, self._remote)
-                self._w.write(frame)
-            except Exception:
-                pass  # TCP connection already gone
+        if self._closing:
+            return
+        if self._suppress_close:
+            # Session was promoted to a NETROM crosslink — keep the AX.25
+            # link up for L3 traffic.  Do NOT set _closing here either;
+            # write() and drain() must continue to work for outbound NETROM
+            # frames on the same underlying TCP writer.
+            logger.debug(
+                "agwpe TX [d] suppressed (NETROM-promoted) %s→%s",
+                self._local, self._remote,
+            )
+            return
+        self._closing = True
+        logger.debug("agwpe TX [d] disconnect %s→%s", self._local, self._remote)
+        try:
+            frame = _build_frame(self._port, "d", self._local, self._remote)
+            self._w.write(frame)
+        except Exception:
+            pass  # TCP connection already gone
 
     async def wait_closed(self) -> None:
         pass  # Virtual — AGWPE sends 'd' confirmation asynchronously
@@ -287,6 +379,14 @@ class _AGWPESession:
         self.writer = _AGWPEVirtualWriter(
             agwpe_writer, local_call, remote_call, agw_port, drain_lock, write_timeout
         )
+        # Populated when the session is a NETROM crosslink (either
+        # classified as such at 'C' time by the router-lookup, or by the
+        # cold-start late-PID-detection fallback).  Owns all per-user
+        # NETROM circuits on this AX.25 link.
+        self.netrom_manager: Optional[NetromCircuitManager] = None
+        # Cached Connection used by the direct-BBS path; built in the 'C'
+        # handler so the session task gets the same writer/reader objects.
+        self.connection: Optional[Connection] = None
 
     def feed_data(self, data: bytes) -> None:
         if data:
@@ -334,6 +434,7 @@ class AGWPETransport(Transport):
         self._beacon_path: list[str] = [
             p.strip().upper() for p in raw_path.split(",") if p.strip()
         ]
+        self._netrom_nodes_interval: int = 30 * 60  # overridden by set_netrom_nodes_interval()
         self._running = False
         self._sessions: dict[_SessionKey, _AGWPESession] = {}
         # Maps session key → running Task so they can be force-cancelled on TCP drop.
@@ -349,6 +450,61 @@ class AGWPETransport(Transport):
         # Maps callsign → hop count derived from monitored SABM/SABME frames;
         # consumed when the corresponding 'C' (connect) event arrives.
         self._pending_hop_counts: dict[str, int] = {}
+        # NETROM crosslink classifier (Milestone 3 + router-lookup refactor).
+        # Each incoming 'C' is classified synchronously by looking up the
+        # caller in the router's adjacent-neighbor set: known neighbor →
+        # NETROM crosslink (no BBS task started), unknown → direct BBS.
+        # This is deterministic and avoids the race that the old timer-based
+        # classifier had with slow NETROM stacks (KPC-3 / TheNet emit
+        # CONNECT REQ up to ~10 seconds after AX.25 link-up, by which time
+        # the BBS task had already queued banner frames into Direwolf's
+        # outbound RF buffer that we could not pull back).  Late-PID
+        # detection is kept as a cold-start fallback when the router has
+        # no entries yet (see _dispatch 'D').
+        self._netrom_crosslink_enabled: bool = False
+        self._is_netrom_neighbor: Optional[Callable[[str], bool]] = None
+        # Outbound NETROM L3 info-MTU.  Must be ≤ (AX.25 PACLEN − 20-byte
+        # L3 header) of the local TNC: oversize L3 frames get split at L2
+        # by Direwolf (or any AX.25 stack honoring PACLEN) and the
+        # header-less second fragment is undecodable by the peer's NETROM
+        # stack — visible as missing chunks in BBS output.  Default 108
+        # matches NORCAL convention of PACLEN=128.
+        self._netrom_info_mtu: int = 108
+
+    def set_netrom_nodes_interval(self, seconds: int) -> None:
+        self._netrom_nodes_interval = max(60, seconds)
+
+    def set_netrom_crosslink_enabled(self, enabled: bool = True) -> None:
+        """Enable or disable inbound NETROM L3 crosslink acceptance.
+
+        Called by the engine when the user has a ``netrom:`` block in
+        bbs.yaml.  Per-connection classification (NETROM vs. direct BBS)
+        is delegated to the callback registered via
+        :meth:`set_netrom_neighbor_check`.
+        """
+        self._netrom_crosslink_enabled = enabled
+
+    def set_netrom_neighbor_check(
+        self, cb: Callable[[str], bool]
+    ) -> None:
+        """Register the synchronous predicate used on each incoming 'C'
+        to decide whether the caller is a NETROM crosslink.
+
+        Caller-side contract: *cb* should return True iff the callsign
+        passed in is in our adjacent-neighbor set (= we've received at
+        least one NODES broadcast from them since startup, including via
+        ``seed_from_db``).  The router's ``adjacent_neighbors`` property
+        is the canonical source; engine wires it through.
+        """
+        self._is_netrom_neighbor = cb
+
+    def set_netrom_info_mtu(self, mtu: int) -> None:
+        """Set the max NETROM L3 info-field payload (bytes) per fragment.
+
+        Must be ≤ (TNC PACLEN − 20).  See class-level docstring on
+        ``_netrom_info_mtu`` for the rationale.
+        """
+        self._netrom_info_mtu = max(1, int(mtu))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -360,6 +516,7 @@ class AGWPETransport(Transport):
         while self._running:
             writer: Optional[asyncio.StreamWriter] = None
             beacon_task: Optional[asyncio.Task[None]] = None
+            nodes_task: Optional[asyncio.Task[None]] = None
             # Fresh lock per TCP connection so zombie tasks from a prior connection
             # do not contend with new-connection sessions on a different writer.
             self._drain_lock = asyncio.Lock()
@@ -396,8 +553,8 @@ class AGWPETransport(Transport):
                 )
                 await asyncio.wait_for(writer.drain(), timeout=30)
 
+                assert self._drain_lock is not None
                 if self._beacon_text:
-                    assert self._drain_lock is not None
                     beacon_task = asyncio.create_task(
                         self._beacon_loop(writer, self._registered, self._drain_lock), name="agwpe:beacon"
                     )
@@ -406,6 +563,16 @@ class AGWPETransport(Transport):
                         self._beacon_interval // 60,
                         self._beacon_dest,
                         self._beacon_text,
+                    )
+
+                if self._netrom_nodes_builder is not None:
+                    nodes_task = asyncio.create_task(
+                        self._netrom_nodes_loop(writer, self._registered, self._drain_lock),
+                        name="agwpe:netrom_nodes",
+                    )
+                    logger.info(
+                        "agwpe NETROM NODES broadcast enabled: every %d min",
+                        self._netrom_nodes_interval // 60,
                     )
 
                 await self._read_loop(reader, writer)
@@ -420,12 +587,13 @@ class AGWPETransport(Transport):
             except Exception:
                 logger.exception("agwpe unexpected error — reconnecting in %ds", retry_delay)
             finally:
-                if beacon_task:
-                    beacon_task.cancel()
-                    try:
-                        await beacon_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                for _task in (beacon_task, nodes_task):
+                    if _task:
+                        _task.cancel()
+                        try:
+                            await _task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 if writer and not writer.is_closing():
                     writer.close()
                     try:
@@ -437,8 +605,11 @@ class AGWPETransport(Transport):
                 for stask in list(self._session_tasks.values()):
                     stask.cancel()
                 self._session_tasks.clear()
-                # Tear down all active sessions so the BBS sessions see EOF
+                # Tear down all active sessions so the BBS sessions see EOF.
+                # NETROM crosslinks also need to drop all their user circuits.
                 for sess in list(self._sessions.values()):
+                    if sess.netrom_manager is not None:
+                        sess.netrom_manager.shutdown()
                     sess.feed_eof()
                 self._sessions.clear()
 
@@ -567,6 +738,12 @@ class AGWPETransport(Transport):
                 )
                 old_sess = self._sessions.pop(key, None)
                 if old_sess:
+                    # If the old session was a NETROM crosslink, shut down
+                    # every NETROM circuit riding on it (otherwise their BBS
+                    # session tasks would be orphaned and the user circuits
+                    # would leak).
+                    if old_sess.netrom_manager is not None:
+                        old_sess.netrom_manager.shutdown()
                     old_sess.feed_eof()
                 old_task = self._session_tasks.pop(key, None)
                 if old_task and not old_task.done():
@@ -588,22 +765,82 @@ class AGWPETransport(Transport):
                 transport_id=self.transport_id,
                 hop_count=self._pending_hop_counts.pop(call_from.upper(), 0),
             )
+            sess.connection = conn
             assert self._on_connect is not None
-            task = asyncio.create_task(
-                self._run_session(key, sess, conn), name=f"agwpe:session:{call_from}"
+            # Classify on 'C' using the router's adjacent-neighbor set —
+            # synchronous, deterministic, no timer race.  A known NETROM
+            # neighbor → instantiate a circuit manager and DO NOT start
+            # the BBS task; the first 'D' frame will be a NETROM L3
+            # CONNECT REQ that the manager handles, and the per-user BBS
+            # session is spun up there.  An unknown caller → regular BBS
+            # session immediately, banner goes out at AX.25 UA time.
+            is_netrom = (
+                self._netrom_crosslink_enabled
+                and self._is_netrom_neighbor is not None
+                and self._is_netrom_neighbor(call_from)
             )
-            self._session_tasks[key] = task
+            if is_netrom:
+                netrom_writer = self._make_netrom_writer(sess)
+                sess.netrom_manager = NetromCircuitManager(
+                    local_call      = self._local_call,
+                    via_node        = sess.remote_call,
+                    ax25_writer     = netrom_writer,
+                    on_user_connect = self._on_connect,
+                    info_mtu        = self._netrom_info_mtu,
+                )
+                logger.info(
+                    "agwpe: NETROM crosslink with %s — known neighbor, "
+                    "no BBS task started, waiting for L3 CONNECT REQ",
+                    call_from,
+                )
+                # No session task to register — the per-user BBS sessions
+                # are created on demand by the circuit manager.
+            else:
+                task = asyncio.create_task(
+                    self._run_session(key, sess, conn),
+                    name=f"agwpe:session:{call_from}",
+                )
+                self._session_tasks[key] = task
 
         elif kind == "D":
-            # Data for an active connected session
+            # Data for an active connected session.  Three branches:
+            #   (a) NETROM crosslink (decided at 'C' time by router lookup,
+            #       or by late-PID promotion below) → decode L3 + dispatch
+            #   (b) cold-start fallback: PID=0xCF on a session that was
+            #       classified as direct because the caller wasn't in our
+            #       neighbor set on 'C' → promote and dispatch.
+            #   (c) direct BBS user → feed to reader
             sess = self._sessions.get(key)
-            if sess and payload:
-                sess.feed_data(payload)
-            elif not sess:
+            if not sess:
                 logger.warning(
                     "agwpe: 'D' frame for unknown session %s (key=%s) — dropped; known sessions: %s",
                     call_from, key, list(self._sessions.keys()),
                 )
+            elif not payload:
+                pass  # empty 'D' is a no-op
+            elif sess.netrom_manager is not None:
+                frame = decode_l3_frame(payload)
+                if frame is None:
+                    logger.warning(
+                        "agwpe: undecodable NETROM L3 frame on crosslink %s (%d bytes)",
+                        call_from, len(payload),
+                    )
+                else:
+                    await sess.netrom_manager.dispatch(frame)
+            elif pid == PID_NETROM:
+                # Cold-start fallback (router didn't know this neighbor yet).
+                await self._promote_to_netrom_crosslink(key, sess)
+                assert sess.netrom_manager is not None
+                frame = decode_l3_frame(payload)
+                if frame is None:
+                    logger.warning(
+                        "agwpe: late NETROM detection on %s but L3 decode "
+                        "failed (%d bytes)", call_from, len(payload),
+                    )
+                else:
+                    await sess.netrom_manager.dispatch(frame)
+            else:
+                sess.feed_data(payload)
 
         elif kind == "d":
             # Remote station disconnected
@@ -613,6 +850,9 @@ class AGWPETransport(Transport):
                     "agwpe: %s disconnected; remaining sessions: %d %s",
                     call_from, len(self._sessions), list(self._sessions.keys()),
                 )
+                if sess.netrom_manager is not None:
+                    # Tear down all NETROM circuits riding on this crosslink.
+                    sess.netrom_manager.shutdown()
                 sess.feed_eof()
             else:
                 logger.warning(
@@ -626,7 +866,21 @@ class AGWPETransport(Transport):
             #   'S' — supervisory + all non-UI U-frames (SABM, SABME, UA, DM, …)
             # SABM/SABME for an incoming connection arrives under 'S', so the
             # hop-count cache MUST observe both kinds to populate before 'C'.
-            # 1. Cache the via-path length when a SABM/SABME is directed at us.
+            # 1. NETROM UI frames — extract binary payload and dispatch to the
+            #    NETROM observer before any text decoding.  Use both PID and
+            #    destination as discriminators: some AGWPE implementations
+            #    (including Direwolf) report PID=0x00 in the header for all
+            #    monitored frames, so PID alone is not reliable.
+            if (kind == "U" and self._netrom_observer is not None
+                    and (pid == PID_NETROM or call_to.upper() == "NODES")):
+                binary_info = _extract_binary_info(payload) if payload else None
+                if binary_info is not None:
+                    try:
+                        await self._netrom_observer(call_from, call_to, binary_info)
+                    except Exception:
+                        logger.exception("netrom observer error for frame from %s", call_from)
+                return  # NETROM frames are not heard-station traffic
+            # 2. Cache the via-path length when a SABM/SABME is directed at us.
             if payload and call_to.upper() == self._local_call.upper():
                 try:
                     _sabm_text = payload.decode("ascii", errors="replace")
@@ -636,7 +890,7 @@ class AGWPETransport(Transport):
                             self._pending_hop_counts[call_from.upper()] = len(_via)
                 except Exception:
                     pass
-            # 2. Heard-station tracking is UI-frame only — that's the scope of
+            # 3. Heard-station tracking is UI-frame only — that's the scope of
             #    "stations heard on the air". Skip for 'S' kind.
             if kind != "U":
                 return
@@ -683,7 +937,14 @@ class AGWPETransport(Transport):
             elapsed = time.monotonic() - t_start
             # Guard: only remove OUR entry; a fast reconnect from the same station
             # may have already registered a new session/task under this key.
-            was_in_sessions = self._sessions.get(key) is sess
+            # Also guard against the late-NETROM promotion case — if we got
+            # cancelled because the session was promoted to a NETROM crosslink,
+            # the session needs to stay registered for the manager to receive
+            # subsequent 'D' / 'd' frames on it.
+            was_in_sessions = (
+                self._sessions.get(key) is sess
+                and sess.netrom_manager is None
+            )
             if was_in_sessions:
                 self._sessions.pop(key, None)
             cur_task = asyncio.current_task()
@@ -698,6 +959,99 @@ class AGWPETransport(Transport):
                 list(self._sessions.keys()),
             )
 
+    # ── NETROM crosslink classifier (Milestone 3) ─────────────────────────────
+
+    def _make_netrom_writer(
+        self, sess: _AGWPESession
+    ) -> _AGWPEVirtualWriter:
+        """Build a fresh _AGWPEVirtualWriter for a NETROM circuit manager.
+
+        Wraps the same underlying AGWPE TCP socket as ``sess.writer`` but
+        has its own state (PID, close-suppression, mute flag).  The
+        NETROM circuit uses this writer; the old ``sess.writer`` stays
+        in place for the cancelled BBS task but is muted so its writes
+        no longer reach the wire.
+        """
+        old = sess.writer
+        assert self._drain_lock is not None
+        new = _AGWPEVirtualWriter(
+            agwpe_writer  = old._w,
+            local_call    = old._local,
+            remote_call   = old._remote,
+            agw_port      = old._port,
+            drain_lock    = self._drain_lock,
+            write_timeout = self._write_timeout,
+        )
+        new.set_pid(PID_NETROM)
+        return new
+
+    async def _promote_to_netrom_crosslink(
+        self, key: _SessionKey, sess: _AGWPESession
+    ) -> None:
+        """Cold-start fallback: a 'D' frame with PID=0xCF arrived on a
+        session we treated as a direct BBS user because the caller wasn't
+        in our adjacent-neighbor set at 'C' time.
+
+        This fires only when the router was empty / hadn't yet learned of
+        this neighbor (e.g. fresh deployment with no DB seed, or the
+        neighbor's first-ever NODES broadcast hasn't reached us yet).
+        Once the router fills (typically within one broadcast cycle of
+        a normal startup), every subsequent NETROM 'C' from this neighbor
+        is classified correctly on first contact.
+
+        The cost: any banner the BBS already emitted has gone on the air
+        with PID=0xF0 — a strict peer will drop them, a lenient peer
+        forwards them as text.  Best-effort cleanup; the proper fix is to
+        get the neighbor into the router before they connect, which is
+        what ``seed_from_db`` does at startup.
+        """
+        logger.warning(
+            "agwpe: late NETROM crosslink detection on session with %s — "
+            "caller wasn't in router's neighbor set on 'C'; tearing down "
+            "direct BBS path. (Check that NODES from %s reach this station; "
+            "seed_from_db should normally cover this case at startup.)",
+            sess.remote_call, sess.remote_call,
+        )
+        # Three things we do to the OLD writer (the one the cancelled BBS
+        # session still holds a reference to via conn.writer):
+        #   1. mute() — its write() calls become no-ops, so the cancelled
+        #      BBS task's "73 de … -- disconnecting --" tail does NOT go on
+        #      the wire as raw bytes with PID=0xCF and risk being forwarded
+        #      to the user by a lenient peer NETROM stack.
+        #   2. suppress_close() — its close() becomes a no-op, so the
+        #      cancelled task's conn.close() cascade doesn't send an AGWPE
+        #      'd' frame and tear down the AX.25 link the NETROM crosslink
+        #      still needs.
+        # The NEW writer (built below) is what the NETROM circuit manager
+        # actually uses; it has its own state and PID=0xCF.
+        if hasattr(sess.writer, "mute"):
+            sess.writer.mute()
+        if hasattr(sess.writer, "suppress_close"):
+            sess.writer.suppress_close()
+        # Cancel the BBS session task that's been writing the banner.
+        old_task = self._session_tasks.pop(key, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        # Push EOF onto the reader so the BBS task exits its read loop.
+        try:
+            sess.reader.feed_eof()
+        except Exception:
+            pass
+        # Replace the reader with a fresh one — NETROM circuits get their
+        # own per-user readers via NetromCircuit; this one is defensive.
+        sess.reader = asyncio.StreamReader()
+        # Promote: install a circuit manager with its OWN writer.
+        assert self._on_connect is not None
+        netrom_writer = self._make_netrom_writer(sess)
+        sess.netrom_manager = NetromCircuitManager(
+            local_call      = self._local_call,
+            via_node        = sess.remote_call,
+            ax25_writer     = netrom_writer,
+            on_user_connect = self._on_connect,
+            info_mtu        = self._netrom_info_mtu,
+        )
+        sess.pending_classification = False
+
     # ── Beacon ────────────────────────────────────────────────────────────────
 
     async def _beacon_loop(
@@ -706,7 +1060,7 @@ class AGWPETransport(Transport):
     ) -> None:
         """Send an unproto beacon every beacon_interval seconds."""
         # Wait for the 'X' registration ack before sending; AGWPE silently drops
-        # 'T'/'V' frames from an unregistered callsign.
+        # 'M'/'V' frames from an unregistered callsign.
         try:
             await asyncio.wait_for(registered.wait(), timeout=30.0)
         except asyncio.TimeoutError:
@@ -731,7 +1085,7 @@ class AGWPETransport(Transport):
                         )
                     else:
                         frame = _build_frame(
-                            self._agw_port, "T",
+                            self._agw_port, "M",
                             self._local_call, self._beacon_dest,
                             _PID_NO_L3, payload,
                         )
@@ -746,5 +1100,41 @@ class AGWPETransport(Transport):
                 except Exception:
                     logger.warning("agwpe beacon send failed", exc_info=True)
                 await asyncio.sleep(self._beacon_interval)
+        except asyncio.CancelledError:
+            pass
+
+    # ── NETROM NODES broadcast ────────────────────────────────────────────────
+
+    async def _netrom_nodes_loop(
+        self, writer: asyncio.StreamWriter, registered: asyncio.Event,
+        drain_lock: asyncio.Lock,
+    ) -> None:
+        """Broadcast our NETROM NODES routing table every netrom_nodes_interval seconds."""
+        try:
+            await asyncio.wait_for(registered.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("agwpe: registration not confirmed after 30 s; sending NODES anyway")
+        except asyncio.CancelledError:
+            return
+        try:
+            while self._running:
+                assert self._netrom_nodes_builder is not None
+                payload = self._netrom_nodes_builder()
+                if payload:
+                    try:
+                        frame = _build_frame(
+                            self._agw_port, "M",
+                            self._local_call, "NODES",
+                            PID_NETROM, payload,
+                        )
+                        writer.write(frame)
+                        async with drain_lock:
+                            await writer.drain()
+                        logger.info(
+                            "agwpe NETROM NODES broadcast sent: %d bytes", len(payload)
+                        )
+                    except Exception:
+                        logger.warning("agwpe NODES broadcast send failed", exc_info=True)
+                await asyncio.sleep(self._netrom_nodes_interval)
         except asyncio.CancelledError:
             pass

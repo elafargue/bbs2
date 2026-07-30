@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import NetworkGraph from '../components/NetworkGraph.vue'
 import HeardGeoMap  from '../components/HeardGeoMap.vue'
+import { ALIAS_COLORS } from '../utils/colorScheme'
 
 const stations    = ref([])
 const maxAge      = ref(24)
@@ -32,8 +33,13 @@ const deleting       = ref(false)
 const graphData    = ref(null)
 const graphLoading = ref(false)
 
+// NETROM routing table
+const netromRoutes        = ref([])
+const netromRoutesLoading = ref(false)
+
 // Log search
 const search = ref('')
+
 
 function fmtTs(unix) {
   if (!unix) return '—'
@@ -60,6 +66,14 @@ async function loadGraph() {
   if (res.ok) graphData.value = await res.json()
   else snackbar.value = { show: true, text: 'Failed to load graph.', color: 'error' }
   graphLoading.value = false
+}
+
+async function loadNetromRoutes() {
+  netromRoutesLoading.value = true
+  const res = await fetch('/api/heard/netrom-routes')
+  if (res.ok) netromRoutes.value = await res.json()
+  else snackbar.value = { show: true, text: 'Failed to load NETROM routes.', color: 'error' }
+  netromRoutesLoading.value = false
 }
 
 async function saveSettings() {
@@ -102,6 +116,7 @@ async function clearAll() {
 function refresh() {
   if (activeTab.value === 'network') return loadGraph()
   if (activeTab.value === 'map') return Promise.all([load(), loadGraph()])
+  if (activeTab.value === 'netrom') return loadNetromRoutes()
   return load()
 }
 
@@ -119,13 +134,16 @@ function openEdit(item) {
   editItem.value = {
     callsign:        item.callsign,
     transport:       item.transport,
+    transports:      item.transports ?? [],
     source:          item.source,
     first_heard:     item.first_heard,
     last_heard:      item.last_heard,
     count:           item.count,
     lat:             item.lat != null ? String(item.lat) : '',
     lon:             item.lon != null ? String(item.lon) : '',
-    nodename:        item.nodename ?? '',
+    nodename:        item.beacon_alias ?? item.nodename ?? '',
+    netrom_alias:    item.netrom_alias ?? '',
+    kanode_alias:    item.kanode_alias ?? '',
     comment:         item.comment ?? '',
     position_source: item.position_source ?? '',
   }
@@ -134,26 +152,30 @@ function openEdit(item) {
 
 async function saveEdit() {
   editSaving.value = true
-  const { callsign, transport } = editItem.value
-  const lat      = editItem.value.lat !== '' ? Number(editItem.value.lat) : null
-  const lon      = editItem.value.lon !== '' ? Number(editItem.value.lon) : null
-  const comment  = editItem.value.comment
-  const nodename = editItem.value.nodename
+  const { callsign } = editItem.value
+  const lat          = editItem.value.lat !== '' ? Number(editItem.value.lat) : null
+  const lon          = editItem.value.lon !== '' ? Number(editItem.value.lon) : null
+  const comment      = editItem.value.comment
+  const nodename     = editItem.value.nodename
+  const kanode_alias = editItem.value.kanode_alias.trim().toUpperCase()
   const res = await fetch(`/api/heard/${encodeURIComponent(callsign)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transport, lat, lon, comment, nodename }),
+    body: JSON.stringify({ lat, lon, comment, nodename, kanode_alias }),
   })
-  const data = await res.json()
-  snackbar.value = {
-    show: true,
-    text: res.ok ? 'Station updated.' : (data.error ?? 'Save failed.'),
-    color: res.ok ? 'success' : 'error',
+  const data = res.ok ? await res.json() : {}
+  let text = res.ok ? 'Station updated.' : 'Save failed.'
+  if (res.ok && data.merged) {
+    text += ` Merged ${data.merged} (${data.events_merged ?? 0} events`
+    if (data.position_transferred) text += ', position transferred'
+    text += ').'
   }
+  snackbar.value = { show: true, text, color: res.ok ? 'success' : 'error' }
   editSaving.value = false
   if (res.ok) {
     editDialog.value = false
     await load()
+    graphData.value = null  // invalidate graph — node types may have changed
   }
 }
 
@@ -231,8 +253,9 @@ onMounted(load)
     <!-- Tabs: Log / Network / Map -->
     <v-tabs v-model="activeTab" density="compact" class="mb-2">
       <v-tab value="log"     prepend-icon="mdi-table">Log</v-tab>
-      <v-tab value="network" prepend-icon="mdi-graph" @click="!graphData && loadGraph()">Network</v-tab>
-      <v-tab value="map"     prepend-icon="mdi-map"   @click="!graphData && loadGraph()">Map</v-tab>
+      <v-tab value="network" prepend-icon="mdi-graph"        @click="!graphData && loadGraph()">Network</v-tab>
+      <v-tab value="map"     prepend-icon="mdi-map"          @click="!graphData && loadGraph()">Map</v-tab>
+      <v-tab value="netrom"  prepend-icon="mdi-router-network" @click="!netromRoutes.length && loadNetromRoutes()">NETROM</v-tab>
     </v-tabs>
 
     <v-window v-model="activeTab">
@@ -268,7 +291,16 @@ onMounted(load)
         >
           <template #item.callsign="{ item }">
             <span :class="item.transport === '' && item.source !== 'heard' ? 'text-medium-emphasis' : ''">{{ item.callsign }}</span>
-            <span v-if="item.nodename" class="ml-1 text-caption text-medium-emphasis">({{ item.nodename }})</span>
+            <!-- Alias display: priority NETROM → Ka-Node → beacon, with a title attribute
+                 for screen readers / hover so the type isn't conveyed by color alone. -->
+            <span v-if="item.netrom_alias" class="ml-1 text-caption"
+                  :style="`color:${ALIAS_COLORS.netrom}`"
+                  title="NET/ROM alias">({{ item.netrom_alias }})</span>
+            <span v-else-if="item.kanode_alias" class="ml-1 text-caption"
+                  :style="`color:${ALIAS_COLORS.kanode}`"
+                  title="Ka-Node alias">({{ item.kanode_alias }})</span>
+            <span v-else-if="item.beacon_alias" class="ml-1 text-caption text-medium-emphasis"
+                  title="Beacon alias">({{ item.beacon_alias }})</span>
             <v-chip
               v-if="item.transport === '' && item.source !== 'heard'"
               size="x-small"
@@ -277,12 +309,19 @@ onMounted(load)
               color="blue-grey"
             >relay</v-chip>
             <v-chip
-              v-if="item.transport === '' && item.source === 'heard'"
+              v-if="(item.transport === '' && item.source === 'heard') || item.kanode_alias"
               size="x-small"
               variant="outlined"
               class="ml-1"
               color="success"
             >digi</v-chip>
+            <v-chip
+              v-if="item.transports?.includes('netrom') || item.netrom_alias"
+              size="x-small"
+              variant="tonal"
+              class="ml-1"
+              color="deep-purple"
+            >NETROM</v-chip>
           </template>
           <template #item.last_heard="{ item }">
             <span v-if="item.source === 'heard' || item.last_heard">{{ fmtTs(item.last_heard) }}</span>
@@ -296,7 +335,8 @@ onMounted(load)
             <span v-if="item.transport === '' && item.source !== 'heard'" class="text-disabled">—</span>
             <span v-else-if="item.transport === '' && item.source === 'heard'" class="text-disabled">direct</span>
             <span v-else-if="item.via" class="text-mono">{{ item.via }}</span>
-            <span v-else class="text-disabled">direct</span>
+            <span v-else-if="item.source === 'heard'" class="text-disabled">direct</span>
+            <span v-else class="text-disabled">—</span>
           </template>
           <template #item.lat="{ item }">
             <span v-if="item.lat != null">{{ Number(item.lat).toFixed(4) }}</span>
@@ -352,6 +392,61 @@ onMounted(load)
         <NetworkGraph :graph-data="graphData" :loading="graphLoading" />
       </v-window-item>
 
+      <!-- NETROM routing table tab -->
+      <v-window-item value="netrom">
+        <div class="mb-2">
+          <span class="text-caption text-medium-emphasis">
+            NET/ROM routing table learned from NODES broadcasts.
+            Quality 255 = direct neighbor; lower values indicate routes via intermediate nodes.
+          </span>
+        </div>
+        <v-data-table
+          :headers="[
+            { title: 'Destination',   key: 'dest_call',     sortable: true },
+            { title: 'Alias',         key: 'alias',         sortable: true },
+            { title: 'Via Neighbor',  key: 'neighbor_call', sortable: true },
+            { title: 'Quality',       key: 'quality',       sortable: true },
+            { title: 'Advertised by', key: 'via_call',      sortable: true },
+            { title: 'Last Updated',  key: 'last_seen',     sortable: true },
+          ]"
+          :items="netromRoutes"
+          :loading="netromRoutesLoading"
+          density="compact"
+          hover
+        >
+          <template #item.dest_call="{ item }">
+            <span class="text-mono font-weight-medium">{{ item.dest_call }}</span>
+          </template>
+          <template #item.alias="{ item }">
+            <span v-if="item.alias" :style="`color:${ALIAS_COLORS.netrom}`" class="text-mono">{{ item.alias }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
+          <template #item.neighbor_call="{ item }">
+            <span class="text-mono">{{ item.neighbor_call }}</span>
+          </template>
+          <template #item.quality="{ item }">
+            <span class="text-mono">{{ item.quality }}</span>
+            <v-progress-linear
+              :model-value="item.quality"
+              :max="255"
+              :color="item.quality >= 200 ? 'success' : item.quality >= 100 ? 'warning' : 'error'"
+              height="3"
+              rounded
+              class="mt-1"
+              style="max-width: 60px; display: inline-block; vertical-align: middle; margin-left: 6px;"
+            />
+          </template>
+          <template #item.via_call="{ item }">
+            <span class="text-mono">{{ item.via_call }}</span>
+            <span v-if="item.via_alias" class="ml-1 text-caption text-medium-emphasis">({{ item.via_alias }})</span>
+          </template>
+          <template #item.last_seen="{ item }">{{ fmtTs(item.last_seen) }}</template>
+        </v-data-table>
+        <div v-if="!netromRoutesLoading && !netromRoutes.length" class="mt-4 text-center text-medium-emphasis text-body-2">
+          No NET/ROM routes learned yet. Routes are populated from NODES broadcasts.
+        </div>
+      </v-window-item>
+
       <!-- Map tab (geographic) -->
       <v-window-item value="map">
         <div class="mb-2">
@@ -371,7 +466,10 @@ onMounted(load)
         <v-card-title class="d-flex align-center">
           <v-icon start>mdi-pencil</v-icon>
           Edit {{ editItem.callsign }}
-          <span v-if="editItem.transport" class="text-caption text-medium-emphasis ml-2">({{ editItem.transport }})</span>
+          <span v-if="editItem.transports?.length" class="text-caption text-medium-emphasis ml-2">
+            ({{ editItem.transports.join(', ') }})
+          </span>
+          <span v-else-if="editItem.transport" class="text-caption text-medium-emphasis ml-2">({{ editItem.transport }})</span>
           <span v-else class="text-caption text-medium-emphasis ml-2">(relay node)</span>
         </v-card-title>
         <v-divider />
@@ -379,13 +477,19 @@ onMounted(load)
           <!-- Read-only info -->
           <v-row dense class="mb-2 text-body-2">
             <v-col cols="4" class="text-medium-emphasis">Transport</v-col>
-            <v-col cols="8">{{ editItem.transport || '—' }}</v-col>
+            <v-col cols="8">
+              {{ editItem.transports?.join(', ') || editItem.transport || '—' }}
+            </v-col>
             <v-col cols="4" class="text-medium-emphasis">First heard</v-col>
             <v-col cols="8">{{ (editItem.transport !== '' || editItem.source === 'heard') ? fmtTs(editItem.first_heard) : '—' }}</v-col>
             <v-col cols="4" class="text-medium-emphasis">Last heard</v-col>
             <v-col cols="8">{{ editItem.last_heard ? fmtTs(editItem.last_heard) : '—' }}</v-col>
             <v-col cols="4" class="text-medium-emphasis">Count</v-col>
             <v-col cols="8">{{ editItem.count }}</v-col>
+            <template v-if="editItem.netrom_alias">
+              <v-col cols="4" class="text-medium-emphasis">NET/ROM alias</v-col>
+              <v-col cols="8" :style="`color:${ALIAS_COLORS.netrom}`" class="text-mono">{{ editItem.netrom_alias }}</v-col>
+            </template>
           </v-row>
           <v-divider class="mb-3" />
           <v-row dense>
@@ -412,8 +516,17 @@ onMounted(load)
             <v-col cols="12" class="mt-2">
               <v-text-field
                 v-model="editItem.nodename"
-                label="Node name"
-                hint="Optional alias (e.g. AUBNOD). Set automatically when a station beacons a &lt;MAP:...&gt; tag."
+                label="Beacon alias"
+                hint="Auto-populated from &lt;MAP:...&gt; beacons. Informational only."
+                persistent-hint
+                density="compact"
+              />
+            </v-col>
+            <v-col cols="12" class="mt-2">
+              <v-text-field
+                v-model="editItem.kanode_alias"
+                label="Ka-Node alias"
+                hint="Sysop entry: the Ka-Node digipeater alias for this TNC (e.g. KROCK). If a matching station row exists it will be merged into this one."
                 persistent-hint
                 density="compact"
               />

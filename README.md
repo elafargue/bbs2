@@ -19,8 +19,10 @@ Welcome, W1AW-7!
 
 - **Multiple AX.25 transports** — KISS serial, KISS TCP (Dire Wolf), Linux kernel AF_AX25, and AGWPE/AGW Packet Engine
 - **TCP transport** for Telnet access and local development
+- **NET/ROM networking** — learns network topology from NODES broadcasts, advertises a node alias, and accepts inbound L3 connections routed through the NET/ROM mesh (AGWPE transport)
 - **Bulletin Board** — threaded messages organized into areas with per-area read/post access levels
 - **Multi-room Chat** — broadcast chat with private messaging and room history
+- **Heard stations** — logs every station heard on the air, with a web map and a network-topology graph
 - **Last Connections log** — persistent journal of every station that has visited
 - **OTP authentication** — TOTP (RFC 6238) and HOTP (RFC 4226), compatible with any standard authenticator app
 - **Web management interface** — Vue 3 + Vuetify SPA with real-time activity feed via WebSocket
@@ -118,9 +120,21 @@ bbs:
 
 Enable one or more transports. All enabled transports run concurrently.
 
-#### KISS over serial port
+#### Which transport should I use?
 
-Connects directly to a hardware TNC or Dire Wolf via a serial port. No `kissattach` required.
+| Transport      | Connected-mode (BBS sessions) | UI frames (APRS / beacons) | Platforms          | Notes                                              |
+|----------------|:-----------------------------:|:--------------------------:|--------------------|----------------------------------------------------|
+| `agwpe`        | ✅                            | ✅                         | Linux / macOS / Win | Recommended. Direwolf has AGWPE on TCP 8000.       |
+| `kernel_ax25`  | ✅                            | ✅                         | Linux only          | Native AX.25 sockets; requires `kissattach`.       |
+| `kiss_tcp`     | ❌ (UI only)                  | ✅                         | Linux / macOS / Win | **No AX.25 state machine.** See warning below.     |
+| `kiss_serial`  | ❌ (UI only)                  | ✅                         | Linux / macOS / Win | **No AX.25 state machine.** See warning below.     |
+| `tcp`          | n/a                           | n/a                        | All                 | Plain TCP / Telnet, no radio involved.             |
+
+> ⚠ **KISS transports are UI-frame only.** They handle APRS, beacons, and heard-station logging — but they do NOT implement AX.25 connected mode (SABM/UA/I-frames). A normal BBS client connecting over `kiss_tcp` or `kiss_serial` will time out. For real BBS sessions, use `agwpe` (works everywhere) or `kernel_ax25` (Linux). See `bbs/transport/kiss.py` for the rationale.
+
+#### KISS over serial port (UI-only)
+
+Reads UI frames from a hardware TNC or Dire Wolf over serial. Useful for APRS beaconing and heard-station logging, **not** for accepting BBS connections.
 
 ```yaml
 transports:
@@ -128,14 +142,16 @@ transports:
     enabled: true
     device: /dev/ttyACM0
     baud: 9600
-    port: 0              # AX.25 port number (0–15) inside KISS frames.
+    port: 0                 # AX.25 port number (0–15) inside KISS frames.
     beacon_text: "N0CALL-1 BBS"
-    beacon_interval: 20  # Minutes between beacons.
+    beacon_dest: BEACON     # Destination callsign for beacon UI frames.
+    beacon_interval: 20     # Minutes between beacons.
+    beacon_path: ""         # Digipeater path, e.g. "WIDE1-1,WIDE2-1".
 ```
 
-#### KISS over TCP
+#### KISS over TCP (UI-only)
 
-Connects to Dire Wolf's KISS TCP interface (default port 8001). No `kissattach` required.
+Reads UI frames from Dire Wolf's KISS TCP interface (default port 8001). Same UI-only limitation as `kiss_serial`.
 
 ```yaml
 transports:
@@ -145,7 +161,9 @@ transports:
     port: 8001
     ax25_port: 0
     beacon_text: "N0CALL-1 BBS"
+    beacon_dest: BEACON
     beacon_interval: 20
+    beacon_path: ""
 ```
 
 #### Linux kernel AF_AX25
@@ -246,6 +264,29 @@ web:
   sysop_password_hash: ""   # Set with: bbs2 --set-sysop-password
 ```
 
+### `netrom:`
+
+NET/ROM is the packet-radio internet's routing layer. When the `netrom:` block is present, bbs2 listens for NODES routing broadcasts to learn the network topology, optionally re-advertises a NETROM alias on the air, and accepts inbound L3 user connections (CONNECT REQ/INFO/DISC) ridden over an AX.25 crosslink to an adjacent node — so users on distant nodes can reach this BBS through the NET/ROM mesh.
+
+Inbound NETROM crosslinks are classified by router lookup: any incoming AX.25 connect from a callsign already in our adjacent-neighbor set (learned from NODES broadcasts, or seeded from the heard database at startup) is treated as a NETROM crosslink — no BBS banner is sent, and bbs2 waits for the L3 CONNECT REQUEST. Unknown callers get a normal BBS session. Currently supported on the `agwpe` transport.
+
+```yaml
+netrom:
+  alias: "PALO"             # Up to 6 chars. Blank = listen-only (no NODES TX).
+  nodes_interval: 30        # Minutes between our outbound NODES broadcasts.
+  route_ttl_minutes: 180    # Drop routes after this silent period.
+  hop_cost: 25              # Quality decrement when re-advertising a learned route.
+  min_advert_quality: 10    # Don't propagate routes below this after decrement.
+  advertise_self_only: true # Polite-client mode (default). NODES frames carry only
+                            # our own header, so peers add us as a direct neighbor
+                            # without us rebroadcasting their route tables. Set false
+                            # only when operating as a sanctioned transit node.
+  info_mtu: 108             # L3 info bytes per fragment (excludes the 20-byte L3
+                            # header). Must be <= (TNC PACLEN - 20), or oversize
+                            # frames are split at L2 and the headerless tail is
+                            # dropped. 108 suits PACLEN 128 (NORCAL/KPC-3 default).
+```
+
 ### `logging:`
 
 ```yaml
@@ -324,6 +365,14 @@ KD6XYZ    2026-04-11 20:05  2026-04-11 20:05  kiss_tcp     ident
 
 Requires `Identified` level. Connections are recorded after each session ends. Anonymous connections (no callsign established) are not recorded.
 
+### Heard Stations (`H`)
+
+Lists stations recently heard on the air. The plugin passively logs every station observed on the radio transports — direct and digipeated — into its own SQLite tables, and also parses NET/ROM NODES broadcasts and `<MAP:>` beacon tags to learn node aliases and locations. The same data powers the web **Map** and **Network Graph** views. Requires `Identified` level.
+
+### Info (`I`)
+
+Displays a configurable BBS description / welcome message. The sysop can edit the text in-session. Requires `Identified` level.
+
 ---
 
 ## Web Interface
@@ -335,6 +384,8 @@ The sysop web interface is a Vue 3 + Vuetify SPA served from `static/`. It commu
 - **Activity** — live scrolling log of all BBS events
 - **Users** — create, edit, approve, ban users; provision/revoke OTP secrets
 - **Bulletins** — manage areas; view, create, remove messages
+- **Map** — geographic map of heard stations (from `<MAP:>` beacon tags)
+- **Network Graph** — NET/ROM topology graph built from heard stations and NODES broadcasts
 - **Plugins** — enable/disable plugins, view per-plugin stats
 
 ### Building the frontend
@@ -370,6 +421,11 @@ Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests run wit
 | `tests/test_chat.py` | Chat broadcast, private messages, room commands |
 | `tests/test_kiss_codec.py` | KISS/AX.25 frame encoding and decoding |
 | `tests/test_session.py` | BBS session lifecycle |
+| `tests/test_netrom_frame.py` | NET/ROM L3 frame encode/decode |
+| `tests/test_netrom_router.py` | NODES routing table, quality/hop-cost logic |
+| `tests/test_netrom_circuit.py` | NET/ROM L4 circuit state machine and windowing |
+| `tests/test_netrom_l3.py`, `test_netrom_l3_integration.py` | L3 CONNECT handling end-to-end |
+| `tests/test_heard.py`, `test_heard_graph.py`, `test_heard_map.py` | Heard-station logging, schema, graph/map data |
 
 ### Project layout
 
@@ -377,7 +433,8 @@ Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests run wit
 bbs/
   main.py              Entry point and CLI
   config.py            Configuration loading and validation
-  ax25/                AX.25 address utilities and KISS frame codec
+  ax25/                AX.25 address utilities, KISS + NET/ROM L3 frame codecs
+    netrom_frame.py    NET/ROM L3/L4 frame encode/decode
   core/
     engine.py          Asyncio BBS engine, session lifecycle
     session.py         Per-connection session state
@@ -388,16 +445,23 @@ bbs/
     schema.py          SQLite schema creation and migrations
     users.py           User CRUD helpers
     connections.py     Connection journal helpers
+  netrom/
+    router.py          NODES routing table and NODES broadcast building
+    circuit.py         NET/ROM L4 circuit state machine (CONNECT/INFO/DISC)
   plugins/
     bulletins/         Bulletin board plugin
     chat/              Multi-room chat plugin
+    heard/             Heard-station logging (feeds web map + network graph)
+    info/              Configurable BBS info / welcome message
+    display/           Optional Raspberry Pi LCD framebuffer display (headless)
     lastconn/          Last connections plugin
   transport/
     base.py            Abstract transport and Connection types
     tcp.py             TCP (Telnet) transport
     kiss.py            KISS (serial and TCP) transport
     kernel_ax25.py     Linux kernel AF_AX25 transport
-    agwpe.py           AGWPE TCP API transport
+    agwpe.py           AGWPE TCP API transport (NET/ROM crosslink support)
+    web.py             Synthetic writer for browser web-terminal sessions
 server/
   app.py               Flask + SocketIO application
   web_interface.py     Web bridge (asyncio → SocketIO)

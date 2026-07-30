@@ -88,6 +88,7 @@ def _make_test_config(db_path: str, tcp_port: int) -> BBSConfig:
             "sysop_password_hash": "",
         },
         logging={"level": "WARNING", "file": ""},
+        netrom={},
         write_timeout=30,
         path_length_medium_hops=1,
         path_length_long_hops=3,

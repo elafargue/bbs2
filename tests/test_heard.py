@@ -109,7 +109,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT via FROM heard_stations WHERE callsign='KF6ANX'"
+                "SELECT via FROM heard_events WHERE callsign='KF6ANX'"
             )).fetchone()
         assert row[0] == "KJOHN*,KBULN,WOODY*,KBETH"
 
@@ -121,7 +121,7 @@ class TestOnHeard:
         async with aiosqlite.connect(plugin._db_path) as db:
             db.row_factory = aiosqlite.Row
             row = await (await db.execute(
-                "SELECT * FROM heard_stations WHERE callsign='W1AW'"
+                "SELECT * FROM heard_events WHERE callsign='W1AW'"
             )).fetchone()
         assert row is not None
         assert row["dest"] == "APRS"
@@ -137,7 +137,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT count FROM heard_stations WHERE callsign='W1AW'"
+                "SELECT count FROM heard_events WHERE callsign='W1AW' AND transport='agwpe'"
             )).fetchone()
         assert row[0] == 2
 
@@ -148,7 +148,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT via FROM heard_stations WHERE callsign='W6ELA'"
+                "SELECT via FROM heard_events WHERE callsign='W6ELA'"
             )).fetchone()
         assert row[0] == "WIDE1-1*,WIDE2-1"
 
@@ -229,7 +229,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT callsign FROM heard_stations WHERE callsign='W6ELA'"
+                "SELECT callsign FROM stations WHERE callsign='W6ELA'"
             )).fetchone()
         assert row is not None
 
@@ -252,7 +252,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT source FROM heard_stations WHERE callsign='KBETH' AND transport=''"
+                "SELECT source FROM heard_events WHERE callsign='KBETH' AND transport=''"
             )).fetchone()
         assert row is not None
         assert row[0] == "heard"
@@ -276,7 +276,7 @@ class TestOnHeard:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT source FROM heard_stations WHERE callsign='KBETH' AND transport=''"
+                "SELECT source FROM heard_events WHERE callsign='KBETH' AND transport=''"
             )).fetchone()
         assert row is not None
         assert row[0] == "via"
@@ -360,7 +360,7 @@ class TestPrune:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             calls = [r[0] for r in await (await db.execute(
-                "SELECT callsign FROM heard_stations"
+                "SELECT callsign FROM stations"
             )).fetchall()]
         assert "W1NEW" in calls
         assert "W1OLD" in calls  # station record is retained
@@ -375,7 +375,7 @@ class TestPrune:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT count(*) FROM heard_stations"
+                "SELECT count(*) FROM stations"
             )).fetchone()
         assert row[0] == 1
 
@@ -409,7 +409,7 @@ class TestClear:
 
         async with aiosqlite.connect(plugin._db_path) as db:
             row = await (await db.execute(
-                "SELECT count(*) FROM heard_stations"
+                "SELECT count(*) FROM stations"
             )).fetchone()
         assert row[0] == 0
 
@@ -430,6 +430,111 @@ class TestClear:
         plugin = await _make_plugin()
         removed = await plugin._clear()
         assert removed == 0
+
+
+# ---------------------------------------------------------------------------
+# Ka-Node alias resolution + cache invalidation
+# ---------------------------------------------------------------------------
+
+class TestKanodeAlias:
+    async def test_via_hop_resolves_through_kanode_map(self):
+        """When KROCK is registered as the Ka-Node alias of K6FB-5, a frame
+        with KROCK in the via path seeds K6FB-5, not KROCK."""
+        plugin = await _make_plugin()
+        now = int(time.time())
+
+        # Sysop sets K6FB-5.kanode_alias = 'KROCK'
+        async with aiosqlite.connect(plugin._db_path) as db:
+            await db.execute(
+                "INSERT INTO stations (callsign, kanode_alias, first_seen, last_seen)"
+                " VALUES ('K6FB-5', 'KROCK', ?, ?)",
+                (now, now),
+            )
+            await db.commit()
+        await plugin._refresh_kanode_map()
+
+        # Frame from KK6FPP digipeated via KROCK
+        await plugin.on_heard(
+            "KK6FPP", "BEACON", ["KROCK*"], now, "agwpe", "",
+        )
+
+        async with aiosqlite.connect(plugin._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # K6FB-5 should have received the digi seeding (transport='')
+            async with db.execute(
+                "SELECT count FROM heard_events WHERE callsign='K6FB-5' AND transport=''"
+            ) as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            # KROCK should NOT exist as its own row
+            async with db.execute(
+                "SELECT 1 FROM stations WHERE callsign='KROCK'"
+            ) as cur:
+                assert await cur.fetchone() is None
+
+    async def test_clearing_kanode_alias_evicts_cache(self):
+        """If the sysop clears a Ka-Node alias, the next refresh must remove it
+        from the in-memory map so KROCK resolves to itself again."""
+        plugin = await _make_plugin()
+        now = int(time.time())
+
+        async with aiosqlite.connect(plugin._db_path) as db:
+            await db.execute(
+                "INSERT INTO stations (callsign, kanode_alias, first_seen, last_seen)"
+                " VALUES ('K6FB-5', 'KROCK', ?, ?)",
+                (now, now),
+            )
+            await db.commit()
+        await plugin._refresh_kanode_map()
+        assert plugin._kanode_map.get("KROCK") == "K6FB-5"
+
+        # Sysop clears the alias.
+        async with aiosqlite.connect(plugin._db_path) as db:
+            await db.execute(
+                "UPDATE stations SET kanode_alias='' WHERE callsign='K6FB-5'"
+            )
+            await db.commit()
+        await plugin._refresh_kanode_map()
+        assert "KROCK" not in plugin._kanode_map
+
+
+# ---------------------------------------------------------------------------
+# Migration sentinel — netrom_alias→beacon_alias self-healing is one-shot
+# ---------------------------------------------------------------------------
+
+class TestMigrationSentinel:
+    async def test_fix_skipped_when_sentinel_set(self):
+        """If a station has netrom_alias set with no heard_events 'netrom' row
+        but the sentinel is set, the fix must NOT rewrite it."""
+        tmp = tempfile.mkdtemp(prefix="bbs2_heard_sentinel_test_")
+        db_path = str(Path(tmp) / "test.db")
+
+        # First init: creates schema, sets sentinel.
+        plugin = HeardPlugin()
+        await plugin.initialize({"enabled": True, "max_age_hours": 0}, db_path)
+
+        # Now drop a row that LOOKS like the bug: netrom_alias set, no
+        # transport='netrom' event.  Without the sentinel this would be
+        # rewritten on next init.
+        now = int(time.time())
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "INSERT INTO stations (callsign, netrom_alias, first_seen, last_seen)"
+                " VALUES ('K6FB-5', 'ROCK', ?, ?)",
+                (now, now),
+            )
+            await db.commit()
+
+        # Re-initialize — sentinel should prevent the fix from touching the row.
+        plugin2 = HeardPlugin()
+        await plugin2.initialize({"enabled": True, "max_age_hours": 0}, db_path)
+
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "SELECT netrom_alias, beacon_alias FROM stations WHERE callsign='K6FB-5'"
+            ) as cur:
+                row = await cur.fetchone()
+        assert row == ("ROCK", "")
 
 
 # ---------------------------------------------------------------------------

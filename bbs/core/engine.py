@@ -27,6 +27,7 @@ from bbs.core.plugin_registry import PluginRegistry
 from bbs.core.session import BBSSession, SessionState
 from bbs.db.connections import prune_old_connections, upsert_connection
 from bbs.db.schema import init_db
+from bbs.netrom.router import NetromRouter
 from bbs.transport import build_transports
 from bbs.transport.base import Connection
 
@@ -112,10 +113,97 @@ class BBSEngine:
                 "Heard-station observer registered on %d transport(s)", len(transports)
             )
 
+        # Wire NETROM router onto supporting transports.
+        # Listening (RX) requires only the netrom section to be present.
+        # Broadcasting (TX) additionally requires an alias to be set.
+        netrom_router = None
+        netrom_cfg = self.cfg.netrom or {}
+        if netrom_cfg:
+            netrom_alias = str(netrom_cfg.get("alias", "")).strip().upper()
+            netrom_router = NetromRouter(
+                self.cfg.full_callsign,
+                netrom_alias,
+                route_ttl_seconds=int(
+                    netrom_cfg.get("route_ttl_minutes", 180)
+                ) * 60,
+                hop_cost=int(netrom_cfg.get("hop_cost", 25)),
+                min_advert_quality=int(netrom_cfg.get("min_advert_quality", 10)),
+                advertise_self_only=bool(
+                    netrom_cfg.get("advertise_self_only", True)
+                ),
+            )
+            # Seed the in-memory routing table from the heard plugin's
+            # netrom_routes table so we don't begin every restart with
+            # an empty router (which would suppress NODES TX for ~30 min).
+            # Seeding bypasses the nodes_observer, so heard rows aren't
+            # re-written.
+            try:
+                seeded = await netrom_router.seed_from_db(str(self.cfg.db_path))
+                if seeded:
+                    logger.info(
+                        "NETROM router seeded from heard DB: %d route(s)",
+                        seeded,
+                    )
+            except Exception:
+                logger.warning("netrom router seed failed", exc_info=True)
+            # Wire heard plugin as the NODES observer so routing table updates
+            # feed into the heard_stations / netrom_routes tables and backfill
+            # node aliases on previously-heard RF stations.
+            heard_plugin = self.plugin_registry.get("heard")
+            if heard_plugin is not None and heard_plugin.enabled:
+                netrom_router.set_nodes_observer(
+                    heard_plugin.on_netrom_nodes  # type: ignore[attr-defined]
+                )
+                logger.info("NETROM nodes observer wired to heard plugin")
+            nodes_interval_s = max(1, int(netrom_cfg.get("nodes_interval", 30))) * 60
+            # Outbound NETROM L3 info-MTU.  Default 108 = PACLEN 128 - 20.
+            # Operators with a different direwolf.conf PACLEN must set this
+            # to (PACLEN - 20) or the TNC will split L3 frames at L2 and
+            # drop the headerless second half on the wire.
+            info_mtu = int(netrom_cfg.get("info_mtu", 108))
+            # Classification of incoming AX.25 connections as NETROM vs.
+            # direct BBS is delegated to a router-lookup closure.  Captures
+            # `netrom_router` by reference so the set is always current.
+            def _is_netrom_neighbor(
+                call: str, _router=netrom_router
+            ) -> bool:
+                return call.upper() in _router.adjacent_neighbors
+            for t in transports:
+                t.set_netrom_observer(netrom_router.on_netrom_frame)
+                t.set_netrom_nodes_interval(nodes_interval_s)
+                # Accept inbound NETROM L3 crosslinks on transports that can
+                # demultiplex them (AGWPE today; no-op elsewhere).
+                t.set_netrom_crosslink_enabled(True)
+                t.set_netrom_neighbor_check(_is_netrom_neighbor)
+                t.set_netrom_info_mtu(info_mtu)
+                if netrom_alias:
+                    # Only register the builder (and thus start the broadcast
+                    # loop) when we have a node alias to advertise.
+                    t.set_netrom_nodes_builder(netrom_router.build_nodes_payload)
+            logger.info(
+                "NETROM router %s wired onto %d transport(s) — alias: %s, "
+                "classifier: router-lookup",
+                self.cfg.full_callsign, len(transports),
+                netrom_alias if netrom_alias else "(listen-only, no alias set)",
+            )
+
         transport_tasks = [
             asyncio.create_task(t.start(self._on_connection), name=f"transport:{t.transport_id}")
             for t in transports
         ]
+
+        # Periodic NETROM route expiry — only runs when the router is wired.
+        netrom_prune_task: asyncio.Task | None = None
+        if netrom_router is not None:
+            async def _netrom_prune_loop(router=netrom_router) -> None:
+                while True:
+                    await asyncio.sleep(60)
+                    n = router.prune_stale_routes()
+                    if n:
+                        logger.info("netrom: pruned %d stale route(s)", n)
+            netrom_prune_task = asyncio.create_task(
+                _netrom_prune_loop(), name="netrom:prune"
+            )
 
         self._emit_log(f"BBS {self.cfg.full_callsign} online — {len(transports)} transport(s)")
         logger.info("BBS engine running")
@@ -128,6 +216,8 @@ class BBSEngine:
 
         # Graceful shutdown
         logger.info("BBS engine shutting down…")
+        if netrom_prune_task is not None:
+            netrom_prune_task.cancel()
         for task in transport_tasks:
             task.cancel()
 

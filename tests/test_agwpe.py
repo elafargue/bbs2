@@ -6,7 +6,7 @@ Covers:
   - Callsign encode / decode round-trips
   - AGWPETransport connection lifecycle:
       login, callsign registration, incoming 'C' / 'D' / 'd' frames
-  - Beacon: 'T' frame (no path) and 'V' frame (with digipeater path)
+  - Beacon: 'M' frame (no path) and 'V' frame (with digipeater path)
 
 No real network socket is used.  A pair of asyncio.StreamReader / bytes-buffer
 objects stand in for the TCP connection to AGWPE.
@@ -517,7 +517,10 @@ class TestAGWPEBeaconFrames:
 
         assert len(fw.written) >= _HEADER_SIZE
         h = _unpack_header(bytes(fw.written[:_HEADER_SIZE + len(b"test beacon")]))
-        assert h["kind"] == "T"
+        # AGWPE 'M' = Send UNPROTO Information (no via). 'T' was a server→
+        # client confirmation; Direwolf rejects it as INVALID when sent
+        # client→server.
+        assert h["kind"] == "M"
         assert h["data"] == b"test beacon"
 
     async def test_beacon_with_path_sends_V_frame(self):

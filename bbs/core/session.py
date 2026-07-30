@@ -145,7 +145,7 @@ class BBSSession:
             db.row_factory = aiosqlite.Row
             self.db = db
 
-            _ax25_transports = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe")
+            _ax25_transports = ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "netrom")
             _is_ax25 = self.conn.transport_id in _ax25_transports
             _is_web = self.conn.transport_id == "web"
             if _is_ax25:
@@ -279,7 +279,7 @@ class BBSSession:
 
         TCP transport: no callsign embedded; ask the user.
         """
-        if self.conn.transport_id in ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe"):
+        if self.conn.transport_id in ("kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "netrom"):
             # Callsign comes from connection layer — already verified by kernel/TNC.
             # Strip the SSID: user accounts are keyed on the base callsign so that
             # the same operator connecting via -7 or -3 gets the same record.

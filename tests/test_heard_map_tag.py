@@ -111,8 +111,12 @@ async def _fetch_station(plugin: HeardPlugin, callsign: str, transport: str) -> 
     async with aiosqlite.connect(plugin._db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT lat, lon, nodename, position_source "
-            "FROM heard_stations WHERE callsign = ? AND transport = ?",
+            """
+            SELECT s.lat, s.lon, s.beacon_alias AS nodename, s.position_source
+            FROM stations s
+            JOIN heard_events e ON e.callsign = s.callsign
+            WHERE s.callsign = ? AND e.transport = ?
+            """,
             (callsign.upper(), transport),
         ) as cur:
             row = await cur.fetchone()
@@ -161,7 +165,7 @@ class TestOnHeardMapTag:
         # No row was implicitly created for KK6SEN either
         async with aiosqlite.connect(plugin._db_path) as db:
             async with db.execute(
-                "SELECT 1 FROM heard_stations WHERE callsign='KK6SEN'"
+                "SELECT 1 FROM stations WHERE callsign='KK6SEN'"
             ) as cur:
                 assert await cur.fetchone() is None
 

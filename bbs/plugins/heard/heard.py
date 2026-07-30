@@ -11,6 +11,13 @@ up automatically at startup when the plugin is enabled.
 
 Access: IDENTIFIED — any station with a callsign can view the list.
 Sysop:  can configure max_age_hours interactively or via the web UI.
+
+Schema (v2)
+-----------
+  stations      — one row per callsign; station identity, position, aliases.
+  heard_events  — one row per (callsign, transport); per-transport observation data.
+  heard_paths   — one row per (callsign, transport, via_base); path history.
+  netrom_routes — NET/ROM routing table; PK (dest_call, neighbor_call).
 """
 from __future__ import annotations
 
@@ -18,6 +25,8 @@ import logging
 import re
 import time
 from typing import Any, TYPE_CHECKING
+
+from bbs.ax25.netrom_frame import NodesFrame
 
 import aiosqlite
 
@@ -32,21 +41,28 @@ if TYPE_CHECKING:
     from bbs.core.terminal import Terminal
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS heard_stations (
-    callsign    TEXT    NOT NULL COLLATE NOCASE,
-    dest        TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-    transport   TEXT    NOT NULL DEFAULT '',
-    via         TEXT    NOT NULL DEFAULT '',
-    first_heard INTEGER NOT NULL,
-    last_heard  INTEGER NOT NULL,
-    count       INTEGER NOT NULL DEFAULT 1,
-    lat         REAL,
-    lon         REAL,
-    comment     TEXT    NOT NULL DEFAULT '',
-    source      TEXT    NOT NULL DEFAULT 'heard',
+CREATE TABLE IF NOT EXISTS stations (
+    callsign        TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+    lat             REAL,
+    lon             REAL,
+    comment         TEXT    NOT NULL DEFAULT '',
+    position_source TEXT    NOT NULL DEFAULT '',
+    netrom_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    beacon_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    kanode_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    first_seen      INTEGER NOT NULL DEFAULT 0,
+    last_seen       INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS heard_events (
+    callsign          TEXT    NOT NULL COLLATE NOCASE,
+    transport         TEXT    NOT NULL DEFAULT '',
+    source            TEXT    NOT NULL DEFAULT 'heard',
+    first_heard       INTEGER NOT NULL,
+    last_heard        INTEGER NOT NULL,
+    count             INTEGER NOT NULL DEFAULT 0,
     last_direct_heard INTEGER NOT NULL DEFAULT 0,
-    nodename        TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
-    position_source TEXT NOT NULL DEFAULT '',
+    dest              TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    via               TEXT    NOT NULL DEFAULT '',
     PRIMARY KEY (callsign, transport)
 );
 CREATE TABLE IF NOT EXISTS heard_paths (
@@ -62,6 +78,16 @@ CREATE TABLE IF NOT EXISTS heard_paths (
 CREATE TABLE IF NOT EXISTS heard_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS netrom_routes (
+    dest_call     TEXT NOT NULL COLLATE NOCASE,
+    neighbor_call TEXT NOT NULL COLLATE NOCASE,
+    alias         TEXT NOT NULL DEFAULT '',
+    quality       INTEGER NOT NULL DEFAULT 0,
+    via_call      TEXT NOT NULL COLLATE NOCASE,
+    via_alias     TEXT NOT NULL DEFAULT '',
+    last_seen     INTEGER NOT NULL,
+    PRIMARY KEY (dest_call, neighbor_call)
 );
 """
 
@@ -271,63 +297,214 @@ class HeardPlugin(BBSPlugin):
         super().__init__()
         # In-memory cache; refreshed from DB on each session start.
         self._max_age_hours: int = _DEFAULT_MAX_AGE_HOURS
+        # Ka-Node alias → owner callsign (e.g. 'KROCK' → 'K6FB-5').
+        # Loaded at startup, refreshed when sysop saves a kanode_alias.
+        self._kanode_map: dict[str, str] = {}
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
         await super().initialize(cfg, db_path)
         async with aiosqlite.connect(db_path, timeout=30) as db:
-            await db.executescript(_SCHEMA)
-            # Migrate heard_stations: add via column if absent.
-            try:
-                await db.execute(
-                    "ALTER TABLE heard_stations ADD COLUMN via TEXT NOT NULL DEFAULT ''"
+
+            # ── Detect existing tables ────────────────────────────────────────
+            tables_cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+            table_names = {r[0].lower() for r in await tables_cur.fetchall()}
+
+            # ── Migrate heard_paths if it predates the via_base column ────────
+            if "heard_paths" in table_names:
+                try:
+                    await db.execute("SELECT via_base FROM heard_paths LIMIT 1")
+                except Exception:
+                    # Very old schema: drop and recreate (ephemeral path data).
+                    await db.execute("DROP TABLE heard_paths")
+                    table_names.discard("heard_paths")
+
+            # ── Migrate heard_stations → stations + heard_events (schema v2) ──
+            if "heard_stations" in table_names and "stations" not in table_names:
+                logger.info(
+                    "heard plugin: migrating heard_stations → stations + heard_events …"
                 )
-            except Exception:
-                pass  # column already exists
-            try:
-                await db.execute(
-                    "ALTER TABLE heard_stations ADD COLUMN last_direct_heard INTEGER NOT NULL DEFAULT 0"
-                )
-            except Exception:
-                pass  # column already exists
-            try:
-                await db.execute(
-                    "ALTER TABLE heard_stations ADD COLUMN nodename TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
-                )
-            except Exception:
-                pass  # column already exists
-            try:
-                await db.execute(
-                    "ALTER TABLE heard_stations ADD COLUMN position_source TEXT NOT NULL DEFAULT ''"
-                )
-            except Exception:
-                pass  # column already exists
-            # Migrate heard_paths: if via_base column is absent the table uses
-            # the old schema (unique on raw via string).  Drop and recreate —
-            # this is ephemeral data and correctness matters more than history.
-            try:
-                await db.execute("SELECT via_base FROM heard_paths LIMIT 1")
-            except Exception:
-                await db.execute("DROP TABLE heard_paths")
                 await db.execute("""
-                    CREATE TABLE heard_paths (
-                        callsign  TEXT    NOT NULL COLLATE NOCASE,
-                        transport TEXT    NOT NULL DEFAULT '',
-                        via_base  TEXT    NOT NULL DEFAULT '',
-                        via       TEXT    NOT NULL DEFAULT '',
-                        first_seen INTEGER NOT NULL,
-                        last_seen  INTEGER NOT NULL,
-                        count      INTEGER NOT NULL DEFAULT 1,
-                        UNIQUE (callsign, transport, via_base)
+                    CREATE TABLE IF NOT EXISTS stations (
+                        callsign        TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+                        lat             REAL,
+                        lon             REAL,
+                        comment         TEXT    NOT NULL DEFAULT '',
+                        position_source TEXT    NOT NULL DEFAULT '',
+                        netrom_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                        beacon_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                        first_seen      INTEGER NOT NULL DEFAULT 0,
+                        last_seen       INTEGER NOT NULL DEFAULT 0
                     )
                 """)
-            # Seed max_age_hours from YAML config only if not already stored.
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS heard_events (
+                        callsign          TEXT    NOT NULL COLLATE NOCASE,
+                        transport         TEXT    NOT NULL DEFAULT '',
+                        source            TEXT    NOT NULL DEFAULT 'heard',
+                        first_heard       INTEGER NOT NULL,
+                        last_heard        INTEGER NOT NULL,
+                        count             INTEGER NOT NULL DEFAULT 0,
+                        last_direct_heard INTEGER NOT NULL DEFAULT 0,
+                        dest              TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                        via               TEXT    NOT NULL DEFAULT '',
+                        PRIMARY KEY (callsign, transport)
+                    )
+                """)
+                # Station identity: one row per callsign, RF-heard metadata wins
+                # over NETROM-only rows for position / comment.  The old nodename
+                # column was a catch-all (beacons, manual edits, NETROM NODES) so
+                # it goes into beacon_alias; netrom_alias will repopulate from the
+                # next NODES broadcast.
+                await db.execute("""
+                    INSERT INTO stations
+                        (callsign, lat, lon, comment, position_source,
+                         beacon_alias, first_seen, last_seen)
+                    SELECT
+                        callsign,
+                        MAX(CASE WHEN transport != 'netrom' AND lat IS NOT NULL
+                                 THEN lat END),
+                        MAX(CASE WHEN transport != 'netrom' AND lon IS NOT NULL
+                                 THEN lon END),
+                        COALESCE(MAX(CASE WHEN transport != 'netrom'
+                                         AND comment != ''
+                                         THEN comment END), ''),
+                        COALESCE(MAX(CASE WHEN transport != 'netrom'
+                                         AND position_source != ''
+                                         THEN position_source END), ''),
+                        COALESCE(MAX(CASE WHEN nodename != '' THEN nodename END), ''),
+                        MIN(first_heard),
+                        MAX(last_heard)
+                    FROM heard_stations
+                    GROUP BY callsign
+                """)
+                # Per-transport observations: all rows, all transports, verbatim.
+                await db.execute("""
+                    INSERT OR IGNORE INTO heard_events
+                        (callsign, transport, source, first_heard, last_heard,
+                         count, last_direct_heard, dest, via)
+                    SELECT callsign, transport, source, first_heard, last_heard,
+                           count, last_direct_heard, dest, via
+                    FROM heard_stations
+                """)
+                await db.execute("DROP TABLE heard_stations")
+                table_names.discard("heard_stations")
+                table_names.update({"stations", "heard_events"})
+                logger.info("heard plugin: heard_stations migration complete")
+
+            # ── One-shot fix for an early migration bug ───────────────────────
+            # The first version of the schema-v2 migration wrote
+            # heard_stations.nodename → netrom_alias.  It should have gone to
+            # beacon_alias (the original source was ambiguous).  Detect by:
+            # netrom_alias set but no heard_events row with transport='netrom'.
+            # Gated by a heard_settings sentinel so this only runs on databases
+            # that pre-date the fix; otherwise a legit netrom_alias whose
+            # heard_events 'netrom' row gets pruned in the future could be
+            # erroneously rewritten on the next startup.
+            if (
+                "stations" in table_names
+                and "heard_events" in table_names
+                and "heard_settings" in table_names
+            ):
+                done_row = await (await db.execute(
+                    "SELECT value FROM heard_settings"
+                    " WHERE key = 'migration_alias_fix_done'"
+                )).fetchone()
+                if not done_row:
+                    fixed = await db.execute(
+                        """
+                        UPDATE stations
+                           SET beacon_alias = CASE WHEN beacon_alias = ''
+                                                   THEN netrom_alias
+                                                   ELSE beacon_alias END,
+                               netrom_alias = ''
+                         WHERE netrom_alias != ''
+                           AND NOT EXISTS (
+                                   SELECT 1 FROM heard_events e
+                                    WHERE e.callsign = stations.callsign
+                                      AND e.transport = 'netrom'
+                               )
+                        """
+                    )
+                    if fixed.rowcount:
+                        logger.info(
+                            "heard plugin: corrected netrom_alias → beacon_alias"
+                            " for %d station(s)", fixed.rowcount
+                        )
+                    await db.execute(
+                        "INSERT OR REPLACE INTO heard_settings (key, value)"
+                        " VALUES ('migration_alias_fix_done', '1')"
+                    )
+
+            # ── Add kanode_alias column if not present ────────────────────────
+            if "stations" in table_names:
+                try:
+                    await db.execute("SELECT kanode_alias FROM stations LIMIT 1")
+                except Exception:
+                    await db.execute(
+                        "ALTER TABLE stations ADD COLUMN"
+                        " kanode_alias TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
+                    )
+                    logger.info("heard plugin: added kanode_alias column to stations")
+
+            # ── Migrate netrom_routes to composite PK (dest_call, neighbor_call)
+            if "netrom_routes" in table_names:
+                pk_rows = await (await db.execute(
+                    "PRAGMA table_info(netrom_routes)"
+                )).fetchall()
+                pk_count = sum(1 for r in pk_rows if r[5] > 0)
+                if pk_count == 1:
+                    logger.info(
+                        "heard plugin: migrating netrom_routes to composite PK …"
+                    )
+                    await db.execute("""
+                        CREATE TABLE netrom_routes_new (
+                            dest_call     TEXT NOT NULL COLLATE NOCASE,
+                            neighbor_call TEXT NOT NULL COLLATE NOCASE,
+                            alias         TEXT NOT NULL DEFAULT '',
+                            quality       INTEGER NOT NULL DEFAULT 0,
+                            via_call      TEXT NOT NULL COLLATE NOCASE,
+                            via_alias     TEXT NOT NULL DEFAULT '',
+                            last_seen     INTEGER NOT NULL,
+                            PRIMARY KEY (dest_call, neighbor_call)
+                        )
+                    """)
+                    await db.execute("""
+                        INSERT OR IGNORE INTO netrom_routes_new
+                            (dest_call, neighbor_call, alias, quality,
+                             via_call, via_alias, last_seen)
+                        SELECT dest_call, neighbor_call, alias, quality,
+                               via_call, via_alias, last_seen
+                        FROM netrom_routes
+                    """)
+                    await db.execute("DROP TABLE netrom_routes")
+                    await db.execute(
+                        "ALTER TABLE netrom_routes_new RENAME TO netrom_routes"
+                    )
+                    logger.info("heard plugin: netrom_routes migration complete")
+
+            await db.commit()
+
+        # ── Apply schema (idempotent; creates missing tables on fresh install) ─
+        async with aiosqlite.connect(db_path, timeout=30) as db:
+            await db.executescript(_SCHEMA)
             default = int(cfg.get("max_age_hours", _DEFAULT_MAX_AGE_HOURS))
             await db.execute(
                 "INSERT OR IGNORE INTO heard_settings (key, value) VALUES ('max_age_hours', ?)",
                 (str(default),),
             )
+            # Mark the one-shot netrom_alias→beacon_alias migration as done on
+            # fresh installs so it never runs (idempotent; existing DBs may
+            # already have a real or empty value, which is preserved).
+            await db.execute(
+                "INSERT OR IGNORE INTO heard_settings (key, value)"
+                " VALUES ('migration_alias_fix_done', '1')"
+            )
             await db.commit()
+
         self._max_age_hours = await self._load_max_age()
+        await self._refresh_kanode_map()
 
     # ── Settings helpers ──────────────────────────────────────────────────────
 
@@ -348,9 +525,29 @@ class HeardPlugin(BBSPlugin):
             await db.commit()
         self._max_age_hours = hours
 
+    async def _refresh_kanode_map(self) -> None:
+        """Reload kanode_alias → owner callsign map from the DB.
+
+        Called at startup (after schema is applied) and after each sysop edit
+        via PUT /api/heard/<callsign>.  Building a fresh dict from scratch
+        means clearing a Ka-Node alias also evicts the stale mapping.
+        """
+        try:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                async with db.execute(
+                    "SELECT callsign, kanode_alias FROM stations WHERE kanode_alias != ''"
+                ) as cur:
+                    rows = await cur.fetchall()
+            self._kanode_map = {alias.upper(): call.upper() for call, alias in rows}
+        except Exception:
+            logger.warning(
+                "heard plugin: _refresh_kanode_map failed; "
+                "Ka-Node alias resolution may be stale", exc_info=True,
+            )
+
     async def _prune(self) -> int:
         """Delete path entries older than max_age_hours.
-        Station records are retained in the database indefinitely.
+        Station identity records (stations table) are retained indefinitely.
         Returns the number of path entries removed."""
         if self._max_age_hours <= 0:
             return 0
@@ -370,7 +567,8 @@ class HeardPlugin(BBSPlugin):
     ) -> None:
         """
         Called by RF transports when a frame is received that is NOT addressed
-        to the BBS.  Records/updates the heard-stations and heard_paths tables.
+        to the BBS.  Records/updates the stations, heard_events and heard_paths
+        tables.
         """
         src_up   = src.upper()
         dest_up  = dest.upper()
@@ -383,26 +581,41 @@ class HeardPlugin(BBSPlugin):
         via_base  = ",".join(v.rstrip("*") for v in via)  # normalised for digi rows
 
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
-            # ── heard_stations: upsert source station ─────────────────────────
+            # ── stations: ensure identity row exists ──────────────────────────
+            await db.execute(
+                "INSERT OR IGNORE INTO stations (callsign, first_seen, last_seen)"
+                " VALUES (?, ?, ?)",
+                (src_up, ts, ts),
+            )
+            await db.execute(
+                "UPDATE stations SET last_seen = MAX(last_seen, ?) WHERE callsign = ?",
+                (ts, src_up),
+            )
+
+            # ── heard_events: upsert per-transport observation ────────────────
             await db.execute(
                 """
-                INSERT INTO heard_stations
-                    (callsign, dest, transport, via, first_heard, last_heard, count, source, last_direct_heard)
-                VALUES (?, ?, ?, ?, ?, ?, 1, 'heard', ?)
+                INSERT INTO heard_events
+                    (callsign, transport, source, first_heard, last_heard,
+                     count, last_direct_heard, dest, via)
+                VALUES (?, ?, 'heard', ?, ?, 1, ?, ?, ?)
                 ON CONFLICT(callsign, transport) DO UPDATE SET
-                    last_heard = excluded.last_heard,
-                    count      = count + 1,
-                    dest       = excluded.dest,
-                    via        = excluded.via,
-                    source     = 'heard',
+                    last_heard        = excluded.last_heard,
+                    count             = count + 1,
+                    dest              = excluded.dest,
+                    via               = excluded.via,
+                    source            = 'heard',
                     last_direct_heard = CASE
                         WHEN ? THEN excluded.last_direct_heard
                         ELSE last_direct_heard
                     END
                 """,
-                (src_up, dest_up, transport, via_str, ts, ts, ts if is_direct else 0, 1 if is_direct else 0),
+                (src_up, transport, ts, ts,
+                 ts if is_direct else 0, dest_up, via_str,
+                 1 if is_direct else 0),
             )
-            # Auto-seed relay digipeaters from the via path.
+
+            # ── Auto-seed relay digipeaters from the via path ─────────────────
             # Three tiers based on position relative to the last H-bit (*):
             #   i == last_star_idx: BBS received RF directly from this digi.
             #                       Update last_heard, mark source='heard'.
@@ -419,47 +632,68 @@ class HeardPlugin(BBSPlugin):
                 _digi = _part.rstrip("*").strip().upper()
                 if not _digi or _digi == src_up:
                     continue
+                # Resolve Ka-Node alias → owner callsign so digi activity is
+                # attributed to the owning station (e.g. KROCK → K6FB-5).
+                _effective_digi = self._kanode_map.get(_digi, _digi)
+
+                # Always ensure station identity row exists.
+                await db.execute(
+                    "INSERT OR IGNORE INTO stations (callsign, first_seen, last_seen)"
+                    " VALUES (?, ?, ?)",
+                    (_effective_digi, ts, ts),
+                )
+
                 if _i > _last_star:
-                    # Speculative — only ensure the row exists.
+                    # Speculative — only seed the heard_events row, no time update.
                     await db.execute(
                         """
-                        INSERT OR IGNORE INTO heard_stations
-                            (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source, last_direct_heard)
-                        VALUES (?, '', '', '', ?, ?, 0, 'via', 0)
+                        INSERT OR IGNORE INTO heard_events
+                            (callsign, transport, source,
+                             first_heard, last_heard, count, last_direct_heard,
+                             dest, via)
+                        VALUES (?, '', 'via', ?, ?, 0, 0, '', '')
                         """,
-                        (_digi, ts, ts),
+                        (_effective_digi, ts, ts),
                     )
                 elif _i == _last_star:
-                    # Directly heard: BBS received the RF signal from this node.
+                    # Directly heard: BBS received the RF signal from this digi.
+                    await db.execute(
+                        "UPDATE stations SET last_seen = MAX(last_seen, ?) WHERE callsign = ?",
+                        (ts, _effective_digi),
+                    )
                     await db.execute(
                         """
-                        INSERT INTO heard_stations
-                            (callsign, dest, transport, via,
-                             first_heard, last_heard, count, source, last_direct_heard)
-                        VALUES (?, '', '', '', ?, ?, 0, 'heard', ?)
+                        INSERT INTO heard_events
+                            (callsign, transport, source,
+                             first_heard, last_heard, count, last_direct_heard,
+                             dest, via)
+                        VALUES (?, '', 'heard', ?, ?, 0, ?, '', '')
                         ON CONFLICT(callsign, transport) DO UPDATE SET
-                            last_heard = MAX(last_heard, excluded.last_heard),
-                            last_direct_heard = MAX(last_direct_heard, excluded.last_direct_heard),
-                            source     = 'heard'
+                            last_heard        = MAX(last_heard, excluded.last_heard),
+                            last_direct_heard = MAX(last_direct_heard,
+                                                    excluded.last_direct_heard),
+                            source            = 'heard'
                         """,
-                        (_digi, ts, ts, ts),
+                        (_effective_digi, ts, ts, ts),
                     )
                 else:
                     if _part.endswith("*"):
                         # Some transports mark intermediate digis with '*'.
                         await db.execute(
                             """
-                            INSERT INTO heard_stations
-                                (callsign, dest, transport, via,
-                                 first_heard, last_heard, count, source, last_direct_heard)
-                            VALUES (?, '', '', '', ?, ?, 0, 'heard', ?)
+                            INSERT INTO heard_events
+                                (callsign, transport, source,
+                                 first_heard, last_heard, count, last_direct_heard,
+                                 dest, via)
+                            VALUES (?, '', 'heard', ?, ?, 0, ?, '', '')
                             ON CONFLICT(callsign, transport) DO UPDATE SET
-                                last_heard = MAX(last_heard, excluded.last_heard),
-                                last_direct_heard = MAX(last_direct_heard, excluded.last_direct_heard),
-                                source     = 'heard'
+                                last_heard        = MAX(last_heard,
+                                                        excluded.last_heard),
+                                last_direct_heard = MAX(last_direct_heard,
+                                                        excluded.last_direct_heard),
+                                source            = 'heard'
                             """,
-                            (_digi, ts, ts, ts),
+                            (_effective_digi, ts, ts, ts),
                         )
                     else:
                         # No star on this hop: keep 'heard' only briefly after
@@ -467,20 +701,22 @@ class HeardPlugin(BBSPlugin):
                         cutoff = ts - _DIRECT_GRACE_SECONDS
                         await db.execute(
                             """
-                            INSERT INTO heard_stations
-                                (callsign, dest, transport, via,
-                                 first_heard, last_heard, count, source, last_direct_heard)
-                            VALUES (?, '', '', '', ?, ?, 0, 'via', 0)
+                            INSERT INTO heard_events
+                                (callsign, transport, source,
+                                 first_heard, last_heard, count, last_direct_heard,
+                                 dest, via)
+                            VALUES (?, '', 'via', ?, ?, 0, 0, '', '')
                             ON CONFLICT(callsign, transport) DO UPDATE SET
                                 last_heard = MAX(last_heard, excluded.last_heard),
                                 source     = CASE
-                                    WHEN COALESCE(heard_stations.last_direct_heard, 0) >= ?
+                                    WHEN COALESCE(heard_events.last_direct_heard, 0) >= ?
                                     THEN 'heard'
                                     ELSE 'via'
                                 END
                             """,
-                            (_digi, ts, ts, cutoff),
+                            (_effective_digi, ts, ts, cutoff),
                         )
+
             # ── heard_paths: direct receptions → via_base=""; relayed → base ─
             if is_direct:
                 # Record as a direct-path row (via_base="") so the display can
@@ -517,8 +753,10 @@ class HeardPlugin(BBSPlugin):
                         count     = count + 1,
                         via       = ?
                     """,
-                    (src_up, transport, via_base, merged_path_via, ts, ts, merged_path_via),
+                    (src_up, transport, via_base, merged_path_via, ts, ts,
+                     merged_path_via),
                 )
+
             # ── <MAP:lat,lon,call[,nodename]> location-beacon tag ────────────
             # Honour the tag only when its callsign matches the frame source —
             # the protocol says "Only use your own callsign and your own node
@@ -530,28 +768,29 @@ class HeardPlugin(BBSPlugin):
             # authoritative source.
             parsed_map = _parse_map_tag(info)
             if parsed_map is not None:
-                lat, lon, map_call, nodename = parsed_map
+                lat, lon, map_call, beacon_alias = parsed_map
                 if map_call.split("-", 1)[0] == src_up.split("-", 1)[0]:
                     await db.execute(
                         """
-                        UPDATE heard_stations
+                        UPDATE stations
                            SET lat             = ?,
                                lon             = ?,
-                               nodename        = ?,
+                               beacon_alias    = ?,
                                position_source = 'beacon'
-                         WHERE callsign = ? AND transport = ?
+                         WHERE callsign = ?
                         """,
-                        (lat, lon, nodename, src_up, transport),
+                        (lat, lon, beacon_alias, src_up),
                     )
                     logger.info(
                         "MAP beacon: %s%s @ %.4f,%.4f via %s",
                         src_up,
-                        f" ({nodename})" if nodename else "",
+                        f" ({beacon_alias})" if beacon_alias else "",
                         lat, lon, transport,
                     )
                 else:
                     logger.warning(
-                        "MAP beacon ignored: src %s does not match tag callsign %s — info: %r",
+                        "MAP beacon ignored: src %s does not match tag callsign %s"
+                        " — info: %r",
                         src_up, map_call, info,
                     )
             await db.commit()
@@ -566,6 +805,130 @@ class HeardPlugin(BBSPlugin):
                 "timestamp": ts,
                 "info":      info,
             })
+
+    # ── NETROM NODES observer ─────────────────────────────────────────────────
+
+    async def on_netrom_nodes(self, frame: NodesFrame) -> None:
+        """
+        Called by NetromRouter after decoding a received NODES broadcast.
+
+        Updates netrom_routes and upserts stations/heard_events rows so NETROM
+        nodes appear in the map and graph views.  Also backfills netrom_alias on
+        any existing station whose alias we now know for the first time.
+        """
+        ts        = int(time.time())
+        src_up    = frame.source_call.upper()
+        src_alias = frame.source_alias.upper()
+
+        # Build a callsign → alias map for everything we learn from this broadcast.
+        alias_map: dict[str, str] = {}
+        if src_alias:
+            alias_map[src_up] = src_alias
+        for e in frame.entries:
+            if e.alias:
+                alias_map[e.dest_call.upper()] = e.alias.upper()
+
+        async with aiosqlite.connect(self._db_path, timeout=30) as db:
+            # Upsert the advertising node into stations + heard_events.
+            if src_alias:
+                await db.execute(
+                    "INSERT OR IGNORE INTO stations"
+                    " (callsign, first_seen, last_seen, netrom_alias)"
+                    " VALUES (?, ?, ?, ?)",
+                    (src_up, ts, ts, src_alias),
+                )
+                await db.execute(
+                    """
+                    UPDATE stations SET
+                        last_seen    = MAX(last_seen, ?),
+                        netrom_alias = CASE WHEN netrom_alias = ''
+                                           THEN ? ELSE netrom_alias END
+                    WHERE callsign = ?
+                    """,
+                    (ts, src_alias, src_up),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO heard_events
+                        (callsign, transport, source,
+                         first_heard, last_heard, count, last_direct_heard,
+                         dest, via)
+                    VALUES (?, 'netrom', 'netrom', ?, ?, 1, 0, '', '')
+                    ON CONFLICT(callsign, transport) DO UPDATE SET
+                        last_heard = excluded.last_heard,
+                        count      = count + 1
+                    """,
+                    (src_up, ts, ts),
+                )
+
+            # Upsert each route entry into netrom_routes and stations/heard_events.
+            for e in frame.entries:
+                dest_up  = e.dest_call.upper()
+                alias_up = e.alias.upper() if e.alias else ''
+                nbr_up   = e.neighbor_call.upper()
+
+                await db.execute(
+                    """
+                    INSERT INTO netrom_routes
+                        (dest_call, neighbor_call, alias, quality,
+                         via_call, via_alias, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(dest_call, neighbor_call) DO UPDATE SET
+                        alias     = excluded.alias,
+                        quality   = excluded.quality,
+                        via_call  = excluded.via_call,
+                        via_alias = excluded.via_alias,
+                        last_seen = excluded.last_seen
+                    """,
+                    (dest_up, nbr_up, alias_up, e.quality, src_up, src_alias, ts),
+                )
+
+                if alias_up:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO stations"
+                        " (callsign, first_seen, last_seen, netrom_alias)"
+                        " VALUES (?, ?, ?, ?)",
+                        (dest_up, ts, ts, alias_up),
+                    )
+                    await db.execute(
+                        """
+                        UPDATE stations SET
+                            last_seen    = MAX(last_seen, ?),
+                            netrom_alias = CASE WHEN netrom_alias = ''
+                                               THEN ? ELSE netrom_alias END
+                        WHERE callsign = ?
+                        """,
+                        (ts, alias_up, dest_up),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO heard_events
+                            (callsign, transport, source,
+                             first_heard, last_heard, count, last_direct_heard,
+                             dest, via)
+                        VALUES (?, 'netrom', 'netrom', ?, ?, 1, 0, '', '')
+                        ON CONFLICT(callsign, transport) DO UPDATE SET
+                            last_heard = excluded.last_heard,
+                            count      = count + 1
+                        """,
+                        (dest_up, ts, ts),
+                    )
+
+            # Backfill netrom_alias on every existing station row for callsigns
+            # we just learned an alias for — only where it is still blank.
+            for call, alias in alias_map.items():
+                await db.execute(
+                    "UPDATE stations SET netrom_alias = ?"
+                    " WHERE callsign = ? AND netrom_alias = ''",
+                    (alias, call),
+                )
+
+            await db.commit()
+
+        logger.info(
+            "netrom NODES from %s (%s): %d routes, aliases backfilled for %d callsign(s)",
+            src_up, src_alias, len(frame.entries), len(alias_map),
+        )
 
     # ── ASCII network map ─────────────────────────────────────────────────────
 
@@ -653,7 +1016,7 @@ class HeardPlugin(BBSPlugin):
         try:
             async with aiosqlite.connect(self._db_path, timeout=30) as db:
                 async with db.execute(
-                    "SELECT COUNT(*) FROM heard_stations"
+                    "SELECT COUNT(DISTINCT callsign) FROM heard_events"
                     " WHERE source = 'heard' AND transport != '' AND last_heard >= ?",
                     (cutoff,),
                 ) as cur:
@@ -724,24 +1087,48 @@ class HeardPlugin(BBSPlugin):
                     db.row_factory = aiosqlite.Row
                     async with db.execute(
                         """
-                        SELECT hs.callsign, hs.dest, hs.transport, hs.via,
-                               hs.first_heard, hs.last_heard, hs.count,
-                               (SELECT COUNT(*) FROM heard_paths hp
-                                 WHERE hp.callsign = hs.callsign
-                                   AND hp.transport = hs.transport
-                                   AND hp.via_base = '') AS direct_count,
-                               (SELECT COUNT(*) FROM heard_paths hp
-                                 WHERE hp.callsign = hs.callsign
-                                   AND hp.transport = hs.transport
-                                   AND hp.via_base != '') AS digi_count,
-                               (SELECT hp.via FROM heard_paths hp
-                                 WHERE hp.callsign = hs.callsign
-                                   AND hp.transport = hs.transport
-                                   AND hp.via_base != ''
-                                 ORDER BY hp.last_seen DESC LIMIT 1) AS best_digi_via
-                        FROM heard_stations hs
-                        WHERE hs.source = 'heard' AND hs.transport != '' AND hs.last_heard >= ?
-                        ORDER BY hs.last_heard DESC
+                        SELECT
+                            s.callsign,
+                            COALESCE((SELECT e.dest FROM heard_events e
+                                       WHERE e.callsign = s.callsign
+                                         AND e.source = 'heard'
+                                         AND e.transport != ''
+                                       ORDER BY e.last_heard DESC LIMIT 1), '') AS dest,
+                            COALESCE((SELECT e.transport FROM heard_events e
+                                       WHERE e.callsign = s.callsign
+                                         AND e.source = 'heard'
+                                         AND e.transport != ''
+                                       ORDER BY e.last_heard DESC LIMIT 1), '') AS transport,
+                            COALESCE((SELECT e.via FROM heard_events e
+                                       WHERE e.callsign = s.callsign
+                                         AND e.source = 'heard'
+                                         AND e.transport != ''
+                                       ORDER BY e.last_heard DESC LIMIT 1), '') AS via,
+                            s.first_seen  AS first_heard,
+                            s.last_seen   AS last_heard,
+                            COALESCE((SELECT SUM(e.count) FROM heard_events e
+                                       WHERE e.callsign = s.callsign
+                                         AND e.source = 'heard'
+                                         AND e.transport != ''), 0) AS count,
+                            (SELECT COUNT(*) FROM heard_paths hp
+                              WHERE hp.callsign = s.callsign
+                                AND hp.via_base = '') AS direct_count,
+                            (SELECT COUNT(*) FROM heard_paths hp
+                              WHERE hp.callsign = s.callsign
+                                AND hp.via_base != '') AS digi_count,
+                            (SELECT hp.via FROM heard_paths hp
+                              WHERE hp.callsign = s.callsign
+                                AND hp.via_base != ''
+                              ORDER BY hp.last_seen DESC LIMIT 1) AS best_digi_via
+                        FROM stations s
+                        WHERE EXISTS (
+                            SELECT 1 FROM heard_events e
+                             WHERE e.callsign = s.callsign
+                               AND e.source = 'heard'
+                               AND e.transport != ''
+                               AND e.last_heard >= ?
+                        )
+                        ORDER BY s.last_seen DESC
                         LIMIT ?
                         """,
                         (cutoff, limit),
@@ -818,10 +1205,12 @@ class HeardPlugin(BBSPlugin):
         await term.sendln()
 
     async def _clear(self) -> int:
-        """Delete all rows from heard_stations and heard_paths.  Returns rows removed."""
+        """Delete all rows from stations, heard_events and heard_paths.
+        Returns the number of station records removed."""
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
-            cur = await db.execute("DELETE FROM heard_stations")
+            cur = await db.execute("DELETE FROM stations")
             removed = cur.rowcount
+            await db.execute("DELETE FROM heard_events")
             await db.execute("DELETE FROM heard_paths")
             await db.commit()
         return removed

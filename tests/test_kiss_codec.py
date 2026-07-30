@@ -5,7 +5,7 @@ These tests cover:
   - address.py: parse / format_addr / callsign_only
   - kiss_frame.py: escape/unescape, build, decode, split
   - transport/kiss.py: _build_ax25_ui_frame round-trip through decode_frame
-  - Beacon frame construction (sent to QST)
+  - Beacon frame construction with configurable dest and via path
 
 No network, no async, no fixtures required.
 """
@@ -308,22 +308,22 @@ class TestSplitKissFrames:
 
 
 # ---------------------------------------------------------------------------
-# Beacon frame construction (QST destination, sent by _KISSBaseTransport)
+# Beacon frame construction (sent by _KISSBaseTransport)
 # ---------------------------------------------------------------------------
 
 class TestBeaconFrame:
     """
     Verify that a beacon built the same way _send_beacon() does it decodes
-    correctly: destination is QST, source is the BBS callsign, payload is
-    the configured text.
+    correctly: destination matches the configured beacon_dest, source is the
+    BBS callsign, payload is the configured text.
     """
 
     BBS_CALL = "W6ELA-8"
     BEACON_TEXT = "W6ELA-8 BBS - Ed's BBS Palo Alto CA"
 
-    def _build_beacon(self) -> bytes:
+    def _build_beacon(self, dest: str = "BEACON") -> bytes:
         ax25 = _build_ax25_ui_frame(
-            self.BBS_CALL, "QST", self.BEACON_TEXT.encode("ascii")
+            self.BBS_CALL, dest, self.BEACON_TEXT.encode("ascii")
         )
         return build_kiss_frame(0, ax25)
 
@@ -337,10 +337,21 @@ class TestBeaconFrame:
         frame = decode_frame(kiss[1:-1])
         assert frame.src_call == self.BBS_CALL
 
-    def test_beacon_dest_is_qst(self):
+    def test_beacon_dest_default_is_beacon(self):
         kiss = self._build_beacon()
         frame = decode_frame(kiss[1:-1])
+        assert frame.dest_call == "BEACON"
+
+    def test_beacon_dest_can_be_qst(self):
+        kiss = self._build_beacon(dest="QST")
+        frame = decode_frame(kiss[1:-1])
         assert frame.dest_call == "QST"
+
+    def test_beacon_dest_can_be_kanode_id(self):
+        # Ka-Node-style advertisement: dest "ID", payload "FOLSM/N,FOLSM/B,FOLSM/C"
+        kiss = self._build_beacon(dest="ID")
+        frame = decode_frame(kiss[1:-1])
+        assert frame.dest_call == "ID"
 
     def test_beacon_payload_matches_text(self):
         kiss = self._build_beacon()
@@ -364,3 +375,164 @@ class TestBeaconFrame:
         from bbs.transport.kiss import KISSTCPTransport
         t = KISSTCPTransport(cfg, "W1BBS")
         assert t._beacon_text == ""
+
+
+# ---------------------------------------------------------------------------
+# Digipeater (via) path in UI frames
+# ---------------------------------------------------------------------------
+
+class TestUIFrameVia:
+    """
+    Verify that _build_ax25_ui_frame() correctly emits the digipeater address
+    chain when `via` is supplied, and that decode_frame() round-trips it.
+    """
+
+    def _roundtrip(self, src: str, dest: str, payload: bytes, via: list[str] | None):
+        ax25 = _build_ax25_ui_frame(src, dest, payload, via=via)
+        kiss = build_kiss_frame(0, ax25)
+        return decode_frame(kiss[1:-1])
+
+    def test_no_via_defaults_to_empty_list(self):
+        frame = self._roundtrip("W1AW", "BEACON", b"hi", via=None)
+        assert frame is not None
+        assert frame.via == []
+
+    def test_empty_via_list_emits_no_digis(self):
+        frame = self._roundtrip("W1AW", "BEACON", b"hi", via=[])
+        assert frame is not None
+        assert frame.via == []
+
+    def test_single_via_roundtrips(self):
+        frame = self._roundtrip("W1AW", "BEACON", b"hi", via=["WIDE1-1"])
+        assert frame is not None
+        assert frame.via == ["WIDE1-1"]
+
+    def test_multiple_vias_preserve_order(self):
+        frame = self._roundtrip(
+            "W1AW", "BEACON", b"hi", via=["WIDE1-1", "WIDE2-1"]
+        )
+        assert frame is not None
+        assert frame.via == ["WIDE1-1", "WIDE2-1"]
+
+    def test_via_h_bit_clear_on_originated_frame(self):
+        # When WE originate the frame, no digi has repeated it yet — decoder
+        # marks repeated digis with a trailing "*"; ours must be unmarked.
+        frame = self._roundtrip(
+            "W1AW", "BEACON", b"hi", via=["KD6XYZ-3", "W6ABC"]
+        )
+        assert frame is not None
+        assert all("*" not in v for v in frame.via)
+
+    def test_via_lowercases_normalized(self):
+        # parse() upper-cases callsigns; vias should follow suit on the wire.
+        frame = self._roundtrip("W1AW", "BEACON", b"hi", via=["wide1-1"])
+        assert frame is not None
+        assert frame.via == ["WIDE1-1"]
+
+    def test_payload_preserved_with_via(self):
+        payload = b"under digi path"
+        frame = self._roundtrip(
+            "W1AW", "BEACON", payload, via=["WIDE1-1", "WIDE2-1"]
+        )
+        assert frame is not None
+        assert frame.payload == payload
+
+
+# ---------------------------------------------------------------------------
+# AX.25 v2.0 command/response and digipeater H-bit encoding on the wire
+# ---------------------------------------------------------------------------
+
+class TestCRandHBits:
+    """
+    The decoder strips bit 7 of each SSID byte when extracting the callsign
+    and SSID, so we inspect the raw AX.25 bytes directly to confirm:
+      - dest SSID bit 7 = 1 (C-bit set: v2 command frame)
+      - src  SSID bit 7 = 0 (C-bit clear: v2 command frame)
+      - every via SSID bit 7 = 0 (H-bit clear: not yet repeated)
+    """
+
+    def test_dest_c_bit_set_on_originated_ui(self):
+        ax25 = _build_ax25_ui_frame("W1AW", "BEACON", b"hi")
+        dest_ssid_byte = ax25[6]
+        assert dest_ssid_byte & 0x80 == 0x80
+
+    def test_src_c_bit_clear_on_originated_ui(self):
+        ax25 = _build_ax25_ui_frame("W1AW", "BEACON", b"hi")
+        src_ssid_byte = ax25[13]
+        assert src_ssid_byte & 0x80 == 0x00
+
+    def test_via_h_bit_clear_in_raw_frame(self):
+        ax25 = _build_ax25_ui_frame(
+            "W1AW", "BEACON", b"hi", via=["WIDE1-1", "WIDE2-1"]
+        )
+        # dest=0-6, src=7-13, via1=14-20, via2=21-27
+        assert ax25[20] & 0x80 == 0x00
+        assert ax25[27] & 0x80 == 0x00
+
+    def test_reserved_bits_set(self):
+        # AX.25 spec requires SSID bits 6 and 5 to be 1 on every address byte.
+        ax25 = _build_ax25_ui_frame(
+            "W1AW", "BEACON", b"hi", via=["WIDE1-1"]
+        )
+        for ssid_idx in (6, 13, 20):
+            assert ax25[ssid_idx] & 0x60 == 0x60, (
+                f"reserved bits 6,5 must be set at byte {ssid_idx}"
+            )
+
+    def test_end_of_address_bit_on_last_via_only(self):
+        ax25 = _build_ax25_ui_frame(
+            "W1AW", "BEACON", b"hi", via=["WIDE1-1", "WIDE2-1"]
+        )
+        # src (byte 13) and via1 (byte 20) must NOT be end; via2 (byte 27) MUST.
+        assert ax25[13] & 0x01 == 0x00
+        assert ax25[20] & 0x01 == 0x00
+        assert ax25[27] & 0x01 == 0x01
+
+    def test_end_of_address_bit_on_src_when_no_via(self):
+        ax25 = _build_ax25_ui_frame("W1AW", "BEACON", b"hi")
+        # dest not end, src is end.
+        assert ax25[6] & 0x01 == 0x00
+        assert ax25[13] & 0x01 == 0x01
+
+
+# ---------------------------------------------------------------------------
+# Transport config parsing for beacon_dest and beacon_path
+# ---------------------------------------------------------------------------
+
+class TestBeaconConfigParsing:
+    """
+    Verify _KISSBaseTransport correctly reads beacon_dest and beacon_path
+    from the config dict and applies sensible defaults.
+    """
+
+    def _make(self, **cfg):
+        from bbs.transport.kiss import KISSTCPTransport
+        return KISSTCPTransport(cfg, "W1BBS")
+
+    def test_default_beacon_dest_is_beacon(self):
+        t = self._make()
+        assert t._beacon_dest == "BEACON"
+
+    def test_beacon_dest_uppercased(self):
+        t = self._make(beacon_dest="id")
+        assert t._beacon_dest == "ID"
+
+    def test_beacon_dest_empty_string_falls_back_to_beacon(self):
+        t = self._make(beacon_dest="   ")
+        assert t._beacon_dest == "BEACON"
+
+    def test_default_beacon_path_is_empty(self):
+        t = self._make()
+        assert t._beacon_path == []
+
+    def test_beacon_path_csv_parsed(self):
+        t = self._make(beacon_path="wide1-1, wide2-1")
+        assert t._beacon_path == ["WIDE1-1", "WIDE2-1"]
+
+    def test_beacon_path_empty_entries_skipped(self):
+        t = self._make(beacon_path=" , ,WIDE1-1, ,")
+        assert t._beacon_path == ["WIDE1-1"]
+
+    def test_beacon_path_uppercased(self):
+        t = self._make(beacon_path="kd6xyz-3,w6abc")
+        assert t._beacon_path == ["KD6XYZ-3", "W6ABC"]

@@ -506,6 +506,7 @@ def _abbrev_transport(tid: str) -> str:
         "kiss_serial": "KISS/SER",
         "agwpe":       "AGWPE",
         "kernel_ax25": "AX.25",
+        "netrom":      "NETROM",
         "tcp":         "TCP",
         "web":         "WEB",
     }
