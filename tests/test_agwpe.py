@@ -344,6 +344,27 @@ class TestAGWPETransportDispatch:
         assert hdr["call_from"] == "W6ELA-9"
         assert hdr["call_to"] == "W6ELA-15"
 
+    async def test_monitoring_enabled_exactly_once_across_registrations(self):
+        """Direwolf's 'm' TOGGLES monitoring, so it must be sent exactly once.
+        With extra service SSIDs each callsign gets its own 'X' ack; re-sending
+        'm' per ack (an even number) would silence the heard/display plugins."""
+        self.transport._registered = asyncio.Event()
+        self.transport._monitoring_on = False
+        # Two registration acks: BBS callsign + one service SSID.
+        for _ in range(2):
+            await self.transport._dispatch(
+                "X", 0, "", "", 0, b"\x01", self.fake_writer,  # type: ignore[arg-type]
+            )
+        # Walk the frames written back; count the 'm' (enable-monitoring) frames.
+        buf = bytes(self.fake_writer.written)
+        m_count, i = 0, 0
+        while i + _HEADER_SIZE <= len(buf):
+            hdr = _unpack_header(buf[i:])
+            if hdr["kind"] == "m":
+                m_count += 1
+            i += _HEADER_SIZE + hdr["data_len"]
+        assert m_count == 1
+
     async def test_data_frame_feeds_reader(self):
         """'D' frames are fed into the session's StreamReader."""
         # First create the session via 'C'

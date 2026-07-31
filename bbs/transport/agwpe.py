@@ -441,6 +441,11 @@ class AGWPETransport(Transport):
         self._session_tasks: dict[_SessionKey, "asyncio.Task[None]"] = {}
         self._on_connect: Optional[ConnectionCallback] = None
         self._registered: Optional[asyncio.Event] = None  # set when 'X' ack received
+        # Direwolf's 'm' command TOGGLES monitoring, so it must be sent exactly
+        # once per connection.  When multiple callsigns are registered (BBS +
+        # service SSIDs) each 'X' ack would otherwise re-toggle it — an even
+        # count silences the heard/display plugins.  Guarded by this flag.
+        self._monitoring_on: bool = False
         # Serialises all drain() calls on the shared AGWPE TCP writer across
         # concurrent session tasks and the beacon loop (Python 3.9 fix).
         self._drain_lock: Optional[asyncio.Lock] = None
@@ -570,6 +575,7 @@ class AGWPETransport(Transport):
 
                 # Register our callsign so AGWPE routes incoming calls to us
                 self._registered = asyncio.Event()
+                self._monitoring_on = False   # re-enable once, on this connection
                 writer.write(
                     _build_frame(self._agw_port, "X", self._local_call, "")
                 )
@@ -753,11 +759,16 @@ class AGWPETransport(Transport):
                     self._registered.set()
                 # Enable frame monitoring so 'U' (UI) frames arrive with
                 # source, dest, and via path already parsed in TNC2 format.
-                writer.write(_build_frame(self._agw_port, "m", "", ""))
-                assert self._drain_lock is not None
-                async with self._drain_lock:
-                    await writer.drain()
-                logger.info("agwpe: monitoring enabled for hop-count tracking and heard-station logging")
+                # Direwolf's 'm' TOGGLES monitoring, so send it ONLY on the
+                # first 'X' ack — extra service-SSID registrations each ack
+                # too, and re-sending 'm' would toggle monitoring back off.
+                if not self._monitoring_on:
+                    self._monitoring_on = True
+                    writer.write(_build_frame(self._agw_port, "m", "", ""))
+                    assert self._drain_lock is not None
+                    async with self._drain_lock:
+                        await writer.drain()
+                    logger.info("agwpe: monitoring enabled for hop-count tracking and heard-station logging")
             else:
                 logger.warning(
                     "agwpe: callsign registration FAILED for %s on port %d",
