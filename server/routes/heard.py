@@ -10,6 +10,7 @@ PUT  /api/heard/settings  — update settings; body: {"max_age_hours": N}
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from flask import jsonify, request, session
 
@@ -59,6 +60,7 @@ def heard_list():
                 s.callsign,
                 s.lat, s.lon, s.comment, s.position_source,
                 s.netrom_alias, s.beacon_alias, s.kanode_alias,
+                s.service, s.last_beacon_text, s.last_beacon_ts,
                 COALESCE(NULLIF(s.kanode_alias,''), NULLIF(s.beacon_alias,''), NULLIF(s.netrom_alias,''), '') AS nodename,
                 s.first_seen  AS first_heard,
                 s.last_seen   AS last_heard,
@@ -102,6 +104,188 @@ def heard_list():
         return jsonify(rows)
     except sqlite3.OperationalError:
         return jsonify([])
+    finally:
+        db.close()
+
+
+@app.route("/api/heard/entities", methods=["GET"])
+def heard_entities():
+    """Physical stations: group callsign-SSIDs by base callsign and roll up
+    aliases / services / position / last-beacon across a station's SSIDs.
+
+    This is a display grouping *above* the per-SSID data; routing, the network
+    graph and path-proving stay per-SSID and are untouched.
+    """
+    err = _require_sysop()
+    if err:
+        return err
+    db = _sync_db()
+    if not db:
+        return jsonify({"error": "BBS engine not running"}), 503
+    try:
+        cur = db.execute(
+            """
+            SELECT
+                s.base_call, s.callsign, s.service,
+                s.lat, s.lon, s.position_source, s.position_ts,
+                s.netrom_alias, s.beacon_alias, s.kanode_alias,
+                s.last_beacon_text, s.last_beacon_ts,
+                s.first_seen, s.last_seen,
+                e.canonical_nodename, e.notes,
+                e.lat AS e_lat, e.lon AS e_lon, e.position_source AS e_pos,
+                COALESCE((SELECT SUM(ev.count) FROM heard_events ev
+                          WHERE ev.callsign = s.callsign AND ev.transport != ''), 0) AS count,
+                (SELECT ev.transport FROM heard_events ev WHERE ev.callsign = s.callsign
+                   ORDER BY CASE WHEN ev.transport NOT IN ('', 'netrom') THEN 0
+                                 WHEN ev.transport = 'netrom' THEN 1 ELSE 2 END,
+                            ev.last_heard DESC LIMIT 1) AS transport,
+                EXISTS(SELECT 1 FROM heard_events ev WHERE ev.callsign = s.callsign
+                         AND ev.transport = 'netrom') AS has_netrom
+            FROM stations s
+            LEFT JOIN station_entities e ON e.base_call = s.base_call
+            ORDER BY s.base_call, s.last_seen DESC
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        by_base: dict = {}
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            base = d["base_call"] or d["callsign"]
+            ent = by_base.get(base)
+            if ent is None:
+                ent = by_base[base] = {
+                    "base_call": base,
+                    "canonical_nodename": d["canonical_nodename"] or "",
+                    "notes": d["notes"] or "",
+                    "lat": d["e_lat"], "lon": d["e_lon"],
+                    "position_source": d["e_pos"] or ("manual" if d["e_lat"] is not None else ""),
+                    # the entity's OWN sysop override (null = none), distinct from
+                    # the effective rolled-up lat/lon above.
+                    "override_lat": d["e_lat"], "override_lon": d["e_lon"],
+                    "members": [], "aliases": [], "services": [], "transports": [],
+                    # typed alias rollups (deduped) so the UI can distinguish a
+                    # confirmed routing identity from a sysop digi label from a
+                    # self-declared beacon name.  `aliases` stays as a flat union
+                    # for search convenience.
+                    "netrom_aliases": [], "kanode_aliases": [], "beacon_aliases": [],
+                    "first_heard": d["first_seen"], "last_heard": d["last_seen"],
+                    "count": 0, "last_beacon_text": "", "last_beacon_ts": 0,
+                    # internal: sysop entity override pins position; otherwise the
+                    # freshest member beacon (by position_ts) wins.
+                    "_override": d["e_lat"] is not None, "_pos_ts": 0,
+                }
+            ent["members"].append({
+                "callsign": d["callsign"], "service": d["service"] or "",
+                "transport": d["transport"] or "", "count": d["count"],
+                "last_heard": d["last_seen"],
+                "lat": d["lat"], "lon": d["lon"],
+                "position_source": d["position_source"] or "",
+                "netrom_alias": d["netrom_alias"] or "",
+                "kanode_alias": d["kanode_alias"] or "",
+                "beacon_alias": d["beacon_alias"] or "",
+            })
+            for a in (d["kanode_alias"], d["beacon_alias"], d["netrom_alias"]):
+                if a and a not in ent["aliases"]:
+                    ent["aliases"].append(a)
+            for key, col in (("netrom_aliases", "netrom_alias"),
+                             ("kanode_aliases", "kanode_alias"),
+                             ("beacon_aliases", "beacon_alias")):
+                if d[col] and d[col] not in ent[key]:
+                    ent[key].append(d[col])
+            if d["service"]:
+                ent["services"].append(d["service"])
+            ent["first_heard"] = min(ent["first_heard"], d["first_seen"])
+            ent["last_heard"] = max(ent["last_heard"], d["last_seen"])
+            ent["count"] += d["count"]
+            if d["transport"] and d["transport"] not in ent["transports"]:
+                ent["transports"].append(d["transport"])
+            # a station heard on NET/ROM (a NODES broadcast, evidenced by a
+            # netrom event or a netrom_alias) is a node even when its primary
+            # transport rolled up to AGWPE — surface that in Via.
+            if (d["has_netrom"] or d["netrom_alias"]) and "netrom" not in ent["transports"]:
+                ent["transports"].append("netrom")
+            # reference position: sysop entity override pins it; otherwise the
+            # freshest position beacon across the station's SSIDs wins.
+            if not ent["_override"] and d["lat"] is not None and d["position_ts"] >= ent["_pos_ts"]:
+                ent["lat"], ent["lon"] = d["lat"], d["lon"]
+                ent["position_source"] = d["position_source"] or ""
+                ent["_pos_ts"] = d["position_ts"]
+            # latest beacon/ID text across the station's SSIDs
+            if d["last_beacon_ts"] and d["last_beacon_ts"] > ent["last_beacon_ts"]:
+                ent["last_beacon_text"] = d["last_beacon_text"] or ""
+                ent["last_beacon_ts"] = d["last_beacon_ts"]
+        out = list(by_base.values())
+        for ent in out:
+            ent.pop("_override", None)
+            ent.pop("_pos_ts", None)
+            ent["ssids"] = [m["callsign"] for m in ent["members"]]
+            # Title/reference name is the physical station's callsign; a sysop
+            # canonical override wins. Aliases are shown separately, typed.
+            ent["nodename"] = ent["canonical_nodename"] or ent["base_call"]
+        out.sort(key=lambda e: e["last_heard"], reverse=True)
+        return jsonify(out)
+    except sqlite3.OperationalError:
+        return jsonify([])
+    finally:
+        db.close()
+
+
+@app.route("/api/heard/entities/<base_call>", methods=["PUT"])
+def heard_entity_update(base_call: str):
+    """Edit the sysop-canonical fields of a physical-station entity."""
+    err = _require_sysop()
+    if err:
+        return err
+    base_call = base_call.strip().upper()
+    data      = request.get_json(silent=True) or {}
+    canonical = data.get("canonical_nodename")
+    notes     = data.get("notes")
+
+    # Optional entity-level position override. Present + numeric → pin as
+    # 'manual'; present + null → clear the override (fall back to the rolled-up
+    # freshest beacon). Absent → leave unchanged.
+    set_position = "lat" in data or "lon" in data
+    lat, lon = data.get("lat"), data.get("lon")
+    if set_position and (lat is None) != (lon is None):
+        return jsonify({"error": "lat and lon must be provided together"}), 400
+    if set_position and lat is not None:
+        try:
+            lat, lon = float(lat), float(lon)
+            if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({"error": "lat/lon out of range"}), 400
+
+    db = _sync_db()
+    if not db:
+        return jsonify({"error": "BBS engine not running"}), 503
+    try:
+        db.execute(
+            "INSERT OR IGNORE INTO station_entities (base_call) VALUES (?)",
+            (base_call,),
+        )
+        db.execute(
+            "UPDATE station_entities"
+            "   SET canonical_nodename = COALESCE(?, canonical_nodename),"
+            "       notes = COALESCE(?, notes)"
+            " WHERE base_call = ?",
+            (
+                None if canonical is None else str(canonical).strip().upper(),
+                None if notes is None else str(notes),
+                base_call,
+            ),
+        )
+        if set_position:
+            db.execute(
+                "UPDATE station_entities"
+                "   SET lat = ?, lon = ?, position_source = ?"
+                " WHERE base_call = ?",
+                (lat, lon, "manual" if lat is not None else "", base_call),
+            )
+        db.commit()
+        return jsonify({"ok": True})
+    except sqlite3.OperationalError as exc:
+        return jsonify({"error": str(exc)}), 500
     finally:
         db.close()
 
@@ -175,6 +359,10 @@ def heard_update(callsign: str):
     comment      = str(data.get("comment", ""))
     nodename     = str(data.get("nodename", "")).strip().upper()
     kanode_alias = str(data.get("kanode_alias", "")).strip().upper()
+    # service is per-SSID free-form; update it only when the key is present so
+    # a PUT that omits it (older client) leaves the existing value untouched.
+    _service_raw = data.get("service")
+    service_param = None if _service_raw is None else str(_service_raw).strip()
 
     if lat is not None:
         try:
@@ -199,20 +387,27 @@ def heard_update(callsign: str):
     # write can land in the to-be-merged kanode_alias row mid-merge and
     # split heard_events between the old and new callsigns.
     db.isolation_level = None  # autocommit mode — we BEGIN/COMMIT manually
+    now = int(time.time())
     try:
         db.execute("BEGIN IMMEDIATE")
 
         cur = db.execute(
             """
             UPDATE stations
-               SET lat = ?, lon = ?, comment = ?, beacon_alias = ?, kanode_alias = ?,
+               SET service = COALESCE(?, service),
+                   lat = ?, lon = ?, comment = ?, beacon_alias = ?, kanode_alias = ?,
                    position_source = CASE
                        WHEN ? IS NOT NULL OR ? IS NOT NULL THEN 'manual'
                        ELSE position_source
+                   END,
+                   position_ts = CASE
+                       WHEN ? IS NOT NULL OR ? IS NOT NULL THEN ?
+                       ELSE position_ts
                    END
              WHERE callsign = ?
             """,
-            (lat, lon, comment, nodename, kanode_alias, lat, lon, callsign),
+            (service_param, lat, lon, comment, nodename, kanode_alias,
+             lat, lon, lat, lon, now, callsign),
         )
         if cur.rowcount == 0:
             db.execute("ROLLBACK")
@@ -223,17 +418,17 @@ def heard_update(callsign: str):
         # ── Ka-Node merge: absorb the old standalone digi row if it exists ──
         if kanode_alias:
             old = db.execute(
-                "SELECT lat, lon, position_source FROM stations WHERE callsign = ?",
+                "SELECT lat, lon, position_source, position_ts FROM stations WHERE callsign = ?",
                 (kanode_alias,),
             ).fetchone()
             if old:
-                old_lat, old_lon, old_pos_src = old
+                old_lat, old_lon, old_pos_src, old_pos_ts = old
 
                 # Transfer position to owner if owner has none
                 if lat is None and old_lat is not None:
                     db.execute(
-                        "UPDATE stations SET lat=?, lon=?, position_source=? WHERE callsign=?",
-                        (old_lat, old_lon, old_pos_src or "manual", callsign),
+                        "UPDATE stations SET lat=?, lon=?, position_source=?, position_ts=? WHERE callsign=?",
+                        (old_lat, old_lon, old_pos_src or "manual", old_pos_ts or now, callsign),
                     )
                     merge_info["position_transferred"] = True
 

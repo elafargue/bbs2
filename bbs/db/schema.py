@@ -218,26 +218,14 @@ async def _run_migrations(db: aiosqlite.Connection, from_version: int) -> None:
         await db.commit()
         from_version = 5
 
-    if from_version < 6:
-        for stmt in (
-            "ALTER TABLE heard_stations ADD COLUMN lat     REAL",
-            "ALTER TABLE heard_stations ADD COLUMN lon     REAL",
-            "ALTER TABLE heard_stations ADD COLUMN comment TEXT NOT NULL DEFAULT ''",
-        ):
-            try:
-                await db.execute(stmt)
-            except Exception:
-                pass  # column already exists
-        await db.commit()
-        from_version = 6
-
     if from_version < 7:
-        try:
-            await db.execute(
-                "ALTER TABLE heard_stations ADD COLUMN source TEXT NOT NULL DEFAULT 'heard'"
-            )
-        except Exception:
-            pass  # column already exists
+        # v6 and v7 historically ALTERed `heard_stations` — a table the Heard
+        # plugin has since renamed to `stations` and now owns/migrates itself
+        # (see bbs/plugins/heard/heard.py::_migrate_heard_schema).  Those ALTERs
+        # were dead here (they targeted a table this module no longer owns, threw
+        # "no such table", and were swallowed), so they are removed.  The version
+        # bump is kept as a no-op so existing DBs' schema_version history stays
+        # consistent.
         await db.commit()
         from_version = 7
 

@@ -42,17 +42,37 @@ if TYPE_CHECKING:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stations (
-    callsign        TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
-    lat             REAL,
-    lon             REAL,
-    comment         TEXT    NOT NULL DEFAULT '',
-    position_source TEXT    NOT NULL DEFAULT '',
-    netrom_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-    beacon_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-    kanode_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-    first_seen      INTEGER NOT NULL DEFAULT 0,
-    last_seen       INTEGER NOT NULL DEFAULT 0
+    callsign         TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+    base_call        TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    lat              REAL,
+    lon              REAL,
+    comment          TEXT    NOT NULL DEFAULT '',
+    position_source  TEXT    NOT NULL DEFAULT '',
+    position_ts      INTEGER NOT NULL DEFAULT 0,
+    netrom_alias     TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    beacon_alias     TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    kanode_alias     TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+    service          TEXT    NOT NULL DEFAULT '',
+    last_beacon_text TEXT    NOT NULL DEFAULT '',
+    last_beacon_ts   INTEGER NOT NULL DEFAULT 0,
+    first_seen       INTEGER NOT NULL DEFAULT 0,
+    last_seen        INTEGER NOT NULL DEFAULT 0
 );
+-- A physical station: groups the callsign-SSIDs (and, via the Ka-Node merge,
+-- tactical digi aliases) that belong to one operator/site, keyed on the
+-- SSID-stripped base callsign.  Canonical fields are sysop-set; positions and
+-- aliases otherwise roll up from member `stations` rows at read time.
+CREATE TABLE IF NOT EXISTS station_entities (
+    base_call          TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+    canonical_nodename TEXT    NOT NULL DEFAULT '',
+    notes              TEXT    NOT NULL DEFAULT '',
+    lat                REAL,
+    lon                REAL,
+    position_source    TEXT    NOT NULL DEFAULT '',
+    first_seen         INTEGER NOT NULL DEFAULT 0,
+    last_seen          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_stations_base_call ON stations (base_call);
 CREATE TABLE IF NOT EXISTS heard_events (
     callsign          TEXT    NOT NULL COLLATE NOCASE,
     transport         TEXT    NOT NULL DEFAULT '',
@@ -93,6 +113,18 @@ CREATE TABLE IF NOT EXISTS netrom_routes (
 
 _DEFAULT_MAX_AGE_HOURS = 24
 _DIRECT_GRACE_SECONDS = 120
+# Cap on the stored last-beacon/ID text so a long payload can't bloat a row.
+_MAX_BEACON_TEXT = 256
+
+# Heard-schema version, tracked in heard_settings['heard_schema_version'].
+# v1 = consolidation of the pre-versioning legacy migrations (each idempotent
+#      and guarded) plus dropping the orphaned heard_stations table.
+# v2 = add stations.service + last_beacon_text + last_beacon_ts.
+# v3 = add station_entities + stations.base_call; group SSIDs into physical
+#      stations by base callsign.
+# v4 = add stations.position_ts (when a position was last written) so the
+#      physical-station reference position is the freshest beacon across SSIDs.
+_HEARD_SCHEMA_VERSION = 4
 
 
 def _merge_via(stored: str, incoming: str) -> str:
@@ -303,187 +335,12 @@ class HeardPlugin(BBSPlugin):
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
         await super().initialize(cfg, db_path)
+
+        # Versioned schema migrations run BEFORE _SCHEMA is applied, so the v2
+        # split (heard_stations → stations) sees the old table before an empty
+        # `stations` would be created.
         async with aiosqlite.connect(db_path, timeout=30) as db:
-
-            # ── Detect existing tables ────────────────────────────────────────
-            tables_cur = await db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-            table_names = {r[0].lower() for r in await tables_cur.fetchall()}
-
-            # ── Migrate heard_paths if it predates the via_base column ────────
-            if "heard_paths" in table_names:
-                try:
-                    await db.execute("SELECT via_base FROM heard_paths LIMIT 1")
-                except Exception:
-                    # Very old schema: drop and recreate (ephemeral path data).
-                    await db.execute("DROP TABLE heard_paths")
-                    table_names.discard("heard_paths")
-
-            # ── Migrate heard_stations → stations + heard_events (schema v2) ──
-            if "heard_stations" in table_names and "stations" not in table_names:
-                logger.info(
-                    "heard plugin: migrating heard_stations → stations + heard_events …"
-                )
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS stations (
-                        callsign        TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
-                        lat             REAL,
-                        lon             REAL,
-                        comment         TEXT    NOT NULL DEFAULT '',
-                        position_source TEXT    NOT NULL DEFAULT '',
-                        netrom_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-                        beacon_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-                        first_seen      INTEGER NOT NULL DEFAULT 0,
-                        last_seen       INTEGER NOT NULL DEFAULT 0
-                    )
-                """)
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS heard_events (
-                        callsign          TEXT    NOT NULL COLLATE NOCASE,
-                        transport         TEXT    NOT NULL DEFAULT '',
-                        source            TEXT    NOT NULL DEFAULT 'heard',
-                        first_heard       INTEGER NOT NULL,
-                        last_heard        INTEGER NOT NULL,
-                        count             INTEGER NOT NULL DEFAULT 0,
-                        last_direct_heard INTEGER NOT NULL DEFAULT 0,
-                        dest              TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
-                        via               TEXT    NOT NULL DEFAULT '',
-                        PRIMARY KEY (callsign, transport)
-                    )
-                """)
-                # Station identity: one row per callsign, RF-heard metadata wins
-                # over NETROM-only rows for position / comment.  The old nodename
-                # column was a catch-all (beacons, manual edits, NETROM NODES) so
-                # it goes into beacon_alias; netrom_alias will repopulate from the
-                # next NODES broadcast.
-                await db.execute("""
-                    INSERT INTO stations
-                        (callsign, lat, lon, comment, position_source,
-                         beacon_alias, first_seen, last_seen)
-                    SELECT
-                        callsign,
-                        MAX(CASE WHEN transport != 'netrom' AND lat IS NOT NULL
-                                 THEN lat END),
-                        MAX(CASE WHEN transport != 'netrom' AND lon IS NOT NULL
-                                 THEN lon END),
-                        COALESCE(MAX(CASE WHEN transport != 'netrom'
-                                         AND comment != ''
-                                         THEN comment END), ''),
-                        COALESCE(MAX(CASE WHEN transport != 'netrom'
-                                         AND position_source != ''
-                                         THEN position_source END), ''),
-                        COALESCE(MAX(CASE WHEN nodename != '' THEN nodename END), ''),
-                        MIN(first_heard),
-                        MAX(last_heard)
-                    FROM heard_stations
-                    GROUP BY callsign
-                """)
-                # Per-transport observations: all rows, all transports, verbatim.
-                await db.execute("""
-                    INSERT OR IGNORE INTO heard_events
-                        (callsign, transport, source, first_heard, last_heard,
-                         count, last_direct_heard, dest, via)
-                    SELECT callsign, transport, source, first_heard, last_heard,
-                           count, last_direct_heard, dest, via
-                    FROM heard_stations
-                """)
-                await db.execute("DROP TABLE heard_stations")
-                table_names.discard("heard_stations")
-                table_names.update({"stations", "heard_events"})
-                logger.info("heard plugin: heard_stations migration complete")
-
-            # ── One-shot fix for an early migration bug ───────────────────────
-            # The first version of the schema-v2 migration wrote
-            # heard_stations.nodename → netrom_alias.  It should have gone to
-            # beacon_alias (the original source was ambiguous).  Detect by:
-            # netrom_alias set but no heard_events row with transport='netrom'.
-            # Gated by a heard_settings sentinel so this only runs on databases
-            # that pre-date the fix; otherwise a legit netrom_alias whose
-            # heard_events 'netrom' row gets pruned in the future could be
-            # erroneously rewritten on the next startup.
-            if (
-                "stations" in table_names
-                and "heard_events" in table_names
-                and "heard_settings" in table_names
-            ):
-                done_row = await (await db.execute(
-                    "SELECT value FROM heard_settings"
-                    " WHERE key = 'migration_alias_fix_done'"
-                )).fetchone()
-                if not done_row:
-                    fixed = await db.execute(
-                        """
-                        UPDATE stations
-                           SET beacon_alias = CASE WHEN beacon_alias = ''
-                                                   THEN netrom_alias
-                                                   ELSE beacon_alias END,
-                               netrom_alias = ''
-                         WHERE netrom_alias != ''
-                           AND NOT EXISTS (
-                                   SELECT 1 FROM heard_events e
-                                    WHERE e.callsign = stations.callsign
-                                      AND e.transport = 'netrom'
-                               )
-                        """
-                    )
-                    if fixed.rowcount:
-                        logger.info(
-                            "heard plugin: corrected netrom_alias → beacon_alias"
-                            " for %d station(s)", fixed.rowcount
-                        )
-                    await db.execute(
-                        "INSERT OR REPLACE INTO heard_settings (key, value)"
-                        " VALUES ('migration_alias_fix_done', '1')"
-                    )
-
-            # ── Add kanode_alias column if not present ────────────────────────
-            if "stations" in table_names:
-                try:
-                    await db.execute("SELECT kanode_alias FROM stations LIMIT 1")
-                except Exception:
-                    await db.execute(
-                        "ALTER TABLE stations ADD COLUMN"
-                        " kanode_alias TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
-                    )
-                    logger.info("heard plugin: added kanode_alias column to stations")
-
-            # ── Migrate netrom_routes to composite PK (dest_call, neighbor_call)
-            if "netrom_routes" in table_names:
-                pk_rows = await (await db.execute(
-                    "PRAGMA table_info(netrom_routes)"
-                )).fetchall()
-                pk_count = sum(1 for r in pk_rows if r[5] > 0)
-                if pk_count == 1:
-                    logger.info(
-                        "heard plugin: migrating netrom_routes to composite PK …"
-                    )
-                    await db.execute("""
-                        CREATE TABLE netrom_routes_new (
-                            dest_call     TEXT NOT NULL COLLATE NOCASE,
-                            neighbor_call TEXT NOT NULL COLLATE NOCASE,
-                            alias         TEXT NOT NULL DEFAULT '',
-                            quality       INTEGER NOT NULL DEFAULT 0,
-                            via_call      TEXT NOT NULL COLLATE NOCASE,
-                            via_alias     TEXT NOT NULL DEFAULT '',
-                            last_seen     INTEGER NOT NULL,
-                            PRIMARY KEY (dest_call, neighbor_call)
-                        )
-                    """)
-                    await db.execute("""
-                        INSERT OR IGNORE INTO netrom_routes_new
-                            (dest_call, neighbor_call, alias, quality,
-                             via_call, via_alias, last_seen)
-                        SELECT dest_call, neighbor_call, alias, quality,
-                               via_call, via_alias, last_seen
-                        FROM netrom_routes
-                    """)
-                    await db.execute("DROP TABLE netrom_routes")
-                    await db.execute(
-                        "ALTER TABLE netrom_routes_new RENAME TO netrom_routes"
-                    )
-                    logger.info("heard plugin: netrom_routes migration complete")
-
+            await self._migrate_heard_schema(db)
             await db.commit()
 
         # ── Apply schema (idempotent; creates missing tables on fresh install) ─
@@ -505,6 +362,369 @@ class HeardPlugin(BBSPlugin):
 
         self._max_age_hours = await self._load_max_age()
         await self._refresh_kanode_map()
+
+    # ── Schema migrations ─────────────────────────────────────────────────────
+
+    async def _migrate_heard_schema(self, db) -> None:
+        """Apply ordered, version-gated heard-schema migrations.
+
+        The applied version is stored in heard_settings['heard_schema_version'].
+        Every migration is idempotent and internally guarded, so it is safe
+        against any starting DB shape; the version stamp adopts an already-migrated
+        DB (e.g. a live production DB) at the current version and skips the work
+        on every subsequent start.
+        """
+        # heard_settings carries the version marker; ensure it exists first.
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS heard_settings ("
+            " key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        async with db.execute(
+            "SELECT value FROM heard_settings WHERE key = 'heard_schema_version'"
+        ) as _cur:
+            row = await _cur.fetchone()
+        version = int(row[0]) if row and str(row[0]).isdigit() else 0
+        if version >= _HEARD_SCHEMA_VERSION:
+            return
+
+        migrations = [
+            (1, self._heard_migration_v1),
+            (2, self._heard_migration_v2),
+            (3, self._heard_migration_v3),
+            (4, self._heard_migration_v4),
+        ]
+        for target, migrate in migrations:
+            if target > version:
+                await migrate(db)
+                await db.execute(
+                    "INSERT OR REPLACE INTO heard_settings (key, value)"
+                    " VALUES ('heard_schema_version', ?)",
+                    (str(target),),
+                )
+                logger.info("heard plugin: schema migrated to v%d", target)
+
+    async def _heard_migration_v1(self, db) -> None:
+        """v1 — consolidate the pre-versioning legacy migrations (unchanged; each
+        idempotent + guarded) and drop the orphaned heard_stations table."""
+        # ── Detect existing tables ────────────────────────────────────────
+        # Close the cursor (async with) before any later DROP TABLE: an open
+        # cursor on sqlite_master blocks schema modifications ("database table
+        # is locked").
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ) as tables_cur:
+            table_names = {r[0].lower() for r in await tables_cur.fetchall()}
+
+        # ── Migrate heard_paths if it predates the via_base column ────────
+        if "heard_paths" in table_names:
+            try:
+                async with db.execute("SELECT via_base FROM heard_paths LIMIT 1") as _c:
+                    await _c.fetchall()
+            except Exception:
+                # Very old schema: drop and recreate (ephemeral path data).
+                await db.execute("DROP TABLE heard_paths")
+                table_names.discard("heard_paths")
+
+        # ── Migrate heard_stations → stations + heard_events (schema v2) ──
+        if "heard_stations" in table_names and "stations" not in table_names:
+            logger.info(
+                "heard plugin: migrating heard_stations → stations + heard_events …"
+            )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS stations (
+                    callsign        TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+                    lat             REAL,
+                    lon             REAL,
+                    comment         TEXT    NOT NULL DEFAULT '',
+                    position_source TEXT    NOT NULL DEFAULT '',
+                    netrom_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                    beacon_alias    TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                    first_seen      INTEGER NOT NULL DEFAULT 0,
+                    last_seen       INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS heard_events (
+                    callsign          TEXT    NOT NULL COLLATE NOCASE,
+                    transport         TEXT    NOT NULL DEFAULT '',
+                    source            TEXT    NOT NULL DEFAULT 'heard',
+                    first_heard       INTEGER NOT NULL,
+                    last_heard        INTEGER NOT NULL,
+                    count             INTEGER NOT NULL DEFAULT 0,
+                    last_direct_heard INTEGER NOT NULL DEFAULT 0,
+                    dest              TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
+                    via               TEXT    NOT NULL DEFAULT '',
+                    PRIMARY KEY (callsign, transport)
+                )
+            """)
+            # Station identity: one row per callsign, RF-heard metadata wins
+            # over NETROM-only rows for position / comment.  The old nodename
+            # column was a catch-all (beacons, manual edits, NETROM NODES) so
+            # it goes into beacon_alias; netrom_alias will repopulate from the
+            # next NODES broadcast.
+            await db.execute("""
+                INSERT INTO stations
+                    (callsign, lat, lon, comment, position_source,
+                     beacon_alias, first_seen, last_seen)
+                SELECT
+                    callsign,
+                    MAX(CASE WHEN transport != 'netrom' AND lat IS NOT NULL
+                             THEN lat END),
+                    MAX(CASE WHEN transport != 'netrom' AND lon IS NOT NULL
+                             THEN lon END),
+                    COALESCE(MAX(CASE WHEN transport != 'netrom'
+                                     AND comment != ''
+                                     THEN comment END), ''),
+                    COALESCE(MAX(CASE WHEN transport != 'netrom'
+                                     AND position_source != ''
+                                     THEN position_source END), ''),
+                    COALESCE(MAX(CASE WHEN nodename != '' THEN nodename END), ''),
+                    MIN(first_heard),
+                    MAX(last_heard)
+                FROM heard_stations
+                GROUP BY callsign
+            """)
+            # Per-transport observations: all rows, all transports, verbatim.
+            await db.execute("""
+                INSERT OR IGNORE INTO heard_events
+                    (callsign, transport, source, first_heard, last_heard,
+                     count, last_direct_heard, dest, via)
+                SELECT callsign, transport, source, first_heard, last_heard,
+                       count, last_direct_heard, dest, via
+                FROM heard_stations
+            """)
+            await db.execute("DROP TABLE heard_stations")
+            table_names.discard("heard_stations")
+            table_names.update({"stations", "heard_events"})
+            logger.info("heard plugin: heard_stations migration complete")
+
+        # ── One-shot fix for an early migration bug ───────────────────────
+        # The first version of the schema-v2 migration wrote
+        # heard_stations.nodename → netrom_alias.  It should have gone to
+        # beacon_alias (the original source was ambiguous).  Detect by:
+        # netrom_alias set but no heard_events row with transport='netrom'.
+        # Gated by a heard_settings sentinel so this only runs on databases
+        # that pre-date the fix; otherwise a legit netrom_alias whose
+        # heard_events 'netrom' row gets pruned in the future could be
+        # erroneously rewritten on the next startup.
+        if (
+            "stations" in table_names
+            and "heard_events" in table_names
+            and "heard_settings" in table_names
+        ):
+            async with db.execute(
+                "SELECT value FROM heard_settings"
+                " WHERE key = 'migration_alias_fix_done'"
+            ) as _c:
+                done_row = await _c.fetchone()
+            if not done_row:
+                fixed = await db.execute(
+                    """
+                    UPDATE stations
+                       SET beacon_alias = CASE WHEN beacon_alias = ''
+                                               THEN netrom_alias
+                                               ELSE beacon_alias END,
+                           netrom_alias = ''
+                     WHERE netrom_alias != ''
+                       AND NOT EXISTS (
+                               SELECT 1 FROM heard_events e
+                                WHERE e.callsign = stations.callsign
+                                  AND e.transport = 'netrom'
+                           )
+                    """
+                )
+                if fixed.rowcount:
+                    logger.info(
+                        "heard plugin: corrected netrom_alias → beacon_alias"
+                        " for %d station(s)", fixed.rowcount
+                    )
+                await db.execute(
+                    "INSERT OR REPLACE INTO heard_settings (key, value)"
+                    " VALUES ('migration_alias_fix_done', '1')"
+                )
+
+        # ── Add kanode_alias column if not present ────────────────────────
+        if "stations" in table_names:
+            try:
+                async with db.execute("SELECT kanode_alias FROM stations LIMIT 1") as _c:
+                    await _c.fetchall()
+            except Exception:
+                await db.execute(
+                    "ALTER TABLE stations ADD COLUMN"
+                    " kanode_alias TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
+                )
+                logger.info("heard plugin: added kanode_alias column to stations")
+
+        # ── Migrate netrom_routes to composite PK (dest_call, neighbor_call)
+        if "netrom_routes" in table_names:
+            async with db.execute("PRAGMA table_info(netrom_routes)") as _c:
+                pk_rows = await _c.fetchall()
+            pk_count = sum(1 for r in pk_rows if r[5] > 0)
+            if pk_count == 1:
+                logger.info(
+                    "heard plugin: migrating netrom_routes to composite PK …"
+                )
+                await db.execute("""
+                    CREATE TABLE netrom_routes_new (
+                        dest_call     TEXT NOT NULL COLLATE NOCASE,
+                        neighbor_call TEXT NOT NULL COLLATE NOCASE,
+                        alias         TEXT NOT NULL DEFAULT '',
+                        quality       INTEGER NOT NULL DEFAULT 0,
+                        via_call      TEXT NOT NULL COLLATE NOCASE,
+                        via_alias     TEXT NOT NULL DEFAULT '',
+                        last_seen     INTEGER NOT NULL,
+                        PRIMARY KEY (dest_call, neighbor_call)
+                    )
+                """)
+                await db.execute("""
+                    INSERT OR IGNORE INTO netrom_routes_new
+                        (dest_call, neighbor_call, alias, quality,
+                         via_call, via_alias, last_seen)
+                    SELECT dest_call, neighbor_call, alias, quality,
+                           via_call, via_alias, last_seen
+                    FROM netrom_routes
+                """)
+                await db.execute("DROP TABLE netrom_routes")
+                await db.execute(
+                    "ALTER TABLE netrom_routes_new RENAME TO netrom_routes"
+                )
+                logger.info("heard plugin: netrom_routes migration complete")
+
+        # ── Drop the orphaned heard_stations table ────────────────────────
+        # The schema-v2 split above only fires when `stations` does NOT yet
+        # exist, so a DB where the split already ran keeps its old heard_stations
+        # rows forever (they are superseded by `stations`).  Drop the stale
+        # table when `stations` is present so no live data is lost.
+        if "heard_stations" in table_names and "stations" in table_names:
+            await db.execute("DROP TABLE heard_stations")
+            table_names.discard("heard_stations")
+            logger.info("heard plugin: dropped orphaned heard_stations table")
+
+    async def _heard_migration_v2(self, db) -> None:
+        """v2 — add stations.service + last_beacon_text + last_beacon_ts.
+
+        Only ALTERs an *existing* stations table; on a fresh install `stations`
+        is created (with these columns) by _SCHEMA after the migrator runs.
+        """
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stations'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return
+        for col, ddl in (
+            ("service",
+             "ALTER TABLE stations ADD COLUMN service TEXT NOT NULL DEFAULT ''"),
+            ("last_beacon_text",
+             "ALTER TABLE stations ADD COLUMN last_beacon_text TEXT NOT NULL DEFAULT ''"),
+            ("last_beacon_ts",
+             "ALTER TABLE stations ADD COLUMN last_beacon_ts INTEGER NOT NULL DEFAULT 0"),
+        ):
+            try:
+                async with db.execute(f"SELECT {col} FROM stations LIMIT 1") as _c:
+                    await _c.fetchall()
+            except Exception:
+                await db.execute(ddl)
+                logger.info("heard plugin: added stations.%s (v2)", col)
+
+    async def _heard_migration_v3(self, db) -> None:
+        """v3 — add station_entities + stations.base_call, grouping the
+        callsign-SSIDs of one physical station under its base callsign."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS station_entities (
+                base_call          TEXT    PRIMARY KEY NOT NULL COLLATE NOCASE,
+                canonical_nodename TEXT    NOT NULL DEFAULT '',
+                notes              TEXT    NOT NULL DEFAULT '',
+                lat                REAL,
+                lon                REAL,
+                position_source    TEXT    NOT NULL DEFAULT '',
+                first_seen         INTEGER NOT NULL DEFAULT 0,
+                last_seen          INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # The rest applies only to an existing stations table; a fresh install
+        # gets base_call from _SCHEMA and has no rows to backfill.
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stations'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return
+        try:
+            async with db.execute("SELECT base_call FROM stations LIMIT 1") as _c:
+                await _c.fetchall()
+        except Exception:
+            await db.execute(
+                "ALTER TABLE stations ADD COLUMN"
+                " base_call TEXT NOT NULL DEFAULT '' COLLATE NOCASE"
+            )
+            logger.info("heard plugin: added stations.base_call (v3)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stations_base_call ON stations (base_call)"
+        )
+        # Backfill base_call = callsign with any -SSID suffix stripped.
+        await db.execute("""
+            UPDATE stations
+               SET base_call = CASE WHEN instr(callsign,'-') > 0
+                                    THEN substr(callsign, 1, instr(callsign,'-') - 1)
+                                    ELSE callsign END
+             WHERE base_call = ''
+        """)
+        # One entity per base callsign, seeded from member first/last_seen.
+        await db.execute("""
+            INSERT OR IGNORE INTO station_entities (base_call, first_seen, last_seen)
+            SELECT base_call, MIN(first_seen), MAX(last_seen)
+              FROM stations WHERE base_call != '' GROUP BY base_call
+        """)
+        logger.info("heard plugin: created station_entities + base_call (v3)")
+
+    async def _heard_migration_v4(self, db) -> None:
+        """v4 — add stations.position_ts (unix time a position was last written).
+
+        Used to pick the freshest beacon position when rolling SSIDs up to a
+        physical station.  Existing positions are backfilled to last_seen: a
+        best-effort "when we last heard this station" stamp, so pre-v4 fixes
+        still order sensibly against new beacons.
+        """
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stations'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return
+        try:
+            async with db.execute("SELECT position_ts FROM stations LIMIT 1") as _c:
+                await _c.fetchall()
+        except Exception:
+            await db.execute(
+                "ALTER TABLE stations ADD COLUMN position_ts INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("heard plugin: added stations.position_ts (v4)")
+        # Seed a timestamp for rows that already carry a fix so freshest-wins
+        # ordering has something to compare against.
+        await db.execute(
+            "UPDATE stations SET position_ts = last_seen"
+            " WHERE lat IS NOT NULL AND position_ts = 0"
+        )
+
+    async def _reconcile_entities(self, db) -> None:
+        """Assign base_call to any newly-inserted stations and ensure a
+        station_entities row exists for each base callsign.  Called at the end
+        of an ingest write; cheap because it only touches rows whose base_call
+        is still blank (the ones just inserted) — base_call is indexed.
+        """
+        await db.execute("""
+            UPDATE stations
+               SET base_call = CASE WHEN instr(callsign,'-') > 0
+                                    THEN substr(callsign, 1, instr(callsign,'-') - 1)
+                                    ELSE callsign END
+             WHERE base_call = ''
+        """)
+        await db.execute("""
+            INSERT OR IGNORE INTO station_entities (base_call, first_seen, last_seen)
+            SELECT base_call, MIN(first_seen), MAX(last_seen)
+              FROM stations
+             WHERE base_call != ''
+               AND base_call NOT IN (SELECT base_call FROM station_entities)
+             GROUP BY base_call
+        """)
 
     # ── Settings helpers ──────────────────────────────────────────────────────
 
@@ -591,6 +811,17 @@ class HeardPlugin(BBSPlugin):
                 "UPDATE stations SET last_seen = MAX(last_seen, ?) WHERE callsign = ?",
                 (ts, src_up),
             )
+            # ── latest beacon/ID/status text this station transmitted ─────────
+            # on_heard only sees monitored UI/unproto frames (beacons, IDs,
+            # APRS, status), so the info field is the station's own broadcast
+            # text.  Keep the most recent non-empty one (capped) for display.
+            _beacon_text = info.strip()
+            if _beacon_text:
+                await db.execute(
+                    "UPDATE stations SET last_beacon_text = ?, last_beacon_ts = ?"
+                    " WHERE callsign = ?",
+                    (_beacon_text[:_MAX_BEACON_TEXT], ts, src_up),
+                )
 
             # ── heard_events: upsert per-transport observation ────────────────
             await db.execute(
@@ -776,10 +1007,11 @@ class HeardPlugin(BBSPlugin):
                            SET lat             = ?,
                                lon             = ?,
                                beacon_alias    = ?,
-                               position_source = 'beacon'
+                               position_source = 'beacon',
+                               position_ts     = ?
                          WHERE callsign = ?
                         """,
-                        (lat, lon, beacon_alias, src_up),
+                        (lat, lon, beacon_alias, ts, src_up),
                     )
                     logger.info(
                         "MAP beacon: %s%s @ %.4f,%.4f via %s",
@@ -793,6 +1025,7 @@ class HeardPlugin(BBSPlugin):
                         " — info: %r",
                         src_up, map_call, info,
                     )
+            await self._reconcile_entities(db)
             await db.commit()
 
         # Notify subscribers after the DB write so the data is consistent.
@@ -923,6 +1156,7 @@ class HeardPlugin(BBSPlugin):
                     (alias, call),
                 )
 
+            await self._reconcile_entities(db)
             await db.commit()
 
         logger.info(

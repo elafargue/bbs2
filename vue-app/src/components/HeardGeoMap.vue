@@ -2,9 +2,14 @@
 /**
  * HeardGeoMap.vue — Leaflet geographic map of heard stations.
  *
- * Shows every station that has lat/lon coordinates stored in the DB as a
- * circle marker.  RF hop edges from the graph data are drawn as polylines
- * between pairs of stations that both have coordinates.
+ * One marker per PHYSICAL STATION (SSIDs folded by base callsign, from
+ * /api/heard/entities).  The marker sits at the entity's rolled-up reference
+ * position (sysop override, else the freshest beacon across its SSIDs).
+ *
+ * RF/NET-ROM hop edges stay PER-SSID (from the graph data): each per-SSID
+ * endpoint resolves to its physical station's marker, so a hop between two
+ * stations draws between their collapsed markers; hops between SSIDs of the
+ * same station collapse to a point and are skipped.
  *
  * Node colour scheme mirrors NetworkGraph.vue:
  *   bbs     — amber   #F59E0B
@@ -24,9 +29,11 @@ delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({ iconUrl, iconRetinaUrl, shadowUrl })
 
 const props = defineProps({
-  /** Full stations list from GET /api/heard — each item has callsign, lat, lon, type? */
-  stations:  { type: Array,  default: () => [] },
-  /** Graph data from GET /api/heard/graph — { bbs, nodes: {call: {type}}, edges: [{source,target}] } */
+  /** Physical stations from GET /api/heard/entities — each item has
+   *  base_call, nodename, lat, lon, position_source, ssids[], services[],
+   *  aliases[], transports[], last_heard, count, last_beacon_text, members[]. */
+  entities:  { type: Array,  default: () => [] },
+  /** Graph data from GET /api/heard/graph — { bbs, nodes: {call:{type}}, edges:[{source,target}] } */
   graphData: { type: Object, default: null },
   loading:   { type: Boolean, default: false },
 })
@@ -36,8 +43,10 @@ let map     = null
 let markersLayer = null
 let edgesLayer   = null
 
-import { NODE_COLORS, RF_EDGE_COLOR, NETROM_EDGE_COLOR }
+import { NODE_COLORS, RF_EDGE_COLOR, NETROM_EDGE_COLOR, ALIAS_COLORS }
   from '../utils/colorScheme'
+
+const BEACON_ALIAS_COLOR = '#9CA3AF'  // muted: self-declared, unverified
 
 // Map markers are smaller than the force-graph nodes; sizing is owned here.
 const NODE_CFG = {
@@ -49,62 +58,63 @@ const NODE_CFG = {
 }
 const DEFAULT_CFG = { color: NODE_COLORS.station.fill, radius: 7, weight: 1.5 }
 
+// Rank used to pick a single representative role for a collapsed station from
+// the (possibly mixed) roles of its member SSIDs.
+const TYPE_RANK = { station: 0, netrom: 1, digi: 2, both: 3, bbs: 4 }
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/** Build a lookup of callsign → {lat, lon, type} for stations with coordinates.
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** The RF/NET-ROM role of a single SSID. The graph node type is authoritative
+ * for the RF role (digi/both/bbs), but only when it is a *node* role — a bare
+ * 'station' must not mask a NET/ROM identity (netrom event or alias). */
+function memberRole(m, cs, bbsCall, nodes) {
+  if (cs === bbsCall) return 'bbs'
+  const g = nodes?.[cs]?.type
+  if (g && g !== 'station') return g                     // digi/both/bbs/netrom
+  if (m.netrom_alias || m.transport === 'netrom') return 'netrom'
+  if (m.kanode_alias) return (m.transport && m.transport !== '') ? 'digi' : 'both'
+  return g || 'station'
+}
+
+/** The representative role of a physical station = the highest-ranked role
+ * among its member SSIDs. */
+function entityType(e, bbsCall, nodes) {
+  let best = 'station'
+  for (const m of e.members ?? []) {
+    const t = memberRole(m, (m.callsign || '').toUpperCase(), bbsCall, nodes)
+    if ((TYPE_RANK[t] ?? 0) > (TYPE_RANK[best] ?? 0)) best = t
+  }
+  return best
+}
+
+/** callsign / alias → { lat, lon, base } for every station with coordinates.
  *
- * Type resolution priority (per callsign):
- *   1. graphData.nodes[callsign].type — computed from confirmed RF heard_paths (most
- *      accurate; correctly reflects Ka-Node merges since paths are re-attributed)
- *   2. kanode_alias set — station acts as a digi even if its own transport is non-empty
- *   3. transport === '' with source === 'heard' — directly-heard digi relay ('both')
- *   4. transport === '' — relay/digi only
- *   5. default — 'station'
- *
- * After a Ka-Node merge (e.g. K6FB absorbs KROCK), other stations' via-paths still
- * contain 'KROCK' as the intermediate hop because the historical path strings are not
- * rewritten.  We add alias entries to coordMap so that graph edge lookups for the old
- * Ka-Node alias automatically resolve to the owning callsign's coordinates.
+ * Every member SSID and known alias of a physical station resolves to the same
+ * collapsed marker position, so per-SSID graph edges land on the right marker.
  */
 function buildCoordMap() {
   const coordMap = {}
-  if (!props.stations) return coordMap
-  const bbs = props.graphData?.bbs ?? null
+  if (!props.entities) return coordMap
+  const bbs   = props.graphData?.bbs ?? null
+  const nodes = props.graphData?.nodes ?? null
 
-  for (const s of props.stations) {
-    if (s.lat == null || s.lon == null) continue
-    const callsign = s.callsign.toUpperCase()
-
-    // 1. Use graph-computed type when available
-    const graphType = props.graphData?.nodes?.[callsign]?.type
-
-    // 2. Fallback heuristics from the API row (schema v2: one row per callsign)
-    const isRelayRow    = s.transport === ''
-    const isHeardDirect = isRelayRow && s.source === 'heard'
-    const hasKaNode     = !!s.kanode_alias
-
-    let t
-    if (callsign === bbs)   t = 'bbs'
-    else if (graphType)     t = graphType
-    else if (hasKaNode)     t = s.source === 'heard' ? 'both' : 'digi'
-    else if (isHeardDirect) t = 'both'
-    else if (isRelayRow)    t = 'digi'
-    else                    t = 'station'
-
-    coordMap[callsign] = { lat: s.lat, lon: s.lon, type: t, station: s }
-  }
-
-  // Add Ka-Node alias entries so graph edges that still reference the old digi
-  // callsign (e.g. KROCK) resolve to the merged owner's coordinates.
-  for (const s of props.stations) {
-    if (!s.kanode_alias) continue
-    const alias = s.kanode_alias.toUpperCase()
-    const owner = s.callsign.toUpperCase()
-    if (coordMap[owner] && !coordMap[alias]) {
-      coordMap[alias] = coordMap[owner]
+  for (const e of props.entities) {
+    if (e.lat == null || e.lon == null) continue
+    const pos = { lat: e.lat, lon: e.lon, base: e.base_call, type: entityType(e, bbs, nodes) }
+    const keys = new Set([e.base_call.toUpperCase()])
+    for (const s of e.ssids ?? []) keys.add(s.toUpperCase())
+    for (const m of e.members ?? []) {
+      for (const a of [m.kanode_alias, m.netrom_alias, m.beacon_alias]) {
+        if (a) keys.add(a.toUpperCase())
+      }
     }
+    for (const k of keys) if (!coordMap[k]) coordMap[k] = pos
   }
-
   return coordMap
 }
 
@@ -118,12 +128,12 @@ function renderLayers() {
   const coordMap = buildCoordMap()
   if (!Object.keys(coordMap).length) return
 
-  // ── RF edge lines ─────────────────────────────────────────────────────
+  // ── RF edge lines (per-SSID; skip intra-station hops) ─────────────────
   if (props.graphData?.edges) {
     for (const edge of props.graphData.edges) {
-      const a = coordMap[edge.source]
-      const b = coordMap[edge.target]
-      if (!a || !b) continue
+      const a = coordMap[(edge.source || '').toUpperCase()]
+      const b = coordMap[(edge.target || '').toUpperCase()]
+      if (!a || !b || a.base === b.base) continue
       L.polyline(
         [[a.lat, a.lon], [b.lat, b.lon]],
         { color: RF_EDGE_COLOR, weight: 2.5, opacity: 0.85 }
@@ -134,9 +144,9 @@ function renderLayers() {
   // ── NETROM routing edges (dashed violet) ──────────────────────────────
   if (props.graphData?.netrom_edges) {
     for (const edge of props.graphData.netrom_edges) {
-      const a = coordMap[edge.source]
-      const b = coordMap[edge.target]
-      if (!a || !b) continue
+      const a = coordMap[(edge.source || '').toUpperCase()]
+      const b = coordMap[(edge.target || '').toUpperCase()]
+      if (!a || !b || a.base === b.base) continue
       const opacity = 0.3 + 0.5 * (edge.quality ?? 128) / 255
       L.polyline(
         [[a.lat, a.lon], [b.lat, b.lon]],
@@ -145,57 +155,53 @@ function renderLayers() {
     }
   }
 
-  // ── Station markers ───────────────────────────────────────────────────
-  // Iterate props.stations directly — coordMap may contain Ka-Node alias
-  // entries (e.g. KROCK → K6FB coords) used only for edge resolution; those
-  // must NOT generate their own markers.
-  for (const s of props.stations) {
-    if (s.lat == null || s.lon == null) continue
-    const callsign = s.callsign.toUpperCase()
-    const info     = coordMap[callsign]
-    if (!info) continue
+  // ── Physical-station markers (one per entity) ─────────────────────────
+  for (const e of props.entities) {
+    if (e.lat == null || e.lon == null) continue
+    const type = entityType(e, props.graphData?.bbs ?? null, props.graphData?.nodes ?? null)
+    const cfg  = NODE_CFG[type] ?? DEFAULT_CFG
 
-    const cfg     = NODE_CFG[info.type] ?? DEFAULT_CFG
-    const expired = s.expired ?? false
-
-    // When a Ka-Node alias is set, lead with it (that's the RF-visible digi
-    // name) and show the database callsign as the secondary label.
-    // Otherwise fall back to the nodename-in-parens behaviour.
-    const displayName = s.kanode_alias || callsign
-    const subName     = s.kanode_alias ? callsign
-                      : (s.nodename   ? s.nodename : null)
-
+    const name    = e.nodename || e.base_call
+    const subName = (e.nodename && e.nodename.toUpperCase() !== e.base_call.toUpperCase())
+      ? e.base_call : null
     const titleHtml = subName
-      ? `<strong>${displayName}</strong> <span style="color:#9CA3AF">(${subName})</span>`
-      : `<strong>${displayName}</strong>`
+      ? `<strong>${esc(name)}</strong> <span style="color:#9CA3AF">(${esc(subName)})</span>`
+      : `<strong>${esc(name)}</strong>`
 
-    const sourceLabel = s.position_source === 'beacon'
+    const sourceLabel = e.position_source === 'beacon'
       ? 'self-reported via beacon'
-      : s.position_source === 'manual'
+      : e.position_source === 'manual'
         ? 'set by sysop'
         : null
+
+    const aliasLine = (label, arr, color) =>
+      (arr?.length) ? `<span style="color:${color}">${label}:</span> ${esc(arr.join(', '))}` : null
+
     const popupLines = [
       titleHtml,
-      `Type: ${info.type}`,
-      s.netrom_alias ? `NET/ROM: ${s.netrom_alias}` : null,
-      s.transport ? `Transport: ${s.transport}` : null,
-      s.last_heard ? `Last heard: ${new Date(s.last_heard * 1000).toLocaleString()}` : null,
-      s.count ? `Count: ${s.count}` : null,
+      (e.ssids?.length)      ? `SSIDs: ${esc(e.ssids.join(', '))}`         : null,
+      (e.services?.length)   ? `Services: ${esc(e.services.join(', '))}`   : null,
+      aliasLine('NET/ROM',   e.netrom_aliases, ALIAS_COLORS.netrom),
+      aliasLine('Ka-Node',   e.kanode_aliases, ALIAS_COLORS.kanode),
+      aliasLine('Beacon ID', e.beacon_aliases, BEACON_ALIAS_COLOR),
+      (e.transports?.length) ? `Via: ${esc(e.transports.join(', '))}`      : null,
+      e.last_heard ? `Last heard: ${new Date(e.last_heard * 1000).toLocaleString()}` : null,
+      e.count ? `Count: ${e.count}` : null,
       sourceLabel ? `Position: ${sourceLabel}` : null,
-      s.comment ? `Comment: ${s.comment}` : null,
+      e.last_beacon_text ? `Beacon: ${esc(e.last_beacon_text)}` : null,
     ].filter(Boolean).join('<br/>')
 
-    const tooltipText = subName ? `${displayName} (${subName})` : displayName
+    const tooltipText = subName ? `${name} (${subName})` : name
 
-    L.circleMarker([info.lat, info.lon], {
+    L.circleMarker([e.lat, e.lon], {
       radius:      cfg.radius,
       color:       cfg.color,
       weight:      cfg.weight,
       fillColor:   cfg.color,
-      fillOpacity: expired ? 0.25 : 0.75,
-      opacity:     expired ? 0.45 : 1.0,
+      fillOpacity: 0.75,
+      opacity:     1.0,
     })
-      .bindPopup(popupLines, { maxWidth: 260 })
+      .bindPopup(popupLines, { maxWidth: 280 })
       .bindTooltip(tooltipText, { permanent: false, direction: 'top', offset: [0, -cfg.radius - 2] })
       .addTo(markersLayer)
   }
@@ -235,7 +241,7 @@ onBeforeUnmount(() => {
   if (map) { map.remove(); map = null }
 })
 
-watch([() => props.stations, () => props.graphData], renderLayers, { deep: true })
+watch([() => props.entities, () => props.graphData], renderLayers, { deep: true })
 </script>
 
 <template>
@@ -248,15 +254,15 @@ watch([() => props.stations, () => props.graphData], renderLayers, { deep: true 
       <v-progress-circular indeterminate color="primary" />
     </div>
 
-    <!-- Empty state (no stations have coordinates) -->
+    <!-- Empty state (no station has coordinates) -->
     <div
-      v-if="!loading && !stations.some(s => s.lat != null && s.lon != null)"
+      v-if="!loading && !entities.some(e => e.lat != null && e.lon != null)"
       style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1000;background:rgba(17,24,39,.55);"
     >
       <span style="color:#9CA3AF;font-size:14px;">No stations with coordinates yet.</span>
       <span style="color:#6B7280;font-size:12px;margin-top:6px;">
-        Stations appear here when they beacon a <code style="color:#9CA3AF;">&lt;MAP:lat,lon,CALL[,NODE]&gt;</code> tag,
-        or after a sysop adds lat/lon via the pencil icon in the Log tab.
+        Stations appear here when any of their SSIDs beacons a <code style="color:#9CA3AF;">&lt;MAP:lat,lon,CALL[,NODE]&gt;</code> tag,
+        or after a sysop sets lat/lon (per-SSID in the Log tab, or per-station in the Stations tab).
       </span>
     </div>
 
