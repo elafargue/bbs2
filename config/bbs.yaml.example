@@ -202,6 +202,12 @@ netrom:
   hop_cost: 25
   # Minimum quality required to re-advertise a route after decrement (default 10)
   min_advert_quality: 10
+  # Idle-crosslink teardown: once the last NET/ROM circuit on a neighbor
+  # crosslink closes, disconnect the underlying AX.25 link after this many
+  # seconds with no circuits (default 900 = 15 min). 0 = keep links up
+  # indefinitely (the Linux AX.25 IDLE=0 default), i.e. rely on the neighbor to
+  # drop them. Mirrors the kernel AX.25 idle timer; T3 keepalives don't reset it.
+  link_idle_timeout: 900
   # Polite-client mode (default true).  When true, NODES broadcasts contain
   # only the 7-byte header (discriminator + alias) — peers add us as a direct
   # neighbor by RX without us re-broadcasting their route tables back at them.

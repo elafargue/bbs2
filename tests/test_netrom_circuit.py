@@ -52,11 +52,12 @@ from bbs.transport.base import Connection
 # ── Test fixtures ────────────────────────────────────────────────────────────
 
 class FakeAX25Writer:
-    """Records frames written, supports drain() and is_closing()."""
+    """Records frames written, supports drain(), is_closing() and close()."""
 
     def __init__(self) -> None:
         self.frames: list[bytes] = []
         self.closing = False
+        self.closed = False
         self.drain_count = 0
 
     def write(self, data: bytes) -> None:
@@ -67,6 +68,10 @@ class FakeAX25Writer:
 
     def is_closing(self) -> bool:
         return self.closing
+
+    def close(self) -> None:
+        self.closed = True
+        self.closing = True
 
 
 def _connect_req_bytes(
@@ -858,3 +863,105 @@ class TestWriterIsClosing:
         assert circuit.writer.is_closing() is True
         sessions.release_all()
         await asyncio.sleep(0)
+
+
+# ── Idle-crosslink reaper (mirrors the Linux AX.25 IDLE timer) ────────────────
+
+def _mgr_with_idle(timeout: float):
+    """A manager whose crosslink self-disconnects after `timeout` idle seconds."""
+    ax25 = FakeAX25Writer()
+    sessions = CapturedSessions()
+    mgr = NetromCircuitManager(
+        local_call        = "W6ELA-1",
+        via_node          = "N6ZX-5",
+        ax25_writer       = ax25,
+        on_user_connect   = sessions.on_user_connect,
+        link_idle_timeout = timeout,
+    )
+    return mgr, ax25, sessions
+
+
+def _disc_req_frame(circuit: NetromCircuit) -> Disconnect:
+    """A peer DISC REQ addressed at *circuit* (closes it → removes it)."""
+    header = L3Header(
+        origin_call  = circuit.origin_node_call,
+        dest_call    = circuit.local_call,
+        ttl          = 25,
+        circuit_idx  = circuit.local_idx,
+        circuit_id   = circuit.local_id,
+        tx_seq       = 0,
+        rx_seq       = 0,
+        opcode_flags = OPCODE_DISCONNECT_REQ,
+    )
+    return Disconnect(header=header)
+
+
+async def _open_one(mgr) -> NetromCircuit:
+    await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+    await asyncio.sleep(0)
+    return mgr.active_circuits[0]
+
+
+class TestIdleReaper:
+    async def test_last_circuit_close_arms_timer(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        c = await _open_one(mgr)
+        assert mgr._idle_handle is None            # active circuit → not armed
+        await mgr.dispatch(_disc_req_frame(c))     # peer disconnects
+        assert mgr.circuit_count == 0
+        assert mgr._idle_handle is not None        # armed once circuit-less
+        mgr._cancel_idle_timer()                   # don't leak the pending timer
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_new_circuit_cancels_timer(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        c = await _open_one(mgr)
+        await mgr.dispatch(_disc_req_frame(c))
+        assert mgr._idle_handle is not None
+        # A fresh inbound circuit before the timer fires cancels the reaper.
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes(cidx=50, cid=51, user="W1AW")))
+        await asyncio.sleep(0)
+        assert mgr.circuit_count == 1
+        assert mgr._idle_handle is None
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_reap_disconnects_crosslink(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        c = await _open_one(mgr)
+        await mgr.dispatch(_disc_req_frame(c))
+        mgr._reap_idle()                           # fire the reaper directly
+        assert ax25.closed is True                 # crosslink 'd' sent
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_reap_noop_when_circuit_active(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        await _open_one(mgr)                        # circuit still open
+        mgr._reap_idle()                           # stray/late fire
+        assert ax25.closed is False                # must NOT cut a live circuit
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_disabled_never_arms(self):
+        mgr, ax25, sessions = _mgr_with_idle(0.0)   # 0 = disabled
+        c = await _open_one(mgr)
+        await mgr.dispatch(_disc_req_frame(c))
+        assert mgr._idle_handle is None
+        assert ax25.closed is False
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_timer_fires_and_disconnects(self):
+        mgr, ax25, sessions = _mgr_with_idle(0.05)  # 50 ms
+        c = await _open_one(mgr)
+        await mgr.dispatch(_disc_req_frame(c))
+        assert ax25.closed is False
+        await asyncio.sleep(0.12)                    # let the real timer fire
+        assert ax25.closed is True
+        sessions.release_all(); await asyncio.sleep(0)
+
+    async def test_shutdown_cancels_timer(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        c = await _open_one(mgr)
+        await mgr.dispatch(_disc_req_frame(c))
+        assert mgr._idle_handle is not None
+        mgr.shutdown()
+        assert mgr._idle_handle is None
+        assert mgr._closed is True

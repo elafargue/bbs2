@@ -475,6 +475,8 @@ class AGWPETransport(Transport):
         # stack — visible as missing chunks in BBS output.  Default 108
         # matches NORCAL convention of PACLEN=128.
         self._netrom_info_mtu: int = 108
+        # Idle-crosslink reaper timeout (seconds); 0 = keep links up forever.
+        self._netrom_link_idle_timeout: float = 0.0
 
         # Additional callsign-SSIDs to register with AGWPE (beyond the BBS
         # callsign) so callers can reach ax25d-style external services on
@@ -515,6 +517,11 @@ class AGWPETransport(Transport):
         ``_netrom_info_mtu`` for the rationale.
         """
         self._netrom_info_mtu = max(1, int(mtu))
+
+    def set_netrom_link_idle_timeout(self, seconds: float) -> None:
+        """Disconnect a NETROM crosslink after this many seconds with no
+        circuits (0 = keep it up indefinitely). See NetromCircuitManager."""
+        self._netrom_link_idle_timeout = max(0.0, float(seconds))
 
     def set_extra_callsigns(self, calls: list[str]) -> None:
         """Register extra callsign-SSIDs to accept (ax25d-style services).
@@ -849,6 +856,7 @@ class AGWPETransport(Transport):
                     ax25_writer     = netrom_writer,
                     on_user_connect = self._on_connect,
                     info_mtu        = self._netrom_info_mtu,
+                    link_idle_timeout = self._netrom_link_idle_timeout,
                 )
                 logger.info(
                     "agwpe: NETROM crosslink with %s — known neighbor, "
@@ -1111,6 +1119,7 @@ class AGWPETransport(Transport):
             ax25_writer     = netrom_writer,
             on_user_connect = self._on_connect,
             info_mtu        = self._netrom_info_mtu,
+            link_idle_timeout = self._netrom_link_idle_timeout,
         )
         sess.pending_classification = False
 

@@ -172,6 +172,11 @@ class BBSEngine:
             # to (PACLEN - 20) or the TNC will split L3 frames at L2 and
             # drop the headerless second half on the wire.
             info_mtu = int(netrom_cfg.get("info_mtu", 108))
+            # Idle-crosslink reaper: disconnect a NETROM crosslink after this
+            # many seconds with no circuits (0 = keep it up indefinitely, like
+            # the Linux AX.25 IDLE=0 default). Frees the link and stops needless
+            # T3 keepalives once the last circuit closes.
+            link_idle_timeout = float(netrom_cfg.get("link_idle_timeout", 900))
             # Classification of incoming AX.25 connections as NETROM vs.
             # direct BBS is delegated to a router-lookup closure.  Captures
             # `netrom_router` by reference so the set is always current.
@@ -187,6 +192,7 @@ class BBSEngine:
                 t.set_netrom_crosslink_enabled(True)
                 t.set_netrom_neighbor_check(_is_netrom_neighbor)
                 t.set_netrom_info_mtu(info_mtu)
+                t.set_netrom_link_idle_timeout(link_idle_timeout)
                 if netrom_alias:
                     # Only register the builder (and thus start the broadcast
                     # loop) when we have a node alias to advertise.

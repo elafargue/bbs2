@@ -158,6 +158,7 @@ class _AX25WriterProto:
     def write(self, data: bytes) -> None: ...
     async def drain(self) -> None: ...
     def is_closing(self) -> bool: ...
+    def close(self) -> None: ...   # tear down the underlying AX.25 crosslink
 
 
 # ── Per-circuit writer for the BBS session ───────────────────────────────────
@@ -602,6 +603,7 @@ class NetromCircuitManager:
         on_user_connect:  Callable[[Connection], Awaitable[None]],
         default_ttl:      int = _DEFAULT_TTL,
         info_mtu:         int = 108,
+        link_idle_timeout: float = 0.0,
     ) -> None:
         self._local_call      = local_call
         self._via_node        = via_node
@@ -611,6 +613,16 @@ class NetromCircuitManager:
         # Cached for each circuit we create — keep them in sync with the
         # TNC's PACLEN so outbound L3 frames never get split at L2.
         self._info_mtu        = max(1, info_mtu)
+
+        # Idle-crosslink reaper. When the last circuit on this crosslink
+        # closes, disconnect the underlying AX.25 link after this many seconds
+        # (0 = disabled, keep the link up indefinitely). Mirrors the Linux
+        # AX.25 IDLE timer: T3 keepalives (handled inside Direwolf, invisible to
+        # us) do NOT reset it — only circuit activity does, which we get for
+        # free because we only ever see 'D' data frames.
+        self._link_idle_timeout: float = max(0.0, float(link_idle_timeout))
+        self._idle_handle: Optional[asyncio.TimerHandle] = None
+        self._closed: bool = False
 
         # Demux: incoming frames address us by OUR (local_idx, local_id).
         self._by_local_key:  dict[tuple[int, int], NetromCircuit] = {}
@@ -779,6 +791,7 @@ class NetromCircuitManager:
         Caller is responsible for cleaning up the circuit (call
         ``circuit.writer.close()``) when the user session ends.
         """
+        self._cancel_idle_timer()   # new circuit — crosslink no longer idle
         local_idx = self._allocate_local_idx()
         local_id  = self._allocate_local_id()
         circuit = NetromCircuit(
@@ -845,6 +858,7 @@ class NetromCircuitManager:
     def _open_circuit(
         self, req: ConnectRequest, accepted_window: int
     ) -> NetromCircuit:
+        self._cancel_idle_timer()   # new circuit — crosslink no longer idle
         local_idx = self._allocate_local_idx()
         local_id  = self._allocate_local_id()
         circuit = NetromCircuit(
@@ -878,12 +892,56 @@ class NetromCircuitManager:
         task = self._user_tasks.pop((circuit.local_idx, circuit.local_id), None)
         if task and not task.done():
             task.cancel()
+        # Last circuit gone — start the idle-crosslink reaper.
+        if not self._by_local_key:
+            self._arm_idle_timer()
+
+    # ── Idle-crosslink reaper ────────────────────────────────────────────────
+
+    def _arm_idle_timer(self) -> None:
+        """Schedule an idle disconnect if the crosslink is now circuit-less."""
+        if (self._closed or self._link_idle_timeout <= 0
+                or self._by_local_key or self._idle_handle is not None):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (shouldn't happen on the dispatch path)
+        self._idle_handle = loop.call_later(self._link_idle_timeout, self._reap_idle)
+        logger.debug(
+            "netrom: crosslink to %s idle — will disconnect in %.0fs if no new circuit",
+            self._via_node, self._link_idle_timeout,
+        )
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+
+    def _reap_idle(self) -> None:
+        """Idle timer fired: disconnect the crosslink if still circuit-less.
+
+        Closing the crosslink writer sends the AGWPE 'd' → Direwolf DISC. The
+        async 'd' confirmation then reaches the transport's kind=='d' handler,
+        which calls shutdown() to finish cleanup. Mirrors ax25_std_idletimer_expiry.
+        """
+        self._idle_handle = None
+        if self._closed or self._by_local_key:
+            return  # shutting down, or a circuit reopened in the meantime
+        logger.info(
+            "netrom: crosslink to %s idle for %.0fs with no circuits — disconnecting",
+            self._via_node, self._link_idle_timeout,
+        )
+        if not self._ax25_writer.is_closing():
+            self._ax25_writer.close()
 
     # ── Crosslink teardown ───────────────────────────────────────────────────
 
     def shutdown(self) -> None:
         """Called when the underlying AX.25 crosslink drops.  Closes all
         circuits and feeds EOF to each BBS session reader."""
+        self._closed = True
+        self._cancel_idle_timer()
         for circuit in list(self._by_local_key.values()):
             circuit._set_closed()
         for task in list(self._user_tasks.values()):

@@ -143,6 +143,13 @@ class Transport(ABC):
         most (TNC PACLEN − 20-byte L3 header).
         """
 
+    def set_netrom_link_idle_timeout(self, seconds: float) -> None:
+        """Set how long a circuit-less NETROM crosslink stays up before we
+        disconnect it (seconds; 0 = keep up indefinitely).
+
+        Default-implementation no-op; AGWPE overrides.
+        """
+
     def set_extra_callsigns(self, calls: list[str]) -> None:
         """Register additional callsign-SSIDs this transport should accept.
 
