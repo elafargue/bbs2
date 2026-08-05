@@ -475,6 +475,53 @@ class TestNetromRouterBuildNodes:
         assert k2ye.quality == 165
 
 
+# ── NODES broadcast fragmentation (N6a — fidelity Gap 1) ────────────────────
+
+class TestNetromNodesFragmentation:
+    """A NODES broadcast is a series of AX.25 UI frames, each ≤11 entries; a
+    larger routing table fragments across frames, each re-stamped with the
+    7-byte header.  build_nodes_payloads() returns one payload per frame."""
+
+    def _transit_router_with(self, n: int) -> NetromRouter:
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False,
+                         obs_min_to_broadcast=5)
+        now = time.time()
+        for i in range(n):
+            call = f"W6A{chr(65 + i)}-5"    # W6AA-5 .. W6AY-5 (distinct dests)
+            r._upsert_route(RouteEntry(
+                call, f"D{i:02d}", call, 200, "K6FB-5", "ROCK", now))
+        return r
+
+    def test_small_table_is_one_frame(self):
+        payloads = self._transit_router_with(5).build_nodes_payloads()
+        assert len(payloads) == 1
+        assert len(decode_nodes_broadcast("W6ELA-1", payloads[0]).entries) == 5
+
+    def test_large_table_fragments_at_11_entries(self):
+        payloads = self._transit_router_with(25).build_nodes_payloads()  # 11+11+3
+        counts = [len(decode_nodes_broadcast("W6ELA-1", p).entries) for p in payloads]
+        assert counts == [11, 11, 3]
+
+    def test_every_fragment_carries_header_and_loses_nothing(self):
+        payloads = self._transit_router_with(25).build_nodes_payloads()
+        seen: set[str] = set()
+        for p in payloads:
+            assert len(p) <= 256                  # fits one AX.25 info field
+            frame = decode_nodes_broadcast("W6ELA-1", p)
+            assert frame is not None              # each frame decodes on its own
+            assert frame.source_alias == "PALO"   # header re-stamped every frame
+            seen.update(e.dest_call for e in frame.entries)
+        assert len(seen) == 25                     # union == whole table
+
+    def test_self_only_returns_single_header_frame(self):
+        payloads = NetromRouter("W6ELA-1", "PALO").build_nodes_payloads()
+        assert len(payloads) == 1 and len(payloads[0]) == 7
+
+    def test_nothing_to_advertise_is_empty_list(self):
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False)
+        assert r.build_nodes_payloads() == []
+
+
 # ── Polite-client (self-only) mode ──────────────────────────────────────────
 
 class TestNetromRouterSelfOnlyMode:

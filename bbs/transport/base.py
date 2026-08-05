@@ -79,10 +79,11 @@ HeardFrameCallback = Callable[[str, str, list[str], int, str, str], Awaitable[No
 # info field bytes, with PID byte already stripped by the transport).
 NetromFrameCallback = Callable[[str, str, bytes], Awaitable[None]]
 
-# Type alias: callable that builds the binary NETROM NODES payload to
-# broadcast.  Returns None when there is nothing to send (e.g. routing
+# Type alias: callable that builds the binary NETROM NODES payload(s) to
+# broadcast — one per AX.25 UI frame (N6a: a large routing table fragments
+# across frames).  Returns [] when there is nothing to send (e.g. routing
 # table not yet populated).
-NetromNodesBuilder = Callable[[], Optional[bytes]]
+NetromNodesBuilder = Callable[[], list[bytes]]
 
 
 class Transport(ABC):

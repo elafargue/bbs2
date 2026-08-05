@@ -1107,7 +1107,7 @@ class TestNetromNodeCallSourcing:
         t = _make_transport()
         t.set_netrom_node_call("N0CALL-5")
         t._running = True
-        t._netrom_nodes_builder = lambda: b"\xffPALO  "   # non-empty payload
+        t._netrom_nodes_builder = lambda: [b"\xffPALO  "]   # one non-empty frame
         fw = _FakeWriter()
         registered = asyncio.Event()
         registered.set()
@@ -1122,6 +1122,30 @@ class TestNetromNodeCallSourcing:
         m = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "M"]
         assert m and m[0]["call_from"] == "N0CALL-5"    # NODES from the node SSID
         assert m[0]["call_to"] == "NODES"
+
+    async def test_nodes_broadcast_sends_one_frame_per_payload(self):
+        # N6a: a fragmented routing table yields several payloads; the loop must
+        # send one NODES UI frame per payload (not concatenate into one frame).
+        t = _make_transport()
+        t.set_netrom_node_call("N0CALL-5")
+        t._running = True
+        t._netrom_nodes_builder = lambda: [
+            b"\xffPALO  \x01", b"\xffPALO  \x02", b"\xffPALO  \x03",
+        ]
+        fw = _FakeWriter()
+        registered = asyncio.Event()
+        registered.set()
+        lock = asyncio.Lock()
+        task = asyncio.create_task(t._netrom_nodes_loop(fw, registered, lock))  # type: ignore
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        m = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "M"]
+        assert len(m) == 3                              # one cycle → three frames
+        assert all(h["call_to"] == "NODES" for h in m)
 
     def test_set_extra_callsigns_dedups_node_call(self):
         t = _make_transport()

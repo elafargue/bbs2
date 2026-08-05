@@ -76,6 +76,17 @@ _OBS_INITIALIZER_DEFAULT = 6
 # by transit re-advertisement (N5c).
 _OBS_MIN_TO_BROADCAST_DEFAULT = 5
 
+# NODES broadcast framing (N6a — fidelity Gap 1).  A NODES broadcast is a series
+# of AX.25 UI frames, each a 7-byte header (0xFF + 6-byte source alias) followed
+# by 21-byte destination entries.  Real NET/ROM nodes cap each frame to fit one
+# AX.25 info field and send multiple frames when the table is larger:
+# (256 - 7) // 21 = 11 entries per frame.  Larger tables fragment across frames,
+# each re-stamped with the header.
+_NODES_HEADER_LEN            = 7
+_NODES_ENTRY_LEN            = 21
+_NODES_FRAME_BUDGET         = 256
+_NODES_MAX_ENTRIES_PER_FRAME = (_NODES_FRAME_BUDGET - _NODES_HEADER_LEN) // _NODES_ENTRY_LEN  # 11
+
 
 def _route_quality(advertised: int, path_quality: int) -> int:
     """NET/ROM receive-side route quality (1987 manual p.65, rule 5):
@@ -856,12 +867,46 @@ class NetromRouter:
         Only enable transit-node mode if the network admins have explicitly
         agreed — re-broadcasting a learned routing table is reserved for
         high-reachability transit nodes by NORCAL convention.
+
+        This is the SINGLE-frame form (back-compat; used by tests and small
+        tables).  The broadcast path uses :meth:`build_nodes_payloads`, which
+        fragments a large table into multiple frames (N6a — fidelity Gap 1).
         """
         if self._advertise_self_only:
             return encode_nodes_broadcast(self._alias, [])
-
-        if not self._routes:
+        entries = self._nodes_entries()
+        if not entries:
             return None
+        return encode_nodes_broadcast(self._alias, entries)
+
+    def build_nodes_payloads(self) -> list[bytes]:
+        """NODES broadcast payload(s), one per AX.25 UI frame (N6a).
+
+        A NODES broadcast is a *series* of UI frames, each a 7-byte header
+        (0xFF + alias) plus up to ``_NODES_MAX_ENTRIES_PER_FRAME`` (11) 21-byte
+        destination entries — a bigger routing table is fragmented across frames,
+        each re-stamped with the header (manual §"Node Broadcasts").  The AGWPE
+        NODES loop sends one UI frame per returned payload.
+
+        Returns ``[]`` when nothing would be advertised.  Polite-client mode
+        (``advertise_self_only``) always returns exactly one header-only frame.
+        """
+        if self._advertise_self_only:
+            return [encode_nodes_broadcast(self._alias, [])]
+        entries = self._nodes_entries()
+        if not entries:
+            return []
+        step = _NODES_MAX_ENTRIES_PER_FRAME
+        return [
+            encode_nodes_broadcast(self._alias, entries[i:i + step])
+            for i in range(0, len(entries), step)
+        ]
+
+    def _nodes_entries(self) -> list[NodeEntry]:
+        """Transit-mode advertisement entries: the best route per destination,
+        obsolescence-gated, sorted for stable wire output.  Empty in
+        polite-client mode's callers (they never call this) or when nothing is
+        advertisable.  Shared by both build_nodes_payload(s)."""
         entries: list[NodeEntry] = []
         for bucket in self._routes.values():
             if not bucket:
@@ -877,8 +922,6 @@ class NetromRouter:
                 neighbor_call=best.via_call,  # OUR next hop, not upstream's
                 quality=best.quality,          # composed; receiver re-composes
             ))
-        if not entries:
-            return None
         # Sort for stable wire output (helps tests + monitoring diff).
         entries.sort(key=lambda e: e.dest_call.upper())
-        return encode_nodes_broadcast(self._alias, entries)
+        return entries

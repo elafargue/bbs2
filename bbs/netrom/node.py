@@ -234,30 +234,35 @@ class NetromNode:
     async def _send_banner(self) -> None:
         await self.term.sendln()
         await self.term.sendln(f"{self.node_alias}:{self.node_call} NET/ROM node")
-        await self.term.sendln(
-            "Commands: C <node>  N  R  U  I  MH  P  B   (? for help)"
-        )
+        # Advertise the full command verbs (ROCK/BPQ-style), not just initials —
+        # derived from the command table so it can't drift.  Verbs may still be
+        # abbreviated to their shortest unambiguous prefix (see _resolve).
+        verbs = "  ".join(c[0] for c in self._COMMANDS if c[0] != "HELP")
+        await self.term.sendln(f"Commands: {verbs}   (? for help)")
         if self._apps:
             await self.term.sendln(
-                f"Applications: {'  '.join(sorted(self._apps))}   (C <name>)"
+                f"Applications: {'  '.join(sorted(self._apps))}   (CONNECT <name>)"
             )
 
     async def cmd_help(self, _arg: str = "") -> None:
         for line in (
-            "C <node|call>  Connect onward to a node/BBS (or a local application)",
-            "N [pattern]    List known nodes",
-            "R [node]       Routes table (neighbors); or routes to a node",
-            "U              Users / active gateway circuits",
-            "I              Node info",
-            "MH             Nodes heard directly",
-            "P              Ports (transports)",
-            "B / Q          Bye",
-            "?              This help",
+            "CONNECT <node|call>  Connect onward to a node/BBS (or a local app)",
+            "NODES [pattern]      List known nodes",
+            "ROUTES [node]        Routes table (neighbours); or routes to a node",
+            "USERS                Users / active gateway circuits",
+            "INFO                 Node info",
+            "MHEARD               Stations heard directly",
+            "PORTS                Ports (transports)",
+            "BYE                  Disconnect",
+            "HELP                 This help",
         ):
             await self.term.sendln(line)
+        await self.term.sendln(
+            "Verbs may be abbreviated (C, N, R, U, I, MH, P, B; ? = HELP)."
+        )
         if self._apps:
             await self.term.sendln(
-                f"Applications (C <name>): {'  '.join(sorted(self._apps))}"
+                f"Applications (CONNECT <name>): {'  '.join(sorted(self._apps))}"
             )
 
     async def cmd_info(self, _arg: str = "") -> None:

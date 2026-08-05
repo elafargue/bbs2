@@ -1511,20 +1511,24 @@ class AGWPETransport(Transport):
         try:
             while self._running:
                 assert self._netrom_nodes_builder is not None
-                payload = self._netrom_nodes_builder()
-                if payload:
+                # One UI frame per payload: a large routing table fragments into
+                # multiple frames, each re-stamped with the NODES header (N6a).
+                payloads = self._netrom_nodes_builder()
+                if payloads:
                     try:
-                        frame = _build_frame(
-                            self._agw_port, "M",
-                            self._netrom_node_call, "NODES",
-                            PID_NETROM, payload,
-                        )
-                        writer.write(frame)
-                        async with drain_lock:
-                            await writer.drain()
+                        for payload in payloads:
+                            frame = _build_frame(
+                                self._agw_port, "M",
+                                self._netrom_node_call, "NODES",
+                                PID_NETROM, payload,
+                            )
+                            writer.write(frame)
+                            async with drain_lock:
+                                await writer.drain()
                         self._save_broadcast_state("nodes", time.time())
                         logger.info(
-                            "agwpe NETROM NODES broadcast sent: %d bytes", len(payload)
+                            "agwpe NETROM NODES broadcast sent: %d frame(s), %d bytes",
+                            len(payloads), sum(len(p) for p in payloads),
                         )
                     except Exception:
                         logger.warning("agwpe NODES broadcast send failed", exc_info=True)

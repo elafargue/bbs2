@@ -563,6 +563,24 @@ class TestLocalApps:
         await node._send_banner()
         assert "Applications: BBS" in node._term.text()
 
+    async def test_banner_shows_full_verbs(self):
+        n = _make_node(); t = n._term
+        await n._send_banner()
+        txt = t.text()
+        # ROCK/BPQ-style: full command words, not single initials.
+        for verb in ("CONNECT", "NODES", "ROUTES", "USERS", "INFO",
+                     "MHEARD", "PORTS", "BYE"):
+            assert verb in txt
+        assert "HELP" not in txt   # HELP is offered via "(? for help)"
+
+    async def test_help_shows_full_verbs_and_abbreviations(self):
+        n = _make_node(); t = n._term
+        await n.cmd_help("")
+        txt = t.text()
+        assert "CONNECT <node|call>" in txt
+        assert "MHEARD" in txt
+        assert "abbreviated" in txt   # notes that C/N/R/... still work
+
 
 # ─── Two-circuit bridge ───────────────────────────────────────────────────────
 

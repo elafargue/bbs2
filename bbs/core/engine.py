@@ -294,7 +294,7 @@ class BBSEngine:
                 if netrom_alias:
                     # Only register the builder (and thus start the broadcast
                     # loop) when we have a node alias to advertise.
-                    t.set_netrom_nodes_builder(netrom_router.build_nodes_payload)
+                    t.set_netrom_nodes_builder(netrom_router.build_nodes_payloads)
             logger.info(
                 "NETROM router %s wired onto %d transport(s) — alias: %s, "
                 "classifier: router-lookup%s",
