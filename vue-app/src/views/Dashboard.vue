@@ -1,10 +1,12 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import socket from '../socket.js'
 
 const bbsCallsign = ref('')
 const users = ref([])
 const plugins = ref([])
+const node = ref({ enabled: false })   // NET/ROM node live activity (polled)
+let nodeTimer = null
 
 const userHeaders = [
   { title: 'Callsign',   key: 'callsign'    },
@@ -12,6 +14,34 @@ const userHeaders = [
   { title: 'Auth Level', key: 'auth_level'  },
   { title: 'Idle (s)',   key: 'idle_seconds'},
 ]
+
+const nodeSessionHeaders = [
+  { title: 'User',         key: 'user'        },
+  { title: 'Entry',        key: 'entry'       },
+  { title: 'Via',          key: 'via'         },
+  { title: 'Connected to', key: 'target'      },
+  { title: 'Up',           key: 'connected_s' },
+  { title: 'Idle',         key: 'idle_s'      },
+]
+
+const gwColor = computed(() => {
+  const g = node.value.gateway
+  if (!g) return undefined
+  return g.active >= g.max ? 'warning' : 'success'
+})
+const recentRefusals = computed(() =>
+  (node.value.gateway?.recent_refusals || []).slice().reverse().slice(0, 10)
+)
+function fmtTime(ts) {
+  try { return new Date(ts * 1000).toLocaleTimeString() } catch { return '' }
+}
+
+async function loadNode() {
+  try {
+    const res = await fetch('/api/netrom/activity')
+    if (res.ok) node.value = await res.json()
+  } catch { /* transient — keep last snapshot */ }
+}
 
 onMounted(async () => {
   // Fetch initial state via REST so navigating back always shows fresh data.
@@ -34,12 +64,17 @@ onMounted(async () => {
   })
   socket.on('users_snapshot',      (snap)  => { users.value   = snap  })
   socket.on('plugin_stats_update', (stats) => { plugins.value = stats })
+
+  // NET/ROM node activity has no socket feed yet — poll it every 5 s.
+  await loadNode()
+  nodeTimer = setInterval(loadNode, 5000)
 })
 
 onUnmounted(() => {
   socket.off('admin_dashboard_init')
   socket.off('users_snapshot')
   socket.off('plugin_stats_update')
+  if (nodeTimer) clearInterval(nodeTimer)
 })
 </script>
 
@@ -97,6 +132,92 @@ onUnmounted(() => {
               </template>
             </v-list-item>
           </v-list>
+        </v-card>
+      </v-col>
+    </v-row>
+
+    <!-- NET/ROM node: live sessions + gateway-safety state -->
+    <v-row v-if="node.enabled">
+      <v-col cols="12">
+        <v-card>
+          <v-card-title>
+            <v-icon start>mdi-transit-connection-variant</v-icon>
+            NET/ROM Node — {{ node.node_alias }}:{{ node.node_call }}
+          </v-card-title>
+          <v-card-text>
+            <!-- gateway-safety strip -->
+            <div class="d-flex flex-wrap align-center mb-3" style="gap: 8px;">
+              <v-chip label size="small" :color="gwColor">
+                Circuits {{ node.gateway.active }}/{{ node.gateway.max }}
+                <span class="text-medium-emphasis">&nbsp;· {{ node.gateway.max_per_user }}/user</span>
+              </v-chip>
+              <v-chip label size="small" variant="outlined">
+                min auth: {{ node.gateway.policy.min_auth }}
+              </v-chip>
+              <v-chip
+                label size="small"
+                :variant="node.gateway.policy.interlock ? 'flat' : 'outlined'"
+                :color="node.gateway.policy.interlock ? 'success' : undefined"
+              >
+                INTERLOCK {{ node.gateway.policy.interlock ? 'on' : 'off' }}
+              </v-chip>
+              <v-chip label size="small" variant="outlined">
+                rate {{ node.gateway.policy.rate_limit_per_min || '∞' }}/min
+              </v-chip>
+              <v-chip
+                v-if="node.gateway.policy.allow.length"
+                label size="small" variant="outlined" color="warning"
+              >allow-list ({{ node.gateway.policy.allow.length }})</v-chip>
+              <v-chip
+                v-if="node.gateway.policy.deny.length"
+                label size="small" variant="outlined"
+              >deny ({{ node.gateway.policy.deny.length }})</v-chip>
+            </div>
+
+            <v-row>
+              <v-col cols="12" md="7">
+                <div class="text-caption text-medium-emphasis mb-1">
+                  Active sessions ({{ node.sessions.length }})
+                </div>
+                <v-data-table
+                  :headers="nodeSessionHeaders"
+                  :items="node.sessions"
+                  :items-per-page="10"
+                  density="compact"
+                  no-data-text="No one on the node."
+                >
+                  <template #item.via="{ item }">{{ item.via || '—' }}</template>
+                  <template #item.target="{ item }">
+                    <span v-if="item.target">→ {{ item.target }}</span>
+                    <span v-else class="text-medium-emphasis">=&gt; (prompt)</span>
+                  </template>
+                  <template #item.connected_s="{ item }">{{ item.connected_s }}s</template>
+                  <template #item.idle_s="{ item }">{{ item.idle_s }}s</template>
+                </v-data-table>
+              </v-col>
+
+              <v-col cols="12" md="5">
+                <div class="text-caption text-medium-emphasis mb-1">
+                  Recent gateway refusals
+                </div>
+                <v-list v-if="recentRefusals.length" density="compact" class="py-0">
+                  <v-list-item
+                    v-for="(r, i) in recentRefusals" :key="i" class="px-2"
+                  >
+                    <template #title>
+                      <span class="text-body-2">
+                        {{ r.user }}<span v-if="r.dest"> → {{ r.dest }}</span>
+                      </span>
+                    </template>
+                    <template #subtitle>
+                      <span class="text-caption">{{ fmtTime(r.ts) }} · {{ r.reason }}</span>
+                    </template>
+                  </v-list-item>
+                </v-list>
+                <div v-else class="text-caption text-disabled">None.</div>
+              </v-col>
+            </v-row>
+          </v-card-text>
         </v-card>
       </v-col>
     </v-row>

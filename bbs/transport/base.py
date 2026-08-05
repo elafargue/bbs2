@@ -36,6 +36,11 @@ class Connection:
                   transport does not distinguish (e.g. TCP).  Used by the
                   service dispatcher to route a connection to an external
                   program vs. the internal BBS.
+    netrom_via:   For an inbound NET/ROM circuit, the adjacent AX.25 neighbor
+                  (crosslink) that carried it to us; empty for a direct RF/TCP
+                  user or any non-NET/ROM path.  Consumed by the node's INTERLOCK
+                  guard (N4a) to refuse routing a circuit back out its arrival
+                  link.
     """
     remote_addr: str
     reader: asyncio.StreamReader
@@ -43,6 +48,7 @@ class Connection:
     transport_id: str
     hop_count: int = 0
     local_addr: str = ""
+    netrom_via: str = ""
 
     async def send(self, data: bytes) -> None:
         """Write *data* to the peer and drain the buffer."""
@@ -164,6 +170,20 @@ class Transport(ABC):
     def set_netrom_link_idle_timeout(self, seconds: float) -> None:
         """Set how long a circuit-less NETROM crosslink stays up before we
         disconnect it (seconds; 0 = keep up indefinitely).
+
+        Default-implementation no-op; AGWPE overrides.
+        """
+
+    def set_netrom_node_call(self, call: str) -> None:
+        """Set the NET/ROM node callsign outbound crosslinks and NODES
+        broadcasts originate from (N3).
+
+        Defaults to the BBS callsign; when a distinct node SSID is configured
+        (``netrom.node_ssid``) the engine sets it here so this station presents
+        a first-class node identity on the air — its NODES self-advertisement
+        and every ``connect_out`` crosslink source from the node SSID.  The
+        node SSID is also registered with the radio (AGWPE registers it in
+        :meth:`start`) so inbound connects to it reach us.
 
         Default-implementation no-op; AGWPE overrides.
         """

@@ -193,6 +193,17 @@ web:
 netrom:
   # NET/ROM node alias (up to 6 characters).  Leave blank to disable NETROM support.
   alias: ""
+  # Node identity SSID (N3, optional).  Leave UNSET for today's behavior: the
+  # NET/ROM node runs on the BBS SSID and is reached from the BBS via the '@'
+  # menu.  Set it (e.g. 5) to give the station a first-class node identity on
+  # <callsign>-<node_ssid>: a user connecting to that SSID lands directly at
+  # the node '=>' prompt, the built-in BBS (bbs.ssid) becomes an application
+  # reachable via `C BBS` (and by direct-connect), and NODES/crosslinks
+  # originate from the node SSID.  Must be 0-15 and differ from bbs.ssid (a
+  # single role can't be both node and BBS); an invalid value is ignored with
+  # a warning and the node stays on the BBS SSID.  The node SSID is registered
+  # with the radio automatically.
+  # node_ssid: 5
   # How often to broadcast the routing table as a NODES frame (minutes)
   nodes_interval: 30
   # Route expiry: a learned route is dropped if its advertiser has been silent
@@ -208,6 +219,30 @@ netrom:
   # indefinitely (the Linux AX.25 IDLE=0 default), i.e. rely on the neighbor to
   # drop them. Mirrors the kernel AX.25 idle timer; T3 keepalives don't reset it.
   link_idle_timeout: 900
+  # Gateway safety (N4a) — protects the outbound gateway (C <node>) on a live,
+  # publicly-reachable node.  Omit the whole block for safe defaults (identified
+  # callers only, INTERLOCK on, rate 6/min, caps 2 per-user / 4 node-wide).
+  # Only C <onward node> is gated; listing verbs (N/R/MH/I/U/P) and local apps
+  # (C BBS / C <svc>) are not.
+  gateway:
+    # Minimum auth to use C: none | identified | authenticated | sysop.
+    # (> identified currently closes C to native-SSID users — no in-node OTP yet.)
+    min_auth: identified
+    # If non-empty, ONLY these callsigns may C out (closed node). Base-or-full,
+    # SSID-insensitive. Empty/unset = open to all who pass the other gates.
+    allow: []
+    # Always refuse these callsigns (ax25d 'lockout' idiom).
+    deny: [NOCALL, N0CALL]
+    # INTERLOCK: refuse routing a circuit back out the crosslink it arrived on
+    # (loop / relay-abuse guard). Direct RF users are exempt. Default true.
+    interlock: true
+    # Max accepted C connects per caller per 60 s (0 = disabled).
+    rate_limit_per_min: 6
+    # Concurrent gateway circuits allowed for one caller.
+    max_circuits_per_user: 2
+    # Concurrent gateway circuits allowed node-wide (supersedes the legacy
+    # netrom.max_gateway_circuits when both are present).
+    max_circuits: 4
   # Polite-client mode (default true).  When true, NODES broadcasts contain
   # only the 7-byte header (discriminator + alias) — peers add us as a direct
   # neighbor by RX without us re-broadcasting their route tables back at them.

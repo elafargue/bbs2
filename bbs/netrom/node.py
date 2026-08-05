@@ -26,12 +26,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
+from bbs.netrom.gateway import GatewayGuard, GatewayPolicy
 from bbs.netrom.router import NetromRouter
 from bbs.transport.base import Connection, Transport
 
 logger = logging.getLogger(__name__)
+
+# A local application the node offers via ``C <app>`` (N3): run the app on the
+# user's own connection and return when it exits (the node resumes its ``=>``
+# prompt).  Built by the engine — the BBS as ``BBS``, each ax25d-style service
+# by its called SSID.
+LocalAppRunner = Callable[[Connection], Awaitable[None]]
+
+# Touch the node's activity this often while a local app runs, so the node's
+# idle watchdog does not evict a user who is busy inside an application (the
+# app governs its own idle timeout; see _run_local_app).
+_APP_KEEPALIVE_SECS = 30.0
 
 _BRIDGE_CHUNK = 4096
 # User→far input is coalesced into whole lines before being sent as NET/ROM L3
@@ -56,10 +69,15 @@ class NetromNode:
         node_alias: str,           # our node alias (e.g. PALO)
         router: NetromRouter,
         transports: list[Transport],
+        apps: Optional[dict[str, LocalAppRunner]] = None,  # local apps: C BBS / C <svc>
         may_connect: bool = True,           # gateway auth gate (full ACL is N4)
         connect_timeout: float = 60.0,
         min_quality: int = 1,
         max_gateway_circuits: int = 4,
+        guard: Optional[GatewayGuard] = None,   # shared node-wide safety authority (N4a)
+        auth_level: Any = None,                 # caller AuthLevel (for min_auth)
+        arrival_via: str = "",                  # crosslink that carried us (INTERLOCK)
+        entry: str = "node",                    # "menu" (@) | "native" (node SSID)
         reconnect: bool = True,             # always return to => on far-end close
         idle_timeout: Optional[float] = None,
         on_activity: Optional[Callable[[], None]] = None,
@@ -78,10 +96,34 @@ class NetromNode:
         self.node_alias = (node_alias or node_call).upper()
         self.router = router
         self.transports = list(transports)
+        # Local applications reachable via ``C <name>`` (N3): the built-in BBS
+        # as ``BBS`` plus each ax25d-style service by its called SSID.  Keyed
+        # uppercase; resolved BEFORE NET/ROM node resolution in cmd_connect so a
+        # local app name always wins over a same-named remote node (documented
+        # precedence).  Empty when the engine wires no apps (e.g. tests).
+        self._apps: dict[str, LocalAppRunner] = {
+            k.upper(): v for k, v in (apps or {}).items()
+        }
         self.may_connect = may_connect
         self.connect_timeout = connect_timeout
         self.min_quality = max(1, int(min_quality))
         self.max_gateway_circuits = max(1, int(max_gateway_circuits))
+        # Gateway safety (N4a).  A shared GatewayGuard (from the node plugin) is
+        # the node-wide authority for ACL / INTERLOCK / rate limits / circuit
+        # caps.  Constructed without one (direct use / tests) ⇒ a permissive
+        # per-instance guard whose only limit is the legacy max_gateway_circuits
+        # budget, so gating is then done solely by may_connect (pre-N4a behavior).
+        self.auth_level = auth_level
+        self.arrival_via = (arrival_via or "").upper()
+        self.entry = entry
+        self._guard = guard if guard is not None else GatewayGuard(
+            GatewayPolicy.permissive(self.max_gateway_circuits)
+        )
+        # Live-state for the web node dashboard (N4c): when connected onward the
+        # current target alias/call, else None (at the => prompt).
+        self.connected_at = time.time()
+        self._last_activity = self.connected_at
+        self._current_target: Optional[str] = None
         self.reconnect = reconnect
         self.idle_timeout = idle_timeout
         self._on_activity = on_activity
@@ -162,11 +204,25 @@ class NetromNode:
                 await self.term.sendln("Command failed.")
 
     def _touch(self) -> None:
+        self._last_activity = time.time()
         if self._on_activity is not None:
             try:
                 self._on_activity()
             except Exception:
                 pass
+
+    def describe(self) -> dict:
+        """A JSON-serializable snapshot of this session's live state for the web
+        node dashboard (N4c)."""
+        now = time.time()
+        return {
+            "user": self.user_call,
+            "entry": self.entry,               # "menu" (@) | "native"
+            "via": self.arrival_via,           # arrival crosslink neighbor ("" = direct)
+            "target": self._current_target,    # None at =>, else what it's bridged to
+            "connected_s": int(now - self.connected_at),
+            "idle_s": int(now - self._last_activity),
+        }
 
     # ── Commands: listings ────────────────────────────────────────────────────
 
@@ -176,10 +232,14 @@ class NetromNode:
         await self.term.sendln(
             "Commands: C <node>  N  R  U  I  MH  P  B   (? for help)"
         )
+        if self._apps:
+            await self.term.sendln(
+                f"Applications: {'  '.join(sorted(self._apps))}   (C <name>)"
+            )
 
     async def cmd_help(self, _arg: str = "") -> None:
         for line in (
-            "C <node|call>  Connect onward to a node/BBS",
+            "C <node|call>  Connect onward to a node/BBS (or a local application)",
             "N [pattern]    List known nodes",
             "R [node]       Routes table (neighbors); or routes to a node",
             "U              Users / active gateway circuits",
@@ -190,6 +250,10 @@ class NetromNode:
             "?              This help",
         ):
             await self.term.sendln(line)
+        if self._apps:
+            await self.term.sendln(
+                f"Applications (C <name>): {'  '.join(sorted(self._apps))}"
+            )
 
     async def cmd_info(self, _arg: str = "") -> None:
         await self.term.sendln(f"{self.node_alias}:{self.node_call}  NET/ROM node (bbs2)")
@@ -268,7 +332,10 @@ class NetromNode:
     async def cmd_users(self, _arg: str = "") -> None:
         await self.term.sendln(f"{self.node_alias}:{self.node_call}")
         await self.term.sendln(f"  {self.user_call} (you)")
-        await self.term.sendln(f"Gateway circuits: {self._active_gateways}")
+        await self.term.sendln(
+            f"Gateway circuits: {self._guard.active_for(self.user_call)} "
+            f"(node total {self._guard.active_total})"
+        )
 
     async def cmd_ports(self, _arg: str = "") -> None:
         for i, t in enumerate(self.transports):
@@ -295,6 +362,17 @@ class NetromNode:
         if not target:
             await self.term.sendln("Usage: C <node|call>")
             return
+
+        # 0. Local application first (N3) — 'C BBS' / 'C <service>'.  A local
+        #    app name wins over a same-named remote node (documented
+        #    precedence) and does not go through the connect-out auth gate: the
+        #    app enforces its own access (the BBS re-identifies; a service has
+        #    its own min_auth).
+        app = self._apps.get(target.upper())
+        if app is not None:
+            await self._run_local_app(target.upper(), app)
+            return
+
         if not self.may_connect:
             await self.term.sendln("Not authorized to connect out.")
             return
@@ -309,9 +387,6 @@ class NetromNode:
         if dest_call == self.node_call:
             await self.term.sendln("That's this node.")
             return
-        if self._active_gateways >= self.max_gateway_circuits:
-            await self.term.sendln("Node busy — too many circuits. Try later.")
-            return
 
         # 2. Pick the adjacent next-hop neighbor (N0b) and a transport for it.
         neighbor = self.router.best_neighbor_for(target, min_quality=self.min_quality)
@@ -323,45 +398,121 @@ class NetromNode:
             await self.term.sendln("No crosslink transport available.")
             return
 
-        # 3. Open (or reuse) the AX.25 crosslink to the neighbor (N1).
-        await self.term.sendln(f"Connecting to {alias} ({dest_call}) via {neighbor} ...")
-        try:
-            mgr = await transport.connect_netrom(neighbor)
-        except (ConnectionError, asyncio.TimeoutError) as exc:
-            logger.info("netrom node: crosslink to %s failed: %s", neighbor, exc)
-            await self.term.sendln(f"Link to {neighbor} failed.")
+        # 3. Gateway-safety gates (N4a): ACL / rate / INTERLOCK, then reserve a
+        #    circuit slot (per-user + node-wide caps).  The shared guard is the
+        #    single authority; a refusal returns its user-facing reason.
+        reason = self._guard.check(
+            user_call=self.user_call, auth_level=self.auth_level,
+            dest_call=dest_call, neighbor=neighbor, arrival_via=self.arrival_via,
+        )
+        if reason:
+            self._guard.note_refusal(self.user_call, reason, dest_call)
+            await self.term.sendln(reason)
             return
-        if mgr is None:
-            await self.term.sendln("No crosslink transport available.")
-            return
-
-        # 4. Originate the L3 circuit to the destination through that crosslink.
-        try:
-            circuit = await mgr.originate_circuit(
-                dest_call, self.user_call, timeout=self.connect_timeout
+        if not self._guard.acquire(self.user_call):
+            self._guard.note_refusal(
+                self.user_call, "Node busy — circuit cap", dest_call
             )
-        except asyncio.TimeoutError:
-            await self.term.sendln(f"{alias} did not answer.")
-            return
-        except ConnectionRefusedError:
-            await self.term.sendln(f"{alias} refused the connection.")
-            return
-        except (ConnectionError, Exception) as exc:  # defensive
-            logger.info("netrom node: originate to %s failed: %s", dest_call, exc)
-            await self.term.sendln(f"Could not connect to {alias}.")
+            await self.term.sendln("Node busy — too many circuits. Try later.")
             return
 
-        # 5. Bridge the two sessions until one side closes.
-        await self.term.sendln(f"*** Connected to {alias}")
-        self._active_gateways += 1
+        # Everything past the reservation must release the slot on every exit
+        # path (link failure, refusal, bridge end), so it lives in one finally.
+        self._active_gateways += 1        # local mirror for the U listing
+        self._current_target = alias      # dashboard: what we're bridged to
+        near_closed = False
         try:
+            # 4. Open (or reuse) the AX.25 crosslink to the neighbor (N1).
+            await self.term.sendln(
+                f"Connecting to {alias} ({dest_call}) via {neighbor} ..."
+            )
+            try:
+                mgr = await transport.connect_netrom(neighbor)
+            except (ConnectionError, asyncio.TimeoutError) as exc:
+                logger.info("netrom node: crosslink to %s failed: %s", neighbor, exc)
+                await self.term.sendln(f"Link to {neighbor} failed.")
+                return
+            if mgr is None:
+                await self.term.sendln("No crosslink transport available.")
+                return
+
+            # 5. Originate the L3 circuit to the destination through the crosslink.
+            try:
+                circuit = await mgr.originate_circuit(
+                    dest_call, self.user_call, timeout=self.connect_timeout
+                )
+            except asyncio.TimeoutError:
+                await self.term.sendln(f"{alias} did not answer.")
+                return
+            except ConnectionRefusedError:
+                await self.term.sendln(f"{alias} refused the connection.")
+                return
+            except (ConnectionError, Exception) as exc:  # defensive
+                logger.info("netrom node: originate to %s failed: %s", dest_call, exc)
+                await self.term.sendln(f"Could not connect to {alias}.")
+                return
+
+            # 6. Bridge the two sessions until one side closes.
+            await self.term.sendln(f"*** Connected to {alias}")
             near_closed = await self._bridge(circuit)
         finally:
+            self._guard.release(self.user_call)
             self._active_gateways -= 1
+            self._current_target = None   # back at the => prompt
 
-        # 6. ReConnect (or end if the user vanished).
+        # 7. ReConnect (or end if the user vanished).
         if near_closed:
             self._running = False   # user disconnected — leave the node loop
+        elif self.reconnect:
+            await self.term.sendln(f"*** Reconnected to {self.node_alias}")
+
+    # ── Local applications (N3) ───────────────────────────────────────────────
+
+    async def _run_local_app(self, name: str, runner: LocalAppRunner) -> None:
+        """Run a local application (the BBS or a service) on the user's own
+        connection, then return to the ``=>`` prompt.
+
+        Same "run then ReConnect" shape as the outbound gateway bridge: the app
+        owns the session while it runs (the ``=>`` interpreter is suspended);
+        when it exits we resume the node prompt, or end the node if the user
+        disconnected inside the app.  The app runs on ``self.conn`` but the
+        engine wraps it so the app's own teardown does not close the underlying
+        link — only the node loop's caller does that.
+
+        While the app runs we periodically refresh the node's activity clock so
+        the node's idle watchdog does not evict a user who is busy inside the
+        application; the app enforces its own idle policy (the BBS has its own
+        idle watchdog; a service has its ``idle_timeout``)."""
+        logger.info("netrom node: %s → local app %s", self.user_call, name)
+        keepalive: Optional[asyncio.Task[None]] = None
+        if self._on_activity is not None:
+            async def _keepalive() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(_APP_KEEPALIVE_SECS)
+                        self._touch()
+                except asyncio.CancelledError:
+                    pass
+            keepalive = asyncio.create_task(
+                _keepalive(), name=f"node-app-keepalive:{self.user_call}"
+            )
+        try:
+            await runner(self.conn)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "netrom node: local app %s failed for %s", name, self.user_call
+            )
+            await self.term.sendln(f"{name} not available.")
+            return
+        finally:
+            if keepalive is not None:
+                keepalive.cancel()
+                await asyncio.gather(keepalive, return_exceptions=True)
+        self._touch()
+        if self.conn.reader.at_eof():
+            self._running = False          # user disconnected inside the app
         elif self.reconnect:
             await self.term.sendln(f"*** Reconnected to {self.node_alias}")
 

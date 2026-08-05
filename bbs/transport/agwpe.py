@@ -423,6 +423,11 @@ class AGWPETransport(Transport):
     def __init__(self, cfg: dict[str, Any], bbs_callsign: str) -> None:
         call, ssid = parse(bbs_callsign)
         self._local_call = format_addr(call, ssid)
+        # NET/ROM node identity (N3).  Outbound crosslinks (connect_out) and
+        # NODES broadcasts originate from this callsign; it defaults to the BBS
+        # callsign (today's behavior) and the engine overrides it with the node
+        # SSID via set_netrom_node_call() when netrom.node_ssid is configured.
+        self._netrom_node_call: str = self._local_call
         self._host: str = cfg.get("host", "127.0.0.1")
         self._port: int = int(cfg.get("port", 8000))
         self._agw_port: int = int(cfg.get("agw_port", 0))
@@ -535,6 +540,16 @@ class AGWPETransport(Transport):
         circuits (0 = keep it up indefinitely). See NetromCircuitManager."""
         self._netrom_link_idle_timeout = max(0.0, float(seconds))
 
+    def set_netrom_node_call(self, call: str) -> None:
+        """Source outbound NETROM crosslinks + NODES broadcasts from *call* (N3).
+
+        Defaults to the BBS callsign; the engine sets the node SSID here when
+        ``netrom.node_ssid`` is configured.  The call is also registered with
+        AGWPE in :meth:`start` (when it differs from the BBS callsign) so
+        inbound connects to the node identity reach us."""
+        c = (call or "").upper().strip()
+        self._netrom_node_call = c or self._local_call
+
     def set_extra_callsigns(self, calls: list[str]) -> None:
         """Register extra callsign-SSIDs to accept (ax25d-style services).
 
@@ -543,7 +558,7 @@ class AGWPETransport(Transport):
         'C' then carries the service SSID as ``call_to`` for the dispatcher.
         The BBS callsign itself is always registered and need not be listed.
         """
-        seen = {self._local_call.upper()}
+        seen = {self._local_call.upper(), self._netrom_node_call.upper()}
         out: list[str] = []
         for c in calls:
             cu = str(c).upper().strip()
@@ -602,6 +617,18 @@ class AGWPETransport(Transport):
                 writer.write(
                     _build_frame(self._agw_port, "X", self._local_call, "")
                 )
+                # Register the NET/ROM node SSID too (N3) when it differs from
+                # the BBS callsign, so inbound connects to the node identity
+                # route to us.  (set_extra_callsigns dedups it out of the list
+                # below, so it is registered exactly once here.)
+                if self._netrom_node_call.upper() != self._local_call.upper():
+                    writer.write(
+                        _build_frame(self._agw_port, "X", self._netrom_node_call, "")
+                    )
+                    logger.info(
+                        "agwpe: registering NET/ROM node callsign %s on port %d",
+                        self._netrom_node_call, self._agw_port,
+                    )
                 # Register any extra service SSIDs (ax25d-style hosting) so
                 # Direwolf also routes connects for those to us.
                 for _svc_call in self._extra_callsigns:
@@ -831,16 +858,20 @@ class AGWPETransport(Transport):
                         pass
                 assert self._drain_lock is not None
                 assert self._on_connect is not None
-                # Build the crosslink session sourced from OUR local call to the
-                # neighbor (call_from).  No BBS session task is started — this
-                # link originates circuits; any inbound circuit arriving on it is
-                # handled by the manager's on_user_connect.
+                # Build the crosslink session sourced from OUR node call to the
+                # neighbor (call_from).  A NET/ROM node's crosslinks originate
+                # from the node identity (N3: the node SSID when configured,
+                # else the BBS callsign) — this feeds both the AGWPE 'D' frame
+                # CallFrom and the L3 origin of circuits originated on the link.
+                # No BBS session task is started — this link originates circuits;
+                # any inbound circuit arriving on it is handled by the manager's
+                # on_user_connect.
                 sess = _AGWPESession(
-                    call_from, self._local_call, port, writer,
+                    call_from, self._netrom_node_call, port, writer,
                     self._drain_lock, self._write_timeout,
                 )
                 sess.netrom_manager = NetromCircuitManager(
-                    local_call        = self._local_call,
+                    local_call        = self._netrom_node_call,
                     via_node          = sess.remote_call,
                     ax25_writer       = self._make_netrom_writer(sess),
                     on_user_connect   = self._on_connect,
@@ -1306,10 +1337,11 @@ class AGWPETransport(Transport):
         fut: "asyncio.Future[NetromCircuitManager]" = loop.create_future()
         self._pending_connects[key] = fut
 
-        # Send the connect: AGWPE 'C', call_from = our (registered) local call,
-        # call_to = neighbor, on our AGW port.  NET/ROM rides as separate 'D'
-        # frames at PID=0xCF later; the connect itself is fine at PID=0xF0.
-        frame = _build_frame(self._agw_port, "C", self._local_call, neighbor_u)
+        # Send the connect: AGWPE 'C', call_from = our NET/ROM node call (the
+        # node SSID when configured, else the BBS callsign — N3), call_to =
+        # neighbor, on our AGW port.  NET/ROM rides as separate 'D' frames at
+        # PID=0xCF later; the connect itself is fine at PID=0xF0.
+        frame = _build_frame(self._agw_port, "C", self._netrom_node_call, neighbor_u)
         try:
             self._sock_writer.write(frame)
             async with self._drain_lock:
@@ -1324,7 +1356,7 @@ class AGWPETransport(Transport):
 
         logger.info(
             "agwpe: originating NETROM crosslink %s → %s (timeout %.0fs)",
-            self._local_call, neighbor_u, timeout,
+            self._netrom_node_call, neighbor_u, timeout,
         )
         try:
             return await asyncio.wait_for(fut, timeout)
@@ -1420,7 +1452,7 @@ class AGWPETransport(Transport):
                     try:
                         frame = _build_frame(
                             self._agw_port, "M",
-                            self._local_call, "NODES",
+                            self._netrom_node_call, "NODES",
                             PID_NETROM, payload,
                         )
                         writer.write(frame)

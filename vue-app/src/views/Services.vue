@@ -1,10 +1,11 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 
 const enabled = ref(false)
 const maxSessions = ref(10)
 const lockout = ref('')          // comma/space separated in the UI
 const routes = ref([])           // array of route rows
+const reserved = ref([])         // read-only SSIDs claimed by the BBS / node
 const loading = ref(false)
 const saving = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
@@ -50,9 +51,23 @@ function flagsOf(r) {
   return f
 }
 
+// Built-in BBS/node SSIDs shown as read-only rows (role in the Program column,
+// description in Args), merged ahead of the editable service routes so the whole
+// SSID map lives in one table.
+const tableItems = computed(() => [
+  ...reserved.value.map(r => ({
+    called: r.ssid, exec: r.role, args: r.detail,
+    min_auth: '', idle_timeout: 0, _reserved: true,
+  })),
+  ...routes.value,
+])
+
 async function load() {
   loading.value = true
-  const res = await fetch('/api/services')
+  const [res, rres] = await Promise.all([
+    fetch('/api/services'),
+    fetch('/api/services/reserved'),
+  ])
   if (res.ok) {
     const d = await res.json()
     enabled.value = !!d.enabled
@@ -60,12 +75,29 @@ async function load() {
     lockout.value = (d.lockout || []).join(', ')
     routes.value = routesFromApi(d.routes)
   }
+  if (rres.ok) {
+    reserved.value = (await rres.json()).reserved || []
+  }
   loading.value = false
 }
 
+function isReserved(called) {
+  const c = (called || '').toUpperCase().trim()
+  return reserved.value.some(r => (r.ssid || '').toUpperCase() === c)
+}
+
 function openAdd() { editIndex.value = -1; editRoute.value = blankRoute(); dialog.value = true }
-function openEdit(i) { editIndex.value = i; editRoute.value = { ...routes.value[i] }; dialog.value = true }
-function removeRoute(i) { routes.value.splice(i, 1) }
+function openEdit(item) {
+  const i = routes.value.findIndex(r => r.called === item.called)
+  if (i === -1) return
+  editIndex.value = i
+  editRoute.value = { ...routes.value[i] }
+  dialog.value = true
+}
+function removeRoute(item) {
+  const i = routes.value.findIndex(r => r.called === item.called)
+  if (i !== -1) routes.value.splice(i, 1)
+}
 
 function saveDialog() {
   const r = editRoute.value
@@ -75,6 +107,13 @@ function saveDialog() {
   }
   if (!r.exec.trim().startsWith('/')) {
     snackbar.value = { show: true, text: 'Program path must be absolute (start with /).', color: 'error' }
+    return
+  }
+  if (isReserved(r.called)) {
+    snackbar.value = {
+      show: true, color: 'error',
+      text: `${r.called.toUpperCase().trim()} is reserved for the BBS/node — pick another SSID.`,
+    }
     return
   }
   const clean = { ...r, called: r.called.toUpperCase().trim() }
@@ -192,7 +231,13 @@ onMounted(load)
     </v-card>
 
     <v-row align="center" class="mb-1">
-      <v-col><div class="text-subtitle-1 font-weight-medium">Routes</div></v-col>
+      <v-col>
+        <div class="text-subtitle-1 font-weight-medium">SSIDs &amp; routes</div>
+        <div class="text-caption text-medium-emphasis">
+          Built-in SSIDs (BBS / NET/ROM node) are shown read-only; they're
+          managed in the netrom config and can't be used as a service route.
+        </div>
+      </v-col>
       <v-col class="text-right">
         <v-btn color="primary" variant="tonal" prepend-icon="mdi-plus" @click="openAdd">
           Add route
@@ -202,27 +247,50 @@ onMounted(load)
 
     <v-data-table
       :headers="headers"
-      :items="routes"
+      :items="tableItems"
       :loading="loading"
       density="compact"
       class="mb-4"
       no-data-text="No routes configured."
     >
+      <template #item.called="{ item }">
+        <v-icon v-if="item._reserved" size="x-small" class="mr-1" color="medium-emphasis">
+          mdi-lock-outline
+        </v-icon>
+        {{ item.called }}
+      </template>
       <template #item.exec="{ item }">
-        <span class="font-monospace">{{ item.exec }}</span>
+        <span v-if="item._reserved" class="font-weight-medium">{{ item.exec }}</span>
+        <span v-else class="font-monospace">{{ item.exec }}</span>
       </template>
       <template #item.args="{ item }">
-        <span class="font-monospace text-medium-emphasis">{{ item.args }}</span>
+        <span :class="item._reserved ? 'text-medium-emphasis' : 'font-monospace text-medium-emphasis'">
+          {{ item.args }}
+        </span>
+      </template>
+      <template #item.min_auth="{ item }">
+        <span v-if="item._reserved" class="text-medium-emphasis">—</span>
+        <span v-else>{{ item.min_auth }}</span>
       </template>
       <template #item.flags="{ item }">
-        <v-chip v-for="f in flagsOf(item)" :key="f" size="x-small" class="mr-1" label>{{ f }}</v-chip>
+        <v-chip v-if="item._reserved" size="x-small" label variant="tonal" color="medium-emphasis">
+          built-in
+        </v-chip>
+        <template v-else>
+          <v-chip v-for="f in flagsOf(item)" :key="f" size="x-small" class="mr-1" label>{{ f }}</v-chip>
+        </template>
       </template>
       <template #item.idle_timeout="{ item }">
-        {{ item.idle_timeout ? item.idle_timeout + 's' : '—' }}
+        <span v-if="item._reserved">—</span>
+        <template v-else>{{ item.idle_timeout ? item.idle_timeout + 's' : '—' }}</template>
       </template>
-      <template #item.actions="{ index }">
-        <v-btn icon="mdi-pencil" size="small" variant="text" @click="openEdit(index)" />
-        <v-btn icon="mdi-delete" size="small" variant="text" color="error" @click="removeRoute(index)" />
+      <template #item.actions="{ item }">
+        <v-icon v-if="item._reserved" size="small" color="medium-emphasis"
+                title="Managed in the netrom config">mdi-lock-outline</v-icon>
+        <template v-else>
+          <v-btn icon="mdi-pencil" size="small" variant="text" @click="openEdit(item)" />
+          <v-btn icon="mdi-delete" size="small" variant="text" color="error" @click="removeRoute(item)" />
+        </template>
       </template>
     </v-data-table>
 

@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from bbs.core.auth import AuthLevel
+from bbs.netrom.gateway import GatewayGuard, GatewayPolicy
 from bbs.netrom.node import NetromNode
 from bbs.netrom.router import NetromRouter, RouteEntry
 from bbs.transport.base import Connection, Transport
@@ -325,7 +327,7 @@ class TestConnectFlow:
 
     async def test_cap_reached(self):
         node, transport, mgr = self._node_with_stack(max_gateway_circuits=1)
-        node._active_gateways = 1
+        node._guard.acquire("PREFILL")          # fill the node-wide budget
         await node.cmd_connect("JOHN")
         assert "busy" in node._term.text().lower()
         assert transport.connect_calls == []
@@ -356,6 +358,200 @@ class TestConnectFlow:
         node = _make_node(transport=None)
         await node.cmd_connect("JOHN")
         assert "No crosslink transport" in node._term.text()
+
+
+# ─── N4a gateway-safety gates (guard wired into cmd_connect) ──────────────────
+
+class TestGatewayGates(TestConnectFlow):
+    async def test_deny_refuses(self):
+        guard = GatewayGuard(GatewayPolicy(deny=frozenset({"N0USER"})))
+        node, transport, mgr = self._node_with_stack(guard=guard)
+        await node.cmd_connect("JOHN")            # user N0USER-1 (base N0USER)
+        assert transport.connect_calls == []
+        assert "denied" in node._term.text().lower()
+
+    async def test_allow_list_closes_node(self):
+        guard = GatewayGuard(GatewayPolicy(allow=frozenset({"KF6ANX"})))
+        node, transport, mgr = self._node_with_stack(guard=guard)
+        await node.cmd_connect("JOHN")            # not on the allow list
+        assert transport.connect_calls == []
+        assert "authorized" in node._term.text().lower()
+
+    async def test_min_auth_refuses_below(self):
+        guard = GatewayGuard(GatewayPolicy(min_auth=AuthLevel.AUTHENTICATED))
+        node, transport, mgr = self._node_with_stack(
+            guard=guard, auth_level=AuthLevel.IDENTIFIED
+        )
+        await node.cmd_connect("JOHN")
+        assert transport.connect_calls == []
+        assert "uthentication" in node._term.text()
+
+    async def test_interlock_refuses_back_out_arrival_link(self):
+        guard = GatewayGuard(GatewayPolicy(interlock=True))
+        # JOHN is direct → next-hop KF6ANX-4; arrive on that same crosslink.
+        node, transport, mgr = self._node_with_stack(
+            guard=guard, arrival_via="KF6ANX-4"
+        )
+        await node.cmd_connect("JOHN")
+        assert transport.connect_calls == []
+        assert "nterlock" in node._term.text()
+
+    async def test_interlock_allows_other_neighbor(self):
+        guard = GatewayGuard(GatewayPolicy(interlock=True))
+        node, transport, mgr = self._node_with_stack(
+            guard=guard, arrival_via="K6FB-5"    # different from JOHN's next-hop
+        )
+        await node.cmd_connect("JOHN")
+        assert transport.connect_calls == ["KF6ANX-4"]
+
+    async def test_slot_acquired_and_released_around_connect(self):
+        guard = GatewayGuard(GatewayPolicy())
+        node, transport, mgr = self._node_with_stack(guard=guard)
+        await node.cmd_connect("JOHN")           # bridge mocked → far-end close
+        assert transport.connect_calls == ["KF6ANX-4"]
+        assert guard.active_total == 0           # released after the bridge
+        assert node._active_gateways == 0
+
+    async def test_node_wide_cap_refuses(self):
+        guard = GatewayGuard(GatewayPolicy(max_circuits=1))
+        node, transport, mgr = self._node_with_stack(guard=guard)
+        guard.acquire("SOMEONE-2")               # a different user fills the node
+        await node.cmd_connect("JOHN")
+        assert transport.connect_calls == []
+        assert "busy" in node._term.text().lower()
+
+    async def test_refusal_recorded_for_dashboard(self):
+        guard = GatewayGuard(GatewayPolicy(deny=frozenset({"N0USER"})))
+        node, transport, mgr = self._node_with_stack(guard=guard)
+        await node.cmd_connect("JOHN")
+        refusals = guard.stats()["recent_refusals"]
+        assert len(refusals) == 1
+        assert refusals[0]["user"] == "N0USER-1"
+        assert refusals[0]["dest"] == "KF6ANX-4"
+
+    async def test_current_target_cleared_after_connect(self):
+        node, transport, mgr = self._node_with_stack()   # bridge → far close
+        await node.cmd_connect("JOHN")
+        assert node._current_target is None              # back at =>
+        assert node.describe()["target"] is None
+
+
+# ─── Node live-state describe() (N4c dashboard) ───────────────────────────────
+
+class TestDescribe:
+    async def test_describe_at_prompt(self):
+        node = _make_node()
+        d = node.describe()
+        assert d["user"] == "N0USER-1"
+        assert d["entry"] == "node"          # default entry label
+        assert d["target"] is None           # at the => prompt
+        assert d["via"] == ""                # direct (no arrival crosslink)
+        assert d["idle_s"] >= 0 and d["connected_s"] >= 0
+
+    async def test_describe_reports_arrival_and_entry(self):
+        node = _make_node(arrival_via="K6FB-5", entry="native")
+        d = node.describe()
+        assert d["via"] == "K6FB-5"
+        assert d["entry"] == "native"
+
+
+# ─── Local applications (N3): C BBS / C <svc> ─────────────────────────────────
+
+class TestLocalApps:
+    def _app_node(self, apps, *, script=None, at_eof=False, **kwargs):
+        term = FakeTerminal(script=script)
+        reader = asyncio.StreamReader()
+        if at_eof:
+            reader.feed_eof()
+        conn = Connection(
+            remote_addr="N0USER-1", reader=reader,
+            writer=CaptureWriter(), transport_id="test",
+        )
+        node = NetromNode(
+            term=term, conn=conn, user_call="N0USER-1",
+            node_call="W6ELA-5", node_alias="PALO",
+            router=_seeded_router(), transports=[], apps=apps, **kwargs,
+        )
+        node._term = term
+        node._running = True              # simulate an active command loop
+        return node
+
+    async def test_c_bbs_runs_local_app_and_reconnects(self):
+        ran: list = []
+
+        async def bbs_app(conn):
+            ran.append(conn)
+
+        node = self._app_node({"BBS": bbs_app})       # reader NOT at eof
+        await node.cmd_connect("BBS")
+        assert len(ran) == 1
+        assert ran[0] is node.conn                     # ran on the user's conn
+        assert "*** Reconnected to PALO" in node._term.text()
+        assert node._running is True                   # back at =>
+
+    async def test_c_bbs_is_case_insensitive(self):
+        ran: list = []
+
+        async def bbs_app(conn):
+            ran.append(1)
+
+        node = self._app_node({"BBS": bbs_app})
+        await node.cmd_connect("bbs")
+        assert ran == [1]
+
+    async def test_local_app_wins_over_may_connect_gate(self):
+        ran: list = []
+
+        async def bbs_app(conn):
+            ran.append(1)
+
+        node = self._app_node({"BBS": bbs_app}, may_connect=False)
+        await node.cmd_connect("BBS")
+        assert ran == [1]                              # ran despite may_connect=False
+        assert "Not authorized" not in node._term.text()
+
+    async def test_app_eof_ends_node(self):
+        async def bbs_app(conn):
+            pass
+
+        node = self._app_node({"BBS": bbs_app}, at_eof=True)
+        await node.cmd_connect("BBS")
+        assert node._running is False                  # user vanished inside the app
+        assert "*** Reconnected" not in node._term.text()
+
+    async def test_app_failure_reports(self):
+        async def broken(conn):
+            raise RuntimeError("boom")
+
+        node = self._app_node({"BBS": broken})
+        await node.cmd_connect("BBS")
+        assert "BBS not available" in node._term.text()
+
+    async def test_unknown_app_falls_through_to_netrom(self):
+        # 'JOHN' is a known node, not a local app → connect-out path runs.
+        circuit = FakeCircuit()
+        transport = FakeTransport(mgr=FakeManager(circuit=circuit))
+        term = FakeTerminal()
+        conn = Connection(
+            remote_addr="N0USER-1", reader=asyncio.StreamReader(),
+            writer=CaptureWriter(), transport_id="test",
+        )
+        node = NetromNode(
+            term=term, conn=conn, user_call="N0USER-1",
+            node_call="W6ELA-5", node_alias="PALO",
+            router=_seeded_router(), transports=[transport], apps={"BBS": None},
+        )
+        node._bridge = AsyncMock(return_value=False)
+        await node.cmd_connect("JOHN")
+        assert transport.connect_calls == ["KF6ANX-4"]
+
+    async def test_banner_lists_applications(self):
+        async def a(conn):
+            pass
+
+        node = self._app_node({"BBS": a})
+        await node._send_banner()
+        assert "Applications: BBS" in node._term.text()
 
 
 # ─── Two-circuit bridge ───────────────────────────────────────────────────────

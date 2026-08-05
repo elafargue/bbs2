@@ -186,6 +186,11 @@ class ServiceDispatcher:
         are harmless to include — transports ignore ones they can't register.)"""
         return list(self._routes.keys())
 
+    def routes(self) -> list[ServiceRoute]:
+        """All configured service routes — used by the NET/ROM node to expose
+        each service as a local application (``C <svc>``)."""
+        return list(self._routes.values())
+
     # ── Classification ────────────────────────────────────────────────────────
 
     def match(self, conn: Connection) -> ServiceDecision:

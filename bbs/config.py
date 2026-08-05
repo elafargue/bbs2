@@ -4,12 +4,15 @@ All other modules import from here; never read yaml directly.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +43,40 @@ class BBSConfig:
     def full_callsign(self) -> str:
         """Return 'CALL-SSID' string, e.g. 'N0CALL-1'."""
         return f"{self.callsign}-{self.ssid}" if self.ssid else self.callsign
+
+    @property
+    def netrom_node_ssid(self) -> Optional[int]:
+        """The NET/ROM node identity SSID (``netrom.node_ssid``), or None.
+
+        Setting it opts this station into a first-class NET/ROM node identity
+        (N3): a user connecting to ``<callsign>-<node_ssid>`` lands natively at
+        the node ``=>`` prompt and the BBS SSID becomes just one of the node's
+        applications.  Returns None — i.e. the node runs on the BBS SSID, which
+        is today's behavior — when the value is absent, outside the 0-15 AX.25
+        range, or equal to ``bbs.ssid`` (a single role can't be both the node
+        and the BBS)."""
+        raw = self.netrom.get("node_ssid")
+        if raw is None:
+            return None
+        try:
+            ssid = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= ssid <= 15 or ssid == self.ssid:
+            return None
+        return ssid
+
+    @property
+    def netrom_node_call(self) -> Optional[str]:
+        """Full node callsign ``CALL-SSID`` when a distinct node SSID is set
+        (N3); None when the node runs on the BBS callsign (today's behavior).
+
+        This is the opt-in switch for the native node landing: the engine only
+        routes inbound connects to the ``=>`` prompt when this is non-None."""
+        ssid = self.netrom_node_ssid
+        if ssid is None:
+            return None
+        return f"{self.callsign}-{ssid}" if ssid else self.callsign
 
     @property
     def db_path(self) -> Path:
@@ -99,7 +136,7 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
     if len(callsign) > 6:
         raise ValueError(f"bbs.callsign '{callsign}' exceeds 6 characters (AX.25 limit)")
 
-    return BBSConfig(
+    config = BBSConfig(
         callsign=callsign,
         ssid=int(bbs.get("ssid", 0)),
         name=str(bbs.get("name", "Amateur Radio BBS")),
@@ -119,6 +156,20 @@ def load_config(path: str | Path = "config/bbs.yaml") -> BBSConfig:
         netrom=raw.get("netrom", {}),
         services=raw.get("services", {}),
     )
+
+    # N3: validate the optional NET/ROM node SSID once at load, warning if it
+    # was set but rejected so the operator knows the node fell back to running
+    # on the BBS SSID (rather than silently ignoring a typo'd config).
+    raw_node_ssid = config.netrom.get("node_ssid")
+    if raw_node_ssid is not None and config.netrom_node_ssid is None:
+        logger.warning(
+            "netrom.node_ssid %r ignored (must be an integer 0-15 and differ "
+            "from bbs.ssid=%d — a single role can't be both the NET/ROM node "
+            "and the BBS); the node runs on the BBS SSID %s",
+            raw_node_ssid, config.ssid, config.full_callsign,
+        )
+
+    return config
 
 
 def update_yaml_setting(path: str | Path, key_path: list[str], value: Any) -> None:

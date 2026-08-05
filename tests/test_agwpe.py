@@ -1030,3 +1030,101 @@ class TestConnectNetromBaseDefault:
         )
         mgr = await asyncio.wait_for(task, timeout=1.0)
         assert isinstance(mgr, NetromCircuitManager)
+
+
+# ─── N3: node-identity sourcing (set_netrom_node_call) ────────────────────────
+
+class TestNetromNodeCallSourcing:
+    """N3: outbound crosslinks + NODES originate from the NET/ROM node call
+    (the node SSID when configured, else the BBS callsign)."""
+
+    def _connected(self, node_call: str | None = None):
+        t = _make_transport()          # BBS call = N0CALL-1
+        if node_call is not None:
+            t.set_netrom_node_call(node_call)
+        t._running = True
+        t._drain_lock = asyncio.Lock()
+        fw = _FakeWriter()
+        t._sock_writer = fw  # type: ignore[assignment]
+
+        async def _on_connect(conn: Connection) -> None:
+            try:
+                while await conn.reader.read(1024):
+                    pass
+            except Exception:
+                pass
+
+        t._on_connect = _on_connect
+        return t, fw
+
+    def test_default_node_call_is_bbs_call(self):
+        t = _make_transport()
+        assert t._netrom_node_call == "N0CALL-1"
+
+    async def test_connect_out_sources_C_from_node_call(self):
+        t, fw = self._connected("N0CALL-5")
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        try:
+            c = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "C"]
+            assert c[0]["call_from"] == "N0CALL-5"     # node SSID, not the BBS call
+            assert c[0]["call_to"] == "W6ELA-2"
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_outbound_crosslink_and_circuit_source_from_node_call(self):
+        t, fw = self._connected("N0CALL-5")
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        # Direwolf confirms; the outbound crosslink is built from the node call.
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-5", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr = await asyncio.wait_for(task, timeout=1.0)
+        sess = t._sessions[(0, "W6ELA-2")]
+        assert sess.writer._local == "N0CALL-5"        # AGWPE 'D' CallFrom
+        # And the L3 circuit CONNECT REQ sources from the node call too.
+        fw.written.clear()
+        oc = asyncio.create_task(mgr.originate_circuit("W6ELA-2", "N0USER-1"))
+        await asyncio.sleep(0)
+        try:
+            d = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "D"]
+            assert d[0]["call_from"] == "N0CALL-5"
+            assert d[0]["pid"] == PID_NETROM
+        finally:
+            oc.cancel()
+            try:
+                await oc
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_nodes_broadcast_sources_from_node_call(self):
+        t = _make_transport()
+        t.set_netrom_node_call("N0CALL-5")
+        t._running = True
+        t._netrom_nodes_builder = lambda: b"\xffPALO  "   # non-empty payload
+        fw = _FakeWriter()
+        registered = asyncio.Event()
+        registered.set()
+        lock = asyncio.Lock()
+        task = asyncio.create_task(t._netrom_nodes_loop(fw, registered, lock))  # type: ignore
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        m = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "M"]
+        assert m and m[0]["call_from"] == "N0CALL-5"    # NODES from the node SSID
+        assert m[0]["call_to"] == "NODES"
+
+    def test_set_extra_callsigns_dedups_node_call(self):
+        t = _make_transport()
+        t.set_netrom_node_call("N0CALL-5")
+        t.set_extra_callsigns(["N0CALL-5", "W6ELA-9"])
+        assert "N0CALL-5" not in t._extra_callsigns   # registered once, in start()
+        assert "W6ELA-9" in t._extra_callsigns

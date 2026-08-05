@@ -210,6 +210,9 @@ class TestConnectRequest:
         assert len(sessions.connections) == 1
         assert sessions.connections[0].remote_addr == "KN6PE-7"
         assert sessions.connections[0].transport_id == "netrom"
+        # N4a: the arrival crosslink neighbor is threaded onto the Connection
+        # so the node's INTERLOCK guard can refuse routing back out this link.
+        assert sessions.connections[0].netrom_via == "N6ZX-5"
         sessions.release_all()
         await asyncio.sleep(0)
 

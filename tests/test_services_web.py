@@ -106,3 +106,60 @@ def test_services_route_rejects_invalid(monkeypatch, tmp_path):
         s["sysop"] = True
     r = client.put("/api/services", json={"routes": {"W6ELA-2": {"exec": "relative"}}})
     assert r.status_code == 400 and "absolute" in r.get_json()["error"]
+
+
+# ── Reserved SSIDs (read-only map + PUT collision guard) ──────────────────────
+
+def test_reserved_ssids_bbs_only(monkeypatch, tmp_path):
+    cfgfile = tmp_path / "bbs.yaml"
+    cfgfile.write_text(
+        "bbs:\n  callsign: W6ELA\n  ssid: 1\n  name: Test BBS\nweb:\n  secret_key: x\n"
+    )
+    client, _ = _client(monkeypatch, cfgfile)
+    with client.session_transaction() as s:
+        s["sysop"] = True
+    r = client.get("/api/services/reserved")
+    assert r.status_code == 200
+    reserved = r.get_json()["reserved"]
+    assert [x["ssid"] for x in reserved] == ["W6ELA-1"]         # node shares BBS SSID
+    assert reserved[0]["role"] == "BBS"
+
+
+def test_reserved_ssids_with_node(monkeypatch, tmp_path):
+    cfgfile = tmp_path / "bbs.yaml"
+    cfgfile.write_text(
+        "bbs:\n  callsign: W6ELA\n  ssid: 1\nweb:\n  secret_key: x\n"
+        "netrom:\n  alias: PALO\n  node_ssid: 5\n"
+    )
+    client, _ = _client(monkeypatch, cfgfile)
+    with client.session_transaction() as s:
+        s["sysop"] = True
+    reserved = client.get("/api/services/reserved").get_json()["reserved"]
+    by_ssid = {x["ssid"]: x for x in reserved}
+    assert set(by_ssid) == {"W6ELA-1", "W6ELA-5"}
+    assert by_ssid["W6ELA-5"]["role"] == "Node"
+    assert "PALO" in by_ssid["W6ELA-5"]["detail"]
+
+
+def test_reserved_ssids_requires_sysop(monkeypatch, tmp_path):
+    cfgfile = tmp_path / "bbs.yaml"
+    cfgfile.write_text("bbs:\n  callsign: W6ELA\n  ssid: 1\nweb:\n  secret_key: x\n")
+    client, _ = _client(monkeypatch, cfgfile)
+    assert client.get("/api/services/reserved").status_code == 401
+
+
+def test_put_rejects_route_on_reserved_ssid(monkeypatch, tmp_path):
+    cfgfile = tmp_path / "bbs.yaml"
+    cfgfile.write_text(
+        "bbs:\n  callsign: W6ELA\n  ssid: 1\nweb:\n  secret_key: x\n"
+        "netrom:\n  alias: PALO\n  node_ssid: 5\n"
+    )
+    client, _ = _client(monkeypatch, cfgfile)
+    with client.session_transaction() as s:
+        s["sysop"] = True
+    # A route on the node SSID must be refused (would shadow the node).
+    r = client.put("/api/services", json={
+        "routes": {"W6ELA-5": {"exec": "/bin/cat", "args": ["cat"]}},
+    })
+    assert r.status_code == 400
+    assert "reserved" in r.get_json()["error"].lower()

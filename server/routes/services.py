@@ -97,6 +97,27 @@ def _validate(data):
     }, None
 
 
+def _reserved_ssids(cfg) -> list:
+    """SSIDs already claimed by the BBS and the NET/ROM node — read-only, so the
+    admin sees what is 'taken' and does not add a service route that would shadow
+    (or be shadowed by) them.  Derived from config; managed in bbs/netrom, not
+    here.  When no distinct node SSID is set, the node shares the BBS SSID."""
+    netrom = cfg.netrom or {}
+    alias = str(netrom.get("alias", "")).strip().upper()
+    node_call = cfg.netrom_node_call            # None unless a distinct node SSID
+    out: list = []
+    if node_call:
+        out.append({"ssid": cfg.full_callsign, "role": "BBS", "detail": cfg.name})
+        out.append({
+            "ssid": node_call, "role": "Node",
+            "detail": f"NET/ROM node ({alias})" if alias else "NET/ROM node",
+        })
+    else:
+        detail = f"{cfg.name} + NET/ROM node (@)" if netrom else cfg.name
+        out.append({"ssid": cfg.full_callsign, "role": "BBS", "detail": detail})
+    return out
+
+
 @app.route("/api/services", methods=["GET"])
 def get_services():
     err = _require_sysop()
@@ -106,6 +127,19 @@ def get_services():
     if bbs_engine is None:
         return jsonify({"error": "BBS engine not running"}), 503
     return jsonify(bbs_engine.cfg.services or {})
+
+
+@app.route("/api/services/reserved", methods=["GET"])
+def get_reserved_ssids():
+    """Read-only list of SSIDs claimed by the BBS / NET/ROM node (see
+    :func:`_reserved_ssids`)."""
+    err = _require_sysop()
+    if err:
+        return err
+    from server.app import bbs_engine
+    if bbs_engine is None:
+        return jsonify({"error": "BBS engine not running"}), 503
+    return jsonify({"reserved": _reserved_ssids(bbs_engine.cfg)})
 
 
 @app.route("/api/services", methods=["PUT"])
@@ -120,6 +154,15 @@ def update_services():
     normalized, verr = _validate(request.get_json(silent=True) or {})
     if verr:
         return jsonify({"error": verr}), 400
+
+    # A service route on the BBS or node SSID would shadow (or be shadowed by)
+    # them at dispatch — reject so the admin can't foot-gun the BBS/node away.
+    reserved = {r["ssid"].upper() for r in _reserved_ssids(bbs_engine.cfg)}
+    clash = sorted(reserved & set(normalized["routes"].keys()))
+    if clash:
+        return jsonify({"error":
+            f"SSID(s) {', '.join(clash)} are reserved for the BBS/node and "
+            f"cannot be a service route."}), 400
 
     old_ssids = {str(k).upper() for k in (bbs_engine.cfg.services or {}).get("routes", {})}
     new_ssids = set(normalized["routes"].keys())

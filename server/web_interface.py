@@ -17,6 +17,7 @@ import server.routes.bulletins   # noqa: F401
 import server.routes.info        # noqa: F401
 import server.routes.heard       # noqa: F401
 import server.routes.chat        # noqa: F401
+import server.routes.netrom      # noqa: F401
 import server.routes.display     # noqa: F401
 import server.routes.services    # noqa: F401
 import server.websocket.handlers # noqa: F401

@@ -17,7 +17,8 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Callable, Optional
+from dataclasses import replace
+from typing import Any, Awaitable, Callable, Optional
 import queue as stdlib_queue
 from concurrent.futures import Future as ConcurrentFuture
 
@@ -27,6 +28,7 @@ from bbs.core.plugin_registry import PluginRegistry
 from bbs.core.session import BBSSession, SessionState
 from bbs.db.connections import prune_old_connections, upsert_connection
 from bbs.db.schema import init_db
+from bbs.netrom.gateway import GatewayPolicy
 from bbs.netrom.router import NetromRouter
 from bbs.services.bridge import run_service
 from bbs.services.dispatcher import ServiceAction, ServiceDispatcher, ServiceRoute
@@ -37,6 +39,43 @@ logger = logging.getLogger(__name__)
 
 # Maximum log lines kept in the in-memory ring buffer (web dashboard)
 LOG_BUFFER_SIZE = 500
+
+
+class _NonClosingWriter:
+    """Wrap a StreamWriter so ``close()``/``wait_closed()`` are no-ops.
+
+    Lets a sub-application (the BBS or an ax25d-style service) run on a shared
+    link from inside the NET/ROM node (N3, ``C BBS`` / ``C <svc>``) and exit
+    without tearing down the underlying transport — so the node can resume its
+    ``=>`` prompt.  ``write``/``drain`` delegate; ``is_closing`` reflects the
+    real writer so output stops if the link actually drops."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def write(self, data: bytes) -> None:
+        self._inner.write(data)
+
+    async def drain(self) -> None:
+        await self._inner.drain()
+
+    def is_closing(self) -> bool:
+        return self._inner.is_closing()
+
+    def close(self) -> None:
+        pass  # deliberately a no-op — the node owns the real link's lifetime
+
+    async def wait_closed(self) -> None:
+        pass
+
+    def get_extra_info(self, key: str, default: Any = None) -> Any:
+        return self._inner.get_extra_info(key, default)
+
+
+def _non_closing_conn(conn: Connection) -> Connection:
+    """A view of *conn* whose writer's ``close()`` is a no-op (see
+    :class:`_NonClosingWriter`) — for running a sub-app from the node."""
+    return replace(conn, writer=_NonClosingWriter(conn.writer))  # type: ignore[arg-type]
 
 
 class BBSEngine:
@@ -86,6 +125,15 @@ class BBSEngine:
         # Maps Socket.IO SID → BBS session_id for web terminal sessions.
         self._web_session_map: dict[str, str] = {}
 
+        # NET/ROM node identity (N3).  self._netrom_node_call is the OPT-IN
+        # switch: None (default) means the node runs on the BBS SSID (today's
+        # behavior) and there is NO native => landing; a value (the node SSID,
+        # e.g. "W6ELA-5") routes inbound connects to that SSID straight to the
+        # node prompt in _on_connection.  self._netrom_apps is the node's
+        # local-application registry (BBS + services) reachable via C <app>.
+        self._netrom_node_call: Optional[str] = None
+        self._netrom_apps: dict[str, "Callable[[Connection], Awaitable[None]]"] = {}
+
     # ── Startup & shutdown ────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -124,6 +172,13 @@ class BBSEngine:
                 "Heard-station observer registered on %d transport(s)", len(transports)
             )
 
+        # Build the ax25d-style service dispatcher EARLY (before the NET/ROM
+        # node binds) so the node's local-application registry — 'C BBS' /
+        # 'C <svc>' — can enumerate the configured service routes.  The SSID
+        # registration with the radio still happens further below (it must
+        # precede start()).
+        self._services = ServiceDispatcher(self.cfg.services or {})
+
         # Wire NETROM router onto supporting transports.
         # Listening (RX) requires only the netrom section to be present.
         # Broadcasting (TX) additionally requires an alias to be set.
@@ -131,8 +186,15 @@ class BBSEngine:
         netrom_cfg = self.cfg.netrom or {}
         if netrom_cfg:
             netrom_alias = str(netrom_cfg.get("alias", "")).strip().upper()
+            # N3: the effective node identity.  When netrom.node_ssid is set
+            # (and valid) the node presents on <callsign>-<node_ssid> and that
+            # SSID gets the native => landing; otherwise the node runs on the
+            # BBS callsign (today's behavior) and self._netrom_node_call stays
+            # None so _on_connection never diverts to the native landing.
+            self._netrom_node_call = self.cfg.netrom_node_call
+            effective_node_call = self._netrom_node_call or self.cfg.full_callsign
             netrom_router = NetromRouter(
-                self.cfg.full_callsign,
+                effective_node_call,
                 netrom_alias,
                 route_ttl_seconds=int(
                     netrom_cfg.get("route_ttl_minutes", 180)
@@ -205,38 +267,52 @@ class BBSEngine:
                 t.set_netrom_crosslink_observer(netrom_router.note_crosslink)
                 t.set_netrom_info_mtu(info_mtu)
                 t.set_netrom_link_idle_timeout(link_idle_timeout)
+                # N3: source outbound crosslinks + NODES from the node identity
+                # (the node SSID when configured, else the BBS callsign) and, on
+                # AGWPE, register that SSID so inbound connects to it reach us.
+                t.set_netrom_node_call(effective_node_call)
                 if netrom_alias:
                     # Only register the builder (and thus start the broadcast
                     # loop) when we have a node alias to advertise.
                     t.set_netrom_nodes_builder(netrom_router.build_nodes_payload)
             logger.info(
                 "NETROM router %s wired onto %d transport(s) — alias: %s, "
-                "classifier: router-lookup",
-                self.cfg.full_callsign, len(transports),
+                "classifier: router-lookup%s",
+                effective_node_call, len(transports),
                 netrom_alias if netrom_alias else "(listen-only, no alias set)",
+                (f", node SSID {effective_node_call} (BBS on {self.cfg.full_callsign})"
+                 if self._netrom_node_call else ""),
             )
+
+            # N3: build the node's local-application registry (the BBS as 'BBS'
+            # plus each configured service) so the node offers 'C <app>'.  The
+            # same registry backs both the '@' entry and the native landing.
+            self._netrom_apps = self._build_netrom_apps()
 
             # Wire the NET/ROM node command layer (N2): bind the '@' menu plugin
             # to the router + crosslink-capable transports so users can enter the
             # node and connect onward.  Binding also enables the plugin (it stays
-            # disabled/hidden on stations without a netrom: block).
+            # disabled/hidden on stations without a netrom: block).  With a node
+            # SSID set (N3) the node presents its own identity and the BBS
+            # becomes an application.
             node_plugin = self.plugin_registry.get("node")
             if node_plugin is not None:
                 node_plugin.bind(  # type: ignore[attr-defined]
                     router=netrom_router,
                     transports=transports,
-                    node_call=self.cfg.full_callsign,
-                    node_alias=netrom_alias or self.cfg.full_callsign,
+                    node_call=effective_node_call,
+                    node_alias=netrom_alias or effective_node_call,
+                    apps=self._netrom_apps,
+                    # N4a: gateway-safety policy (ACL / INTERLOCK / rate / caps).
+                    gateway_policy=GatewayPolicy.from_netrom_cfg(netrom_cfg),
                     connect_timeout=float(netrom_cfg.get("connect_timeout", 60.0)),
                     min_quality=int(netrom_cfg.get("connect_min_quality", 1)),
                     max_gateways=int(netrom_cfg.get("max_gateway_circuits", 4)),
                 )
 
-        # Wire ax25d-style external-service hosting.  The dispatcher routes an
-        # inbound connection (by called SSID) to an external program instead of
-        # the internal BBS; register its service SSIDs so transports accept
-        # connects to them (must happen before start()).
-        self._services = ServiceDispatcher(self.cfg.services or {})
+        # Register ax25d-style external-service SSIDs so transports accept
+        # connects to them (must happen before start()).  The dispatcher itself
+        # was built earlier so the NET/ROM node app-registry could see it.
         if self._services.enabled:
             svc_calls = self._services.route_callsigns()
             for t in transports:
@@ -307,6 +383,21 @@ class BBSEngine:
 
     async def _on_connection(self, conn: Connection) -> None:
         """Called by each transport when a new connection arrives."""
+        # N3: native NET/ROM node landing.  A user who dialed our node SSID
+        # lands at the '=>' prompt (the BBS + services become 'applications'
+        # reachable via C BBS / C <svc>).  Opt-in — only when netrom.node_ssid
+        # is configured (self._netrom_node_call set), so every station keeps
+        # today's behavior on upgrade.  Checked FIRST so the node SSID wins over
+        # service dispatch and the BBS.  (A neighbor *crosslink* on this SSID
+        # never reaches here — the transport classifies it via is_direct_neighbor
+        # and never calls back into the engine; only genuine user sessions and
+        # per-user NET/ROM circuits addressed to the node SSID arrive here.)
+        if self._netrom_node_call and (
+            (conn.local_addr or "").upper() == self._netrom_node_call.upper()
+        ):
+            await self._run_node_native(conn)
+            return
+
         # ax25d-style dispatch: route to an external program by called SSID,
         # BEFORE any BBS banner/menu is emitted.
         if self._services is not None and self._services.enabled:
@@ -453,6 +544,198 @@ class BBSEngine:
                     f"(online {int(time.time() - connected_at)}s)"
                 )
 
+    # ── NET/ROM node: native landing + local applications (N3) ────────────────
+
+    async def _run_node_native(self, conn: Connection) -> None:
+        """Run the NET/ROM node (``=>``) natively for a user who connected to
+        the node SSID (N3).  BYE ⇒ disconnect (the native-landing exit
+        contract); the node itself never closes the connection.
+
+        A lightweight idle watchdog evicts an idle native user (the node's
+        command loop only re-prompts on idle); activity inside a ``C <app>``
+        sub-session keeps it fresh via the node's keepalive (see NetromNode)."""
+        node_plugin = self.plugin_registry.get("node")
+        if node_plugin is None or not getattr(node_plugin, "enabled", False):
+            # netrom.node_ssid set but the node plugin isn't bound — shouldn't
+            # happen (both are wired together in run()); fail safe.
+            logger.warning("node SSID connect but node plugin unavailable — closing")
+            await conn.close()
+            return
+
+        # Native node users count toward max_users.
+        if self.cfg.max_users > 0 and len(self._sessions) >= self.cfg.max_users:
+            logger.warning(
+                "Max users (%d) reached; rejecting node connect from %s",
+                self.cfg.max_users, conn.remote_addr,
+            )
+            try:
+                conn.writer.write(
+                    f"\r\nSorry, {self.cfg.name} is full "
+                    f"({self.cfg.max_users} users max). Try again later.\r\n".encode()
+                )
+                await conn.writer.drain()
+            except Exception:
+                pass
+            await conn.close()
+            return
+
+        from bbs.core.terminal import Terminal
+
+        _is_ax25 = conn.transport_id in (
+            "kernel_ax25", "kiss_tcp", "kiss_serial", "agwpe", "netrom"
+        )
+        term = await Terminal.create(
+            conn.reader,
+            conn.writer,
+            echo=not _is_ax25,
+            # AX.25/NET/ROM peers want bare CR; other transports get CRLF.
+            eol="\r" if _is_ax25 else "\r\n",
+            write_timeout=self.cfg.write_timeout,
+        )
+        user_call = (conn.remote_addr or "").upper().strip()
+        idle_to = float(self.cfg.idle_timeout) if self.cfg.idle_timeout else 0.0
+        connected_at = time.time()
+
+        last_activity = time.monotonic()
+
+        def _touch() -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
+
+        self._emit_event({
+            "type": "user_connected",
+            "session_id": f"node:{conn.remote_addr}:{connected_at:.3f}",
+            "remote_addr": conn.remote_addr,
+            "transport": conn.transport_id,
+            "timestamp": connected_at,
+        })
+        self._emit_log(f"NODE {conn.remote_addr} → {self._netrom_node_call}")
+
+        loop_task = asyncio.create_task(
+            node_plugin.run_native(  # type: ignore[attr-defined]
+                term=term, conn=conn, user_call=user_call,
+                idle_timeout=(idle_to or None), on_activity=_touch,
+                # A native-landing radio caller is identified by their AX.25
+                # callsign; the gateway ACL's min_auth is checked against this.
+                auth_level=AuthLevel.IDENTIFIED,
+            ),
+            name=f"node-native:{conn.remote_addr}",
+        )
+        watchdog: Optional[asyncio.Task[None]] = None
+        if idle_to > 0:
+            async def _idle_watchdog() -> None:
+                interval = min(10.0, idle_to / 3.0)
+                try:
+                    while True:
+                        await asyncio.sleep(interval)
+                        if time.monotonic() - last_activity > idle_to:
+                            logger.info(
+                                "node %s: idle watchdog fired after %.0fs — closing",
+                                conn.remote_addr, idle_to,
+                            )
+                            loop_task.cancel()
+                            return
+                except asyncio.CancelledError:
+                    pass
+            watchdog = asyncio.create_task(
+                _idle_watchdog(), name=f"node-native:wd:{conn.remote_addr}"
+            )
+
+        try:
+            # asyncio.wait (not `await loop_task`) so an idle-cancel of the loop
+            # task returns here normally, while a real cancel of THIS task (engine
+            # shutdown) propagates out of wait() — then the finally tears down.
+            await asyncio.wait({loop_task})
+        finally:
+            if not loop_task.done():
+                loop_task.cancel()
+            if watchdog is not None:
+                watchdog.cancel()
+            await asyncio.gather(
+                loop_task, *( [watchdog] if watchdog is not None else [] ),
+                return_exceptions=True,
+            )
+            if conn.remote_addr and self.cfg.connection_log_days != 0:
+                try:
+                    await upsert_connection(
+                        str(self.cfg.db_path),
+                        callsign=conn.remote_addr,
+                        transport=f"node:{self._netrom_node_call}",
+                        connected_at=connected_at,
+                        auth_level=AuthLevel.IDENTIFIED.value,
+                        connected=0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to record node session for %s", conn.remote_addr
+                    )
+            self._emit_event({
+                "type": "user_disconnected",
+                "session_id": f"node:{conn.remote_addr}:{connected_at:.3f}",
+                "remote_addr": conn.remote_addr,
+                "transport": conn.transport_id,
+                "timestamp": time.time(),
+            })
+            self._emit_log(
+                f"NODE-END {conn.remote_addr} "
+                f"(online {int(time.time() - connected_at)}s)"
+            )
+            await conn.close()
+
+    def _build_netrom_apps(self) -> "dict[str, Callable[[Connection], Awaitable[None]]]":
+        """Build the NET/ROM node's local-application registry (N3): the names
+        the node offers via ``C <app>``.
+
+        Always includes ``BBS`` (the built-in BBS as an application); adds each
+        configured ax25d-style service by its called SSID.  Each value runs the
+        app on the user's own connection (wrapped so the app's own teardown
+        won't close the underlying link) and returns when the app exits — the
+        node then resumes its ``=>`` prompt."""
+        apps: dict[str, Callable[[Connection], Awaitable[None]]] = {
+            "BBS": self._run_bbs_app,
+        }
+        if self._services is not None and self._services.enabled:
+            for route in self._services.routes():
+                apps[route.called.upper()] = self._make_service_app(route)
+        return apps
+
+    async def _run_bbs_app(self, conn: Connection) -> None:
+        """Run the built-in BBS as an application on *conn* (N3, ``C BBS``).
+
+        A fresh BBSSession runs on a non-closing view of the link, as its own
+        task so its idle watchdog cancels only the app (returning the user to
+        ``=>``), not the whole node session.  We call ``session.run()`` directly
+        rather than ``_run_session`` — the physical connection is already
+        journaled + evented by the native landing, so routing the sub-app
+        through ``_run_session`` would double-count it."""
+        session = BBSSession(
+            conn=_non_closing_conn(conn),
+            cfg=self.cfg,
+            auth_service=self.auth_service,
+            plugin_registry=self.plugin_registry,
+        )
+        task = asyncio.create_task(
+            session.run(), name=f"node-bbs-app:{conn.remote_addr}"
+        )
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def _make_service_app(
+        self, route: ServiceRoute
+    ) -> "Callable[[Connection], Awaitable[None]]":
+        """Build a runner that hosts ax25d-style service *route* as a node
+        application (N3, ``C <svc>``), on a non-closing view of the link."""
+        async def _run(conn: Connection) -> None:
+            app_conn = _non_closing_conn(conn)
+            argv = self._services.build_argv(route, app_conn)  # type: ignore[union-attr]
+            await run_service(app_conn, route, argv)
+        return _run
+
     def reload_services(self) -> None:
         """Rebuild the service dispatcher from ``self.cfg.services`` and refresh
         the SSID registration list on transports.
@@ -462,6 +745,11 @@ class BBSEngine:
         loop always sees a consistent table.  Routing/lockout/flag changes take
         effect immediately; a *newly added* service SSID is registered with the
         radio on the next transport (re)connect (or a restart).
+
+        Note (N3): the NET/ROM node's ``C <app>`` registry is snapshotted at
+        startup (bind time), so a service added here becomes reachable via the
+        node after a restart — it is reachable by direct-connect immediately.
+        Live app-registry reload is folded into the N4 unified-application work.
         """
         self._services = ServiceDispatcher(self.cfg.services or {})
         svc_calls = self._services.route_callsigns() if self._services.enabled else []
@@ -506,6 +794,20 @@ class BBSEngine:
 
     def plugin_stats_snapshot(self) -> list[dict[str, Any]]:
         return self.plugin_registry.all_stats()
+
+    def netrom_snapshot(self) -> dict[str, Any]:
+        """Thread-safe snapshot of live NET/ROM node activity — active node
+        sessions (who's at ``=>`` or bridged onward) plus gateway-safety state
+        (caps, live count, recent refusals) — for the web node dashboard (N4c).
+        Returns ``{"enabled": False}`` when the node isn't running."""
+        node_plugin = self.plugin_registry.get("node")
+        if node_plugin is None or not getattr(node_plugin, "enabled", False):
+            return {"enabled": False}
+        try:
+            return node_plugin.activity_snapshot()  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("netrom_snapshot failed")
+            return {"enabled": False}
 
     def recent_log_lines(self, n: int = 100) -> list[str]:
         return list(self.log_buffer)[-n:]

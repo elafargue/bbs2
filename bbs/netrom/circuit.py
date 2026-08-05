@@ -788,6 +788,9 @@ class NetromCircuitManager:
             # The L3 destination the user asked to reach (our node call/SSID),
             # so the service dispatcher can route NET/ROM users by called SSID.
             local_addr   = frame.header.dest_call,
+            # The adjacent neighbor whose crosslink carried this circuit — the
+            # node's INTERLOCK guard (N4a) refuses routing it back out this link.
+            netrom_via   = self._via_node,
         )
         task = asyncio.create_task(
             self._run_user_session(circuit, conn),
