@@ -631,3 +631,55 @@ class TestSysopAccess:
             await c.sendln("Q")  # back from configure
             text = await c.wait_for(HEARD_PROMPT)
             assert "HEARD" in text
+
+
+# ---------------------------------------------------------------------------
+# Direct-heard cache (feeds NET/ROM router's best_neighbor_for)
+# ---------------------------------------------------------------------------
+
+class TestDirectHeardCache:
+    async def test_direct_frame_marks_heard_direct(self):
+        p = await _make_plugin()
+        await p.on_heard("KF6ANX-4", "ID", [], int(time.time()), "agwpe", "")
+        assert p.heard_direct_within("KF6ANX-4", 3600) is True
+        assert p.heard_direct_within("kf6anx-4", 3600) is True   # case-insensitive
+        assert p.heard_direct_within("W1AW-9", 3600) is False     # never heard
+
+    async def test_digipeated_frame_not_direct(self):
+        p = await _make_plugin()
+        # A relayed frame (a digi set the H-bit '*') is NOT a direct hearing.
+        await p.on_heard("KF6ANX-4", "ID", ["WIDE1-1*"], int(time.time()), "agwpe", "")
+        assert p.heard_direct_within("KF6ANX-4", 3600) is False
+
+    async def test_ttl_expiry(self):
+        p = await _make_plugin()
+        old = int(time.time()) - 7200          # heard direct 2h ago
+        await p.on_heard("KF6ANX-4", "ID", [], old, "agwpe", "")
+        assert p.heard_direct_within("KF6ANX-4", 3600) is False   # >1h → expired
+        assert p.heard_direct_within("KF6ANX-4", 10800) is True   # <3h → still fresh
+
+    async def test_direct_heard_observer_replays_then_pushes(self):
+        """set_direct_heard_observer replays the seeded cache immediately, then
+        fires on every subsequent direct hearing (N0.5 push to the router)."""
+        p = await _make_plugin()
+        await p.on_heard("KF6ANX-4", "ID", [], int(time.time()), "agwpe", "")
+        pushed: list[tuple[str, float]] = []
+        p.set_direct_heard_observer(lambda call, ts: pushed.append((call, ts)))
+        assert "KF6ANX-4" in [c for c, _ in pushed]          # replayed the cache
+        pushed.clear()
+        await p.on_heard("K6FB-5", "ID", [], int(time.time()), "agwpe", "")  # live
+        assert pushed and pushed[0][0] == "K6FB-5"
+        # A digipeated (non-direct) hearing must NOT push.
+        pushed.clear()
+        await p.on_heard("N6ZX-5", "ID", ["WIDE1-1*"], int(time.time()), "agwpe", "")
+        assert pushed == []
+
+    async def test_cache_seeded_from_db_on_restart(self):
+        p1 = await _make_plugin()
+        db_path = p1._db_path
+        await p1.on_heard("KF6ANX-4", "ID", [], int(time.time()), "agwpe", "")
+        # A fresh plugin over the SAME db seeds its cache from persisted rows —
+        # this is what makes direct-heard survive a BBS restart.
+        p2 = HeardPlugin()
+        await p2.initialize({"enabled": True, "max_age_hours": 24}, db_path)
+        assert p2.heard_direct_within("KF6ANX-4", 3600) is True

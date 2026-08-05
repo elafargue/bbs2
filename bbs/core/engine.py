@@ -142,6 +142,9 @@ class BBSEngine:
                 advertise_self_only=bool(
                     netrom_cfg.get("advertise_self_only", True)
                 ),
+                direct_heard_ttl_seconds=int(
+                    netrom_cfg.get("direct_heard_ttl_minutes", 60)
+                ) * 60,
             )
             # Seed the in-memory routing table from the heard plugin's
             # netrom_routes table so we don't begin every restart with
@@ -166,6 +169,16 @@ class BBSEngine:
                     heard_plugin.on_netrom_nodes  # type: ignore[attr-defined]
                 )
                 logger.info("NETROM nodes observer wired to heard plugin")
+                # Adjacency enrichment (N0.5): the heard plugin PUSHES RF
+                # direct-hearings into the router (replaying its DB-seeded cache
+                # immediately, then live), so the router — the single adjacency
+                # authority — treats nodes we hear on the air as 1-hop neighbors
+                # even right after a restart.  Optional: absent/disabled heard
+                # just means the router relies on crosslinks + NODES routes.
+                heard_plugin.set_direct_heard_observer(  # type: ignore[attr-defined]
+                    netrom_router.note_heard_direct
+                )
+                logger.info("NETROM router direct-heard enrichment wired (push)")
             nodes_interval_s = max(1, int(netrom_cfg.get("nodes_interval", 30))) * 60
             # Outbound NETROM L3 info-MTU.  Default 108 = PACLEN 128 - 20.
             # Operators with a different direwolf.conf PACLEN must set this
@@ -177,20 +190,19 @@ class BBSEngine:
             # the Linux AX.25 IDLE=0 default). Frees the link and stops needless
             # T3 keepalives once the last circuit closes.
             link_idle_timeout = float(netrom_cfg.get("link_idle_timeout", 900))
-            # Classification of incoming AX.25 connections as NETROM vs.
-            # direct BBS is delegated to a router-lookup closure.  Captures
-            # `netrom_router` by reference so the set is always current.
-            def _is_netrom_neighbor(
-                call: str, _router=netrom_router
-            ) -> bool:
-                return call.upper() in _router.adjacent_neighbors
+            # Classification of incoming AX.25 connections as NETROM vs. direct
+            # BBS delegates to the router's single adjacency authority
+            # (is_direct_neighbor): live crosslink, or a known node heard
+            # directly / with a fresh direct route.
             for t in transports:
                 t.set_netrom_observer(netrom_router.on_netrom_frame)
                 t.set_netrom_nodes_interval(nodes_interval_s)
                 # Accept inbound NETROM L3 crosslinks on transports that can
                 # demultiplex them (AGWPE today; no-op elsewhere).
                 t.set_netrom_crosslink_enabled(True)
-                t.set_netrom_neighbor_check(_is_netrom_neighbor)
+                t.set_netrom_neighbor_check(netrom_router.is_direct_neighbor)
+                # A live crosslink is proof of adjacency — feed it back in.
+                t.set_netrom_crosslink_observer(netrom_router.note_crosslink)
                 t.set_netrom_info_mtu(info_mtu)
                 t.set_netrom_link_idle_timeout(link_idle_timeout)
                 if netrom_alias:
@@ -203,6 +215,22 @@ class BBSEngine:
                 self.cfg.full_callsign, len(transports),
                 netrom_alias if netrom_alias else "(listen-only, no alias set)",
             )
+
+            # Wire the NET/ROM node command layer (N2): bind the '@' menu plugin
+            # to the router + crosslink-capable transports so users can enter the
+            # node and connect onward.  Binding also enables the plugin (it stays
+            # disabled/hidden on stations without a netrom: block).
+            node_plugin = self.plugin_registry.get("node")
+            if node_plugin is not None:
+                node_plugin.bind(  # type: ignore[attr-defined]
+                    router=netrom_router,
+                    transports=transports,
+                    node_call=self.cfg.full_callsign,
+                    node_alias=netrom_alias or self.cfg.full_callsign,
+                    connect_timeout=float(netrom_cfg.get("connect_timeout", 60.0)),
+                    min_quality=int(netrom_cfg.get("connect_min_quality", 1)),
+                    max_gateways=int(netrom_cfg.get("max_gateway_circuits", 4)),
+                )
 
         # Wire ax25d-style external-service hosting.  The dispatcher routes an
         # inbound connection (by called SSID) to an external program instead of

@@ -268,8 +268,14 @@ class TestInformation:
         return mgr.active_circuits[0]
 
     def _info(self, circuit: NetromCircuit, payload: bytes,
-              more_follows: bool = False, tx_seq: int = 0) -> Information:
+              more_follows: bool = False, tx_seq: int | None = None) -> Information:
         flags = OPCODE_INFORMATION | (FLAG_MORE_FOLLOWS if more_follows else 0)
+        # A real peer sends each INFO frame with tx_seq = its V(S), which for
+        # in-order delivery equals our V(R).  Default to that so successive
+        # frames carry incrementing sequence numbers (the duplicate guard in
+        # handle_information relies on tx_seq matching V(R)).
+        if tx_seq is None:
+            tx_seq = circuit.vr
         header = L3Header(
             origin_call  = circuit.origin_node_call,
             dest_call    = circuit.local_call,
@@ -324,6 +330,27 @@ class TestInformation:
         await mgr.dispatch(self._info(circuit, b"baz", more_follows=False))
         data = await asyncio.wait_for(circuit.reader.read(9), timeout=1.0)
         assert data == b"foobarbaz"
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_duplicate_info_not_redelivered(self, setup):
+        """A retransmitted INFO (tx_seq already consumed) must be re-ACKed but
+        NOT fed to the reader again — otherwise the far node's output (e.g. a
+        node's help menu) duplicates on the user's screen."""
+        mgr, ax25, sessions = setup
+        circuit = await self._connect(setup)
+        await mgr.dispatch(self._info(circuit, b"hello\r"))     # tx_seq = V(R)
+        assert (await asyncio.wait_for(circuit.reader.read(6), timeout=1.0)) == b"hello\r"
+        vr_after = circuit.vr
+        ax25.frames.clear()
+        # Peer didn't get our ACK → retransmits the SAME frame (stale tx_seq).
+        dup = self._info(circuit, b"hello\r", tx_seq=(vr_after - 1) & 0xFF)
+        await mgr.dispatch(dup)
+        assert circuit.vr == vr_after                           # V(R) not advanced
+        assert circuit.reader._buffer.__len__() == 0            # not re-delivered
+        acks = [f for f in ax25.frames
+                if (decode_l3_header(f).opcode_flags & 0x07) == OPCODE_INFORMATION_ACK]
+        assert len(acks) == 1                                   # but re-ACKed
         sessions.release_all()
         await asyncio.sleep(0)
 
@@ -903,6 +930,32 @@ async def _open_one(mgr) -> NetromCircuit:
 
 
 class TestIdleReaper:
+    async def test_construction_arms_reaper_for_circuitless_crosslink(self):
+        """A crosslink born with zero circuits (e.g. an outbound connect_out
+        link before/without originate_circuit) must arm the reaper at
+        construction so it self-disconnects instead of leaking."""
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        assert mgr._idle_handle is not None        # armed immediately, no circuit
+        mgr._reap_idle()                           # circuit-less → reaps
+        assert ax25.closed is True
+        mgr._cancel_idle_timer()                   # don't leak the pending timer
+
+    async def test_construction_no_arm_when_disabled(self):
+        """link_idle_timeout <= 0 keeps the crosslink up indefinitely, even
+        when born circuit-less."""
+        mgr, ax25, sessions = _mgr_with_idle(0.0)
+        assert mgr._idle_handle is None
+        assert ax25.closed is False
+
+    async def test_first_circuit_cancels_construction_timer(self):
+        """Opening the first circuit on a freshly-built crosslink cancels the
+        construction-armed reaper."""
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        assert mgr._idle_handle is not None
+        await _open_one(mgr)
+        assert mgr._idle_handle is None            # first circuit cancelled it
+        sessions.release_all(); await asyncio.sleep(0)
+
     async def test_last_circuit_close_arms_timer(self):
         mgr, ax25, sessions = _mgr_with_idle(60.0)
         c = await _open_one(mgr)

@@ -15,7 +15,10 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, Callable, Awaitable, Optional
+
+if TYPE_CHECKING:
+    from bbs.netrom.circuit import NetromCircuitManager
 
 
 @dataclass
@@ -94,9 +97,24 @@ class Transport(ABC):
     #: Set via set_netrom_nodes_builder(); None if NODES TX is disabled.
     _netrom_nodes_builder: Optional[NetromNodesBuilder] = None
 
+    #: Optional observer for NETROM crosslink up/down — cb(neighbor, up).
+    #: Set via set_netrom_crosslink_observer(); the router's note_crosslink.
+    _netrom_crosslink_observer: "Optional[Callable[[str, bool], None]]" = None
+
     def set_heard_observer(self, cb: HeardFrameCallback) -> None:
         """Register *cb* as the callback for overheard (non-BBS) frames."""
         self._heard_observer = cb
+
+    def set_netrom_crosslink_observer(
+        self, cb: "Callable[[str, bool], None]"
+    ) -> None:
+        """Register ``cb(neighbor, up)`` fired when a NETROM crosslink to a
+        neighbor is established (up=True) or torn down (up=False).
+
+        A live crosslink is definitive proof of one-hop adjacency; the router
+        registers its ``note_crosslink`` here.  Default no-op; AGWPE fires it.
+        """
+        self._netrom_crosslink_observer = cb
 
     def set_netrom_observer(self, cb: NetromFrameCallback) -> None:
         """Register *cb* as the callback for received NETROM UI frames."""
@@ -158,6 +176,22 @@ class Transport(ABC):
         callsign so callers can connect to it.  Default no-op; transports
         that register callsigns with an external engine (AGWPE) override.
         """
+
+    async def connect_netrom(
+        self, neighbor: str
+    ) -> "Optional[NetromCircuitManager]":
+        """Originate (or reuse) a NETROM crosslink to *neighbor* and return
+        its circuit manager, on which the caller can then
+        ``originate_circuit(dest_node, user)``.
+
+        *neighbor* must be an adjacent AX.25 callsign we can reach directly
+        (NET/ROM does its own L3 routing from there).  Returns None on
+        transports that cannot originate NET/ROM crosslinks; AGWPE overrides
+        this to perform the outbound AX.25 connect.  Implementations that do
+        support it may raise ``ConnectionError`` / ``asyncio.TimeoutError``
+        if the crosslink cannot be established.
+        """
+        return None
 
     @abstractmethod
     async def start(self, on_connect: ConnectionCallback) -> None:

@@ -446,6 +446,23 @@ class NetromCircuit:
     # ── Inbound: handle decoded L3 frames ────────────────────────────────────
 
     def handle_information(self, frame: Information) -> None:
+        # Duplicate-frame guard (mod-256).  A NETROM INFO frame carries tx_seq;
+        # V(R) is the next tx_seq we expect.  If the peer didn't receive our
+        # INFO ACK in time it RETRANSMITS the frame with a tx_seq we've already
+        # consumed — feeding that payload again duplicates output to the user
+        # (seen live as a NET/ROM node's help/menu repeating).  Drop the payload
+        # but re-send an INFO ACK so the peer learns we already have it and stops
+        # retransmitting.  (AX.25 ARQ underneath makes true reordering unlikely,
+        # so a mismatch is a duplicate, not an out-of-order deliverable.)
+        if (frame.header.tx_seq & 0xFF) != self.vr:
+            logger.debug(
+                "netrom: circuit %d/%d — duplicate INFO tx_seq=%d (expected "
+                "V(R)=%d); re-ACKing, not re-delivering",
+                self.local_idx, self.local_id, frame.header.tx_seq & 0xFF, self.vr,
+            )
+            self._advance_va(frame.header.rx_seq)
+            self._send_info_ack()
+            return
         if len(self._reassembly) + len(frame.info) > _MAX_REASSEMBLY_BYTES:
             # A MORE_FOLLOWS run that never terminates — drop the partial to
             # keep memory bounded.  We still ACK below so the peer's send
@@ -635,6 +652,17 @@ class NetromCircuitManager:
 
         # Per-circuit BBS session tasks (so we can cancel them on teardown).
         self._user_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+
+        # A crosslink is born circuit-less: for an OUTBOUND link (connect_out)
+        # the circuit is opened later by originate_circuit, and for an INBOUND
+        # link the peer's first CONNECT REQ opens it.  Arm the idle reaper now
+        # so a crosslink that never opens a circuit (bare connect_out with no
+        # follow-up, or an AX.25 link-up with no L3 CONNECT REQ) still self-
+        # disconnects instead of leaking.  Opening the first circuit cancels
+        # this timer (_open_circuit / originate_circuit call _cancel_idle_timer);
+        # link_idle_timeout <= 0 disables it entirely.  No-op if constructed
+        # outside a running loop (arm is guarded).
+        self._arm_idle_timer()
 
     # ── Allocation ───────────────────────────────────────────────────────────
 

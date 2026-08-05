@@ -11,7 +11,7 @@ from bbs.ax25.netrom_frame import (
     decode_nodes_broadcast,
     encode_nodes_broadcast,
 )
-from bbs.netrom.router import NetromRouter, RouteEntry
+from bbs.netrom.router import NetromRouter, RouteEntry, _is_routable_callsign
 
 
 def _nodes_payload(alias: str, entries: list[NodeEntry]) -> bytes:
@@ -233,7 +233,7 @@ class TestNetromRouterBuildNodes:
         )
         payload = _nodes_payload("WBAY", [
             NodeEntry("K2YE-5", "COOL", "K2YE-5", 200),  # → degraded 175 < 180, skipped
-            NodeEntry("KK6-9",  "GOOD", "KK6-9",  220),  # → degraded 195 ≥ 180, kept
+            NodeEntry("KK6XY-9",  "GOOD", "KK6XY-9",  220),  # → degraded 195 ≥ 180, kept
         ])
         asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", payload))
 
@@ -241,7 +241,7 @@ class TestNetromRouterBuildNodes:
         frame = decode_nodes_broadcast("W6ELA-1", result)
         assert frame is not None
         dest_calls = {e.dest_call for e in frame.entries}
-        assert dest_calls == {"KK6-9"}
+        assert dest_calls == {"KK6XY-9"}
 
     def test_payload_returns_none_when_all_skipped(self):
         r = NetromRouter(
@@ -302,10 +302,10 @@ class TestNetromRouterSelfOnlyMode:
         # Seed via a learned NODES broadcast.
         learned = _nodes_payload("WBAY", [
             NodeEntry("K2YE-5", "COOL", "K2YE-5", 200),
-            NodeEntry("KK6-9",  "GOOD", "KK6-9",  220),
+            NodeEntry("KK6XY-9",  "GOOD", "KK6XY-9",  220),
         ])
         asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", learned))
-        # K2YE-5 + KK6-9 (entries) + N6ZX-5 (auto-added source) = 3.
+        # K2YE-5 + KK6XY-9 (entries) + N6ZX-5 (auto-added source) = 3.
         assert r.node_count == 3
         payload = r.build_nodes_payload()
         assert payload is not None
@@ -468,3 +468,212 @@ class TestSeedFromDB:
         qualities = [rt.quality for rt in routes]
         assert qualities == sorted(qualities, reverse=True)
 
+
+# ── N0a: bogus-destination filtering (routing hygiene) ────────────────────────
+
+class TestCallsignValidation:
+    def test_real_callsigns_pass(self):
+        for c in ("W6ELA-1", "K2YE-5", "KF6ANX-4", "N6ZX-5", "WA6KQB-5",
+                  "K6FB", "2E0ABC", "G8BPQ-2", "KN6PE-7"):
+            assert _is_routable_callsign(c), c
+
+    def test_junk_rejected(self):
+        # URONode pseudo-entries, garbage, out-of-range SSIDs.
+        for c in ("ENABLE", "ENABLE-0", "OFF", "OFF-0", "SFRC", "#DIGI",
+                  "", "NODES", "-5", "12345", "K2YE-16"):
+            assert not _is_routable_callsign(c), c
+
+
+class TestNodesSanitization:
+    def test_bogus_dests_never_enter_table(self):
+        r = NetromRouter("W6ELA-1", "PALO")
+        payload = _nodes_payload("MONTC", [
+            NodeEntry("N6ZX-5", "WBAY", "N6ZX-5", 180),      # real
+            NodeEntry("ENABLE-0", "##TEMP", "K2YE-5", 100),  # URONode pseudo-entry
+            NodeEntry("OFF-0", "SFRC", "K2YE-5", 100),       # URONode pseudo-entry
+        ])
+        asyncio.run(r.on_netrom_frame("K2YE-5", "NODES", payload))
+        dests = {rt.dest_call.upper() for rt in r.routing_table}
+        assert "N6ZX-5" in dests
+        assert "K2YE-5" in dests     # broadcast source auto-added as direct neighbor
+        assert not any("ENABLE" in d or "OFF" in d for d in dests)
+
+    def test_observer_also_sees_sanitized_entries(self):
+        # The heard plugin consumes the same frame via the observer — it must
+        # not record the junk destinations either.
+        r = NetromRouter("W6ELA-1", "PALO")
+        seen: list[list[str]] = []
+
+        async def _obs(frame):
+            seen.append([e.dest_call for e in frame.entries])
+
+        r.set_nodes_observer(_obs)
+        payload = _nodes_payload("MONTC", [
+            NodeEntry("N6ZX-5", "WBAY", "N6ZX-5", 180),
+            NodeEntry("OFF-0", "SFRC", "K2YE-5", 100),
+        ])
+        asyncio.run(r.on_netrom_frame("K2YE-5", "NODES", payload))
+        assert seen == [["N6ZX-5"]]
+
+    async def test_seed_skips_bogus_rows(self, tmp_path):
+        now = int(time.time())
+        db = await _make_heard_db(tmp_path, [
+            ("N6ZX-5",   "WBAY",   "N6ZX-5", 180, "N6ZX-5", "WBAY",  now - 60),
+            ("ENABLE-0", "##TEMP", "K2YE-5", 100, "K2YE-5", "MONTC", now - 60),
+        ])
+        r = NetromRouter("W6ELA-1", "PALO")
+        await r.seed_from_db(db)
+        dests = {rt.dest_call.upper() for rt in r.routing_table}
+        assert "N6ZX-5" in dests
+        assert "ENABLE-0" not in dests and "ENABLE" not in dests
+
+
+# ── N0b: outbound next-hop API (trustworthy crosslink target) ─────────────────
+
+class TestOutboundNeighbor:
+    def _direct_and_transit(self):
+        """N6ZX-5 heard direct (q192); also advertised as a transit route by
+        K6FB-5 at higher quality (q220); K2YE-5 reachable only via N6ZX-5."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        asyncio.run(r.on_netrom_frame(
+            "N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 180)])))
+        asyncio.run(r.on_netrom_frame(
+            "K6FB-5", "NODES",
+            _nodes_payload("ROCK", [NodeEntry("N6ZX-5", "WBAY", "K6FB-5", 220)])))
+        return r
+
+    def test_route_is_direct_flag(self):
+        r = self._direct_and_transit()
+        by_via = {rt.via_call: rt for rt in r.get_routes("N6ZX-5")}
+        assert by_via["N6ZX-5"].is_direct is True     # direct link to itself
+        assert by_via["K6FB-5"].is_direct is False    # transit via K6FB-5
+
+    def test_is_direct_neighbor(self):
+        r = self._direct_and_transit()
+        assert r.is_direct_neighbor("N6ZX-5") is True
+        assert r.is_direct_neighbor("K6FB-5") is True
+        assert r.is_direct_neighbor("K2YE-5") is False   # only reachable via N6ZX-5
+
+    def test_best_neighbor_prefers_direct_over_higher_transit(self):
+        r = self._direct_and_transit()
+        # get_route picks the higher-quality transit route…
+        assert r.get_route("N6ZX-5").via_call == "K6FB-5"
+        # …but for originating we prefer the direct link to N6ZX-5 itself.
+        assert r.best_neighbor_for("N6ZX-5") == "N6ZX-5"
+
+    def test_best_neighbor_transit(self):
+        r = self._direct_and_transit()
+        assert r.best_neighbor_for("K2YE-5") == "N6ZX-5"   # crosslink to the neighbor
+        assert r.best_neighbor_for("MONTC") == "N6ZX-5"    # by alias
+
+    def test_best_neighbor_unknown_is_none(self):
+        r = self._direct_and_transit()
+        assert r.best_neighbor_for("W1AW-3") is None
+
+    def test_best_neighbor_min_quality_floor(self):
+        r = NetromRouter("W6ELA-1", "PALO")
+        asyncio.run(r.on_netrom_frame(
+            "N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 60)])))
+        assert r.best_neighbor_for("K2YE-5", min_quality=100) is None
+        assert r.best_neighbor_for("K2YE-5", min_quality=50) == "N6ZX-5"
+
+    def test_best_neighbor_prefers_direct_heard_over_transit(self):
+        """A known dest reachable only via transit is crosslinked to DIRECTLY
+        once we've heard it directly on the air (note_heard_direct)."""
+        r = self._direct_and_transit()
+        assert r.best_neighbor_for("K2YE-5") == "N6ZX-5"      # transit-only in table
+        r.note_heard_direct("K2YE-5")                          # now heard on the air
+        assert r.best_neighbor_for("K2YE-5") == "K2YE-5"       # → direct
+        assert r.best_neighbor_for("MONTC") == "K2YE-5"        # via alias too
+
+    def test_crosslink_makes_direct_even_without_route(self):
+        """A live crosslink is proof of adjacency, even with no NODES route."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        assert r.best_neighbor_for("KF6ANX-4") is None         # unknown, no crosslink
+        r.note_crosslink("KF6ANX-4", up=True)
+        assert r.is_direct_neighbor("KF6ANX-4") is True
+        assert r.best_neighbor_for("KF6ANX-4") == "KF6ANX-4"
+        r.note_crosslink("KF6ANX-4", up=False)
+        assert r.is_direct_neighbor("KF6ANX-4") is False       # link gone
+
+    def test_heard_direct_ignored_for_non_node(self):
+        """Hearing a random (non-node) station directly must NOT make it a
+        crosslink neighbor — known-node gating."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        r.note_heard_direct("W1AW-9")          # a ham we heard, no NET/ROM presence
+        assert r.is_direct_neighbor("W1AW-9") is False
+        assert r.best_neighbor_for("W1AW-9") is None
+
+
+
+class TestAdjacency:
+    """N0.5 — the router as the single adjacency authority, combining NODES
+    routes + RF direct-heard (note_heard_direct) + live crosslinks
+    (note_crosslink)."""
+
+    def _known(self):
+        """N6ZX-5 (WBAY) as a NODES source (→ direct route to itself), which
+        also advertises K2YE-5 (MONTC) as a transit destination."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        asyncio.run(r.on_netrom_frame(
+            "N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 180)])))
+        return r
+
+    def test_nodes_source_is_direct(self):
+        r = self._known()
+        assert r.is_direct_neighbor("N6ZX-5") is True    # source → direct route
+        assert r.is_direct_neighbor("K2YE-5") is False   # transit dest only
+
+    def test_crosslink_is_proof(self):
+        r = self._known()
+        r.note_crosslink("K2YE-5", up=True)
+        assert r.is_direct_neighbor("K2YE-5") is True    # live link overrides
+        r.note_crosslink("K2YE-5", up=False)
+        assert r.is_direct_neighbor("K2YE-5") is False
+
+    def test_heard_direct_within_ttl(self):
+        r = self._known()
+        r.note_heard_direct("K2YE-5")                    # heard now
+        assert r.is_direct_neighbor("K2YE-5") is True
+
+    def test_heard_direct_ttl_expiry(self):
+        r = self._known()
+        r.note_heard_direct("K2YE-5", when=time.time() - 7200)  # 2h ago
+        assert r.is_direct_neighbor("K2YE-5") is False   # default TTL 60m
+
+    def test_graceful_without_heard_or_crosslink(self):
+        """No heard/crosslink pushes → adjacency still works from NODES alone."""
+        r = self._known()
+        assert r.is_direct_neighbor("N6ZX-5") is True    # source direct route
+        assert r.is_direct_neighbor("K2YE-5") is False   # transit only
+
+    def test_adjacent_neighbors_is_coherent_set(self):
+        r = self._known()
+        assert r.adjacent_neighbors == {"N6ZX-5"}        # only the direct one
+        r.note_crosslink("K2YE-5", up=True)
+        assert r.adjacent_neighbors == {"N6ZX-5", "K2YE-5"}
+
+    def test_best_neighbor_first_hop_hardening(self):
+        """Prefer a transit route whose first hop we can reach directly over a
+        higher-quality route whose first hop we cannot."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        now = time.time()
+        # WA6D-5 reachable two ways (post-restart seed style — no source-direct
+        # routes present): higher-q via KO6UN-5 (unreachable), lower-q via N6ZX-5.
+        r._upsert_route(RouteEntry("WA6D-5", "HOGAN", "WA6D-5", 200, "KO6UN-5", "UNRCH", now))
+        r._upsert_route(RouteEntry("WA6D-5", "HOGAN", "WA6D-5", 150, "N6ZX-5", "WBAY", now))
+        r.note_heard_direct("N6ZX-5")                    # only N6ZX-5 is reachable
+        assert r.is_direct_neighbor("KO6UN-5") is False
+        assert r.is_direct_neighbor("N6ZX-5") is True
+        assert r.best_neighbor_for("WA6D-5") == "N6ZX-5"  # skips unreachable KO6UN-5
+
+    def test_best_neighbor_best_effort_when_no_hop_confirmed(self):
+        """If no first hop is confirmed reachable, fall back to the best route
+        rather than refusing it outright."""
+        r = NetromRouter("W6ELA-1", "PALO")
+        now = time.time()
+        r._upsert_route(RouteEntry("WA6D-5", "HOGAN", "WA6D-5", 200, "KO6UN-5", "UNRCH", now))
+        assert r.best_neighbor_for("WA6D-5") == "KO6UN-5"  # best-effort

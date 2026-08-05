@@ -27,6 +27,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
@@ -50,6 +51,25 @@ _MAX_ROUTES_PER_DEST  = 3          # per NET/ROM spec
 # NORCAL convention for direct-RF neighbors.  Used when auto-adding the
 # source of a received NODES broadcast as a direct route to itself.
 _DIRECT_NEIGHBOR_QUALITY = 192
+# How long an RF direct-hearing (note_heard_direct) counts as "still directly
+# reachable" for adjacency.  Overridable via the constructor (engine reads
+# netrom.direct_heard_ttl_minutes, default 60).
+_DIRECT_HEARD_TTL_SECONDS = 60 * 60
+
+# A plausible AX.25 callsign: 1-2 char prefix, a call-area digit, a 1-4 letter
+# suffix, optional -SSID (0-15).  Used to filter NODES junk — URONode emits
+# pseudo-entries like ``##TEMP:ENABLE-0`` and ``SFRC:OFF-0`` for disabled /
+# temporary node-table slots, and garbled callsigns arrive via the mesh — so
+# that non-callsign destinations never enter the routing table, the heard DB,
+# the map or the graph.  (Bit-flipped-but-valid callsigns, e.g. the ELSO
+# WA6KQZ-5/WA6KWB-5 variants, pass this and need the separate alias-collision
+# pass; this only catches things that are not callsigns at all.)
+_CALLSIGN_RE = re.compile(r"^[A-Z0-9]{1,2}[0-9][A-Z]{1,4}(?:-(?:[0-9]|1[0-5]))?$")
+
+
+def _is_routable_callsign(call: str) -> bool:
+    """True iff *call* is a syntactically valid AX.25 callsign(-SSID)."""
+    return bool(_CALLSIGN_RE.match((call or "").upper().strip()))
 
 
 @dataclass
@@ -62,6 +82,13 @@ class RouteEntry:
     via_call: str         # OUR adjacent neighbor (the broadcaster of this entry)
     via_alias: str        # alias of that adjacent neighbor
     last_seen: float      # unix timestamp of last NODES broadcast containing this entry
+
+    @property
+    def is_direct(self) -> bool:
+        """True when this is a direct link to the destination itself (we hear
+        the dest on our own radio), rather than a transit route via another
+        node.  Direct routes are auto-added with ``via_call == dest_call``."""
+        return self.via_call.upper() == self.dest_call.upper()
 
     def __str__(self) -> str:
         age = int(time.time() - self.last_seen)
@@ -86,10 +113,11 @@ class NetromRouter:
         node_call: str,
         node_alias: str,
         *,
-        route_ttl_seconds:    int  = _ROUTE_TTL_SECONDS,
-        hop_cost:             int  = _HOP_COST,
-        min_advert_quality:   int  = _MIN_ADVERT_QUALITY,
-        advertise_self_only:  bool = True,
+        route_ttl_seconds:        int   = _ROUTE_TTL_SECONDS,
+        hop_cost:                 int   = _HOP_COST,
+        min_advert_quality:       int   = _MIN_ADVERT_QUALITY,
+        advertise_self_only:      bool  = True,
+        direct_heard_ttl_seconds: float = _DIRECT_HEARD_TTL_SECONDS,
     ) -> None:
         self._call  = node_call.upper()
         self._alias = node_alias.upper()[:6]
@@ -97,6 +125,16 @@ class NetromRouter:
         # truncated to _MAX_ROUTES_PER_DEST.  Keyed for fast lookup.
         self._routes: dict[str, list[RouteEntry]] = {}
         self._nodes_observer: Optional[NodesFrameCallback] = None
+        # ── Adjacency enrichment (N0.5) ──────────────────────────────────────
+        # The router is the single authority for "is X a directly-reachable
+        # NET/ROM neighbor?", combining three sources: NODES routes (above),
+        # RF direct-heard (fed by the optional heard plugin via
+        # note_heard_direct), and live crosslinks (fed by the transport via
+        # note_crosslink).  Both maps are enrichment — absent sources just mean
+        # less signal, never an error.
+        self._heard_direct: dict[str, float] = {}   # call → unix ts heard DIRECT (RF)
+        self._crosslinks:   set[str]          = set()  # calls with a live AX.25 crosslink
+        self._direct_heard_ttl = float(direct_heard_ttl_seconds)
         self._route_ttl_seconds  = route_ttl_seconds
         self._hop_cost           = hop_cost
         self._min_advert_quality = min_advert_quality
@@ -114,6 +152,29 @@ class NetromRouter:
         """Register *cb* to be called after each NODES broadcast is processed."""
         self._nodes_observer = cb
 
+    # ── Adjacency enrichment (push API) ────────────────────────────────────────
+
+    def note_heard_direct(self, call: str, when: float | None = None) -> None:
+        """Enrich adjacency: we heard *call* DIRECTLY on the air (no digipeater).
+
+        Pushed by the (optional) heard plugin on every direct hearing and once
+        per seeded station at startup.  Enrichment only — if no source ever
+        calls this, adjacency simply relies on live crosslinks + NODES routes.
+        """
+        self._heard_direct[call.upper()] = float(when) if when is not None else time.time()
+
+    def note_crosslink(self, call: str, up: bool) -> None:
+        """Enrich adjacency: a live AX.25 crosslink to *call* opened or closed.
+
+        A live crosslink is definitive proof of one-hop reachability; pushed by
+        the transport at crosslink establish / teardown.
+        """
+        c = call.upper()
+        if up:
+            self._crosslinks.add(c)
+        else:
+            self._crosslinks.discard(c)
+
     # ── Transport observer ────────────────────────────────────────────────────
 
     async def on_netrom_frame(
@@ -127,6 +188,9 @@ class NetromRouter:
         if dest_call.upper() == "NODES":
             frame = decode_nodes_broadcast(src_call, payload)
             if frame is not None:
+                # Sanitize BEFORE both consumers so the routing table AND the
+                # heard plugin (via the observer) only ever see real callsigns.
+                self._sanitize_entries(frame)
                 self._process_nodes(frame)
                 if self._nodes_observer is not None:
                     try:
@@ -137,6 +201,26 @@ class NetromRouter:
                         )
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _sanitize_entries(self, frame: NodesFrame) -> int:
+        """Drop NODES entries whose destination is not a real callsign.
+
+        Filters URONode pseudo-entries (``##TEMP:ENABLE-0``, ``SFRC:OFF-0``) and
+        garbled destinations in place, so neither the routing table nor the
+        heard observer records them.  Returns the count dropped.
+        """
+        clean = [e for e in frame.entries if _is_routable_callsign(e.dest_call)]
+        dropped = len(frame.entries) - len(clean)
+        if dropped:
+            if logger.isEnabledFor(logging.DEBUG):
+                for e in frame.entries:
+                    if not _is_routable_callsign(e.dest_call):
+                        logger.debug(
+                            "netrom: dropping non-callsign NODES dest %r (alias %r) from %s",
+                            e.dest_call, e.alias, frame.source_call,
+                        )
+            frame.entries = clean
+        return dropped
 
     def _upsert_route(self, entry: RouteEntry) -> bool:
         """Insert or refresh *entry* keyed on (dest_call, via_call).
@@ -253,6 +337,10 @@ class NetromRouter:
                     (cutoff,),
                 ) as cursor:
                     async for row in cursor:
+                        # Don't resurrect non-callsign junk persisted before the
+                        # ingest filter existed (it ages out of the DB on its own).
+                        if not _is_routable_callsign(row[0]):
+                            continue
                         entry = RouteEntry(
                             dest_call     = row[0],
                             alias         = row[1] or "",
@@ -336,24 +424,21 @@ class NetromRouter:
 
     @property
     def adjacent_neighbors(self) -> set[str]:
-        """Uppercased callsigns of all our direct NETROM neighbors.
+        """Uppercased callsigns of all nodes we can currently reach in ONE hop.
 
-        A direct neighbor is any node from which we've received a NODES
-        broadcast — that's recorded as the ``via_call`` on every route
-        we've learned from them.  Used by the AGWPE transport to classify
-        incoming AX.25 connections on 'C': a connection from a known
-        neighbor is treated as a NETROM crosslink (no BBS banner sent,
-        wait for the L3 CONNECT REQ), one from an unknown caller is
-        treated as a direct BBS user.
-
-        The set is computed on demand from current router state; cheap
-        for typical NORCAL-scale tables (under 100 destinations).
+        The coherent adjacency set (N0.5): every known node for which
+        :meth:`is_direct_neighbor` is True, plus any live crosslink.  This is
+        the union of the three enrichment sources — NODES-source nodes we still
+        hear, RF direct-heard nodes, and active crosslinks — NOT the raw
+        ``via_call`` set (which was transit-polluted and TTL-fragile).  Callers
+        that classify a single call should use :meth:`is_direct_neighbor`.
         """
-        return {
-            r.via_call.upper()
+        known = {
+            r.dest_call.upper()
             for routes in self._routes.values()
             for r in routes
         }
+        return {c for c in known if self.is_direct_neighbor(c)} | set(self._crosslinks)
 
     def get_route(self, dest: str) -> RouteEntry | None:
         """
@@ -383,6 +468,83 @@ class NetromRouter:
             if routes and routes[0].alias.upper() == dest_up:
                 return list(routes)
         return []
+
+    def _is_known_node(self, call: str) -> bool:
+        """True iff *call* is a NET/ROM node we know about — a destination in the
+        routing table (NODES auto-adds every broadcast source as a dest), a
+        neighbor that advertised routes to us (a route ``via_call``), or a node
+        we currently have a crosslink to.  Gates :meth:`is_direct_neighbor` so
+        that hearing a random (non-node) station's beacon directly does not make
+        it look like a crosslink peer."""
+        c = call.upper()
+        if c in self._routes or c in self._crosslinks:
+            return True
+        return any(
+            r.via_call.upper() == c
+            for routes in self._routes.values()
+            for r in routes
+        )
+
+    def _has_fresh_direct_route(self, call: str) -> bool:
+        """True iff we hold a *direct* NODES route to *call* (``via_call ==
+        dest_call``) still within the route TTL."""
+        cutoff = time.time() - self._route_ttl_seconds
+        return any(
+            r.is_direct and r.last_seen >= cutoff
+            for r in self._routes.get(call.upper(), ())
+        )
+
+    def is_direct_neighbor(self, call: str) -> bool:
+        """The ONE adjacency authority: True iff *call* is a directly-reachable
+        NET/ROM node — reachable in a single AX.25 hop right now.
+
+        Combines all three enrichment sources:
+          - a **live crosslink** to it (definitive proof), OR
+          - it is a **known node** AND either heard **directly** on the air
+            within the direct-heard TTL, OR has a fresh direct NODES route.
+
+        Used for inbound classification (crosslink vs BBS user), outbound
+        next-hop selection, and first-hop hardening.
+        """
+        c = call.upper()
+        if c in self._crosslinks:
+            return True
+        if not self._is_known_node(c):
+            return False
+        if time.time() - self._heard_direct.get(c, 0.0) <= self._direct_heard_ttl:
+            return True
+        return self._has_fresh_direct_route(c)
+
+    def best_neighbor_for(self, dest: str, *, min_quality: int = 1) -> str | None:
+        """The neighbor to open a crosslink to in order to reach *dest* (callsign
+        or alias) — the outbound next-hop for originating a circuit.
+
+        1. If *dest* itself is directly reachable, crosslink straight to it (a
+           fast 1-hop SABM) — even with only transit routes to it, or none.
+        2. Otherwise the highest-quality transit route whose **first hop
+           (via_call) we can also reach directly** (first-hop hardening — avoids
+           a RETRYOUT on a via_call we only hear through a digipeater).
+        3. Best-effort fallback: the highest-quality route even if we can't
+           confirm the first hop, rather than refusing a known route.
+
+        Returns ``None`` if *dest* is unknown or below *min_quality*.
+        """
+        routes = self.get_routes(dest)
+        dest_call = routes[0].dest_call.upper() if routes else dest.upper()
+        # 1. Direct to the destination itself.
+        if _is_routable_callsign(dest_call) and self.is_direct_neighbor(dest_call):
+            return dest_call
+        if not routes:
+            return None
+        usable = [r for r in routes if r.quality >= min_quality]
+        if not usable:
+            return None
+        # 2. Prefer a transit route whose first hop is directly reachable.
+        reachable = next(
+            (r for r in usable if self.is_direct_neighbor(r.via_call)), None
+        )
+        chosen = reachable or usable[0]   # 3. else best-effort (quality-sorted)
+        return chosen.via_call.upper()
 
     def build_nodes_payload(self) -> bytes | None:
         """

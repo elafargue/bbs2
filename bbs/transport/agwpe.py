@@ -449,6 +449,18 @@ class AGWPETransport(Transport):
         # Serialises all drain() calls on the shared AGWPE TCP writer across
         # concurrent session tasks and the beacon loop (Python 3.9 fix).
         self._drain_lock: Optional[asyncio.Lock] = None
+        # The live AGWPE TCP StreamWriter for the current connection, exposed
+        # so out-of-read-loop callers (connect_out) can send frames.  Set after
+        # open_connection() in start(); cleared to None on TCP drop.  None means
+        # "not connected" — connect_out refuses rather than NPE.
+        self._sock_writer: Optional[asyncio.StreamWriter] = None
+        # Outbound NETROM crosslinks awaiting their Direwolf 'C' confirmation.
+        # Keyed by (agw_port, neighbor_upper); the future resolves to the new
+        # crosslink's NetromCircuitManager on 'C', or is failed on 'd'/RETRYOUT,
+        # timeout, or TCP drop.  See connect_out() and the 'C'/'d' dispatch.
+        self._pending_connects: dict[
+            _SessionKey, "asyncio.Future[NetromCircuitManager]"
+        ] = {}
         self._write_timeout: int = int(cfg.get("write_timeout", 30))
         # Optional path for logging raw 'U' monitor strings (useful for test-data capture).
         self._monitor_log: str = cfg.get("monitor_log", "").strip()
@@ -564,6 +576,10 @@ class AGWPETransport(Transport):
                     self._host, self._port, self._local_call, self._agw_port,
                 )
                 retry_delay = 5  # reset back-off after a successful connect
+                # Publish the writer so out-of-read-loop callers (connect_out)
+                # can send frames on this connection.  Paired with the
+                # fresh _drain_lock created above.
+                self._sock_writer = writer
 
                 # Enable TCP keepalives so the OS will probe and tear down the
                 # connection if AGWPE or the host becomes unreachable silently
@@ -630,6 +646,14 @@ class AGWPETransport(Transport):
             except Exception:
                 logger.exception("agwpe unexpected error — reconnecting in %ds", retry_delay)
             finally:
+                # No more out-of-loop sends on this writer, and any connect
+                # awaiting a 'C' confirmation will never get one now — clear the
+                # writer and fail every pending connect future so their callers
+                # unblock instead of hanging until timeout.
+                self._sock_writer = None
+                self._fail_pending_connects(
+                    ConnectionError("agwpe TCP connection lost before connect confirmed")
+                )
                 for _task in (beacon_task, nodes_task):
                     if _task:
                         _task.cancel()
@@ -653,6 +677,7 @@ class AGWPETransport(Transport):
                 for sess in list(self._sessions.values()):
                     if sess.netrom_manager is not None:
                         sess.netrom_manager.shutdown()
+                        self._note_crosslink(sess.remote_call, False)
                     sess.feed_eof()
                 self._sessions.clear()
 
@@ -783,6 +808,54 @@ class AGWPETransport(Transport):
                 )
 
         elif kind == "C":
+            # Outbound-connect confirmation?  Direwolf's 'C' confirmation carries
+            # call_from=remote, call_to=us for BOTH inbound and outbound links
+            # (server_link_established), so address order can't discriminate.
+            # The pending-connect table is the discriminator; the "CONNECTED
+            # With" payload string (server.c:1137) merely corroborates.  This
+            # check runs BEFORE the inbound duplicate-'C' teardown below, so an
+            # outbound confirmation never trips it.
+            pending = self._pending_connects.get(key)
+            if pending is not None:
+                self._pending_connects.pop(key, None)
+                if payload:
+                    try:
+                        _text = payload.decode("ascii", errors="replace")
+                        if "CONNECTED With" not in _text:
+                            logger.warning(
+                                "agwpe: outbound 'C' for %s but payload lacks "
+                                "'CONNECTED With' (%r) — proceeding on pending match",
+                                call_from, _text[:60],
+                            )
+                    except Exception:
+                        pass
+                assert self._drain_lock is not None
+                assert self._on_connect is not None
+                # Build the crosslink session sourced from OUR local call to the
+                # neighbor (call_from).  No BBS session task is started — this
+                # link originates circuits; any inbound circuit arriving on it is
+                # handled by the manager's on_user_connect.
+                sess = _AGWPESession(
+                    call_from, self._local_call, port, writer,
+                    self._drain_lock, self._write_timeout,
+                )
+                sess.netrom_manager = NetromCircuitManager(
+                    local_call        = self._local_call,
+                    via_node          = sess.remote_call,
+                    ax25_writer       = self._make_netrom_writer(sess),
+                    on_user_connect   = self._on_connect,
+                    info_mtu          = self._netrom_info_mtu,
+                    link_idle_timeout = self._netrom_link_idle_timeout,
+                )
+                self._sessions[key] = sess
+                self._note_crosslink(call_from, True)
+                logger.info(
+                    "agwpe: outbound NETROM crosslink to %s established", call_from,
+                )
+                if not pending.done():
+                    pending.set_result(sess.netrom_manager)
+                return
+
             # Incoming connected call — create a new session.
             # Per AX.25 spec, when a TNC receives a SABM while already connected it
             # sends UA back and resets its sequence counters — i.e. it treats the
@@ -805,6 +878,7 @@ class AGWPETransport(Transport):
                     # would leak).
                     if old_sess.netrom_manager is not None:
                         old_sess.netrom_manager.shutdown()
+                        self._note_crosslink(call_from, False)
                     old_sess.feed_eof()
                 old_task = self._session_tasks.pop(key, None)
                 if old_task and not old_task.done():
@@ -858,6 +932,7 @@ class AGWPETransport(Transport):
                     info_mtu        = self._netrom_info_mtu,
                     link_idle_timeout = self._netrom_link_idle_timeout,
                 )
+                self._note_crosslink(call_from, True)
                 logger.info(
                     "agwpe: NETROM crosslink with %s — known neighbor, "
                     "no BBS task started, waiting for L3 CONNECT REQ",
@@ -913,6 +988,30 @@ class AGWPETransport(Transport):
                 sess.feed_data(payload)
 
         elif kind == "d":
+            # Outbound connect failure?  A 'd' while a connect to this neighbor
+            # is pending means the link never came up (RETRYOUT timeout, or a DM
+            # refusal).  Reject the pending future; there is no session to tear
+            # down because the 'C' confirmation that would have created one never
+            # arrived.
+            pending = self._pending_connects.pop(key, None)
+            if pending is not None:
+                reason = ""
+                if payload:
+                    try:
+                        reason = payload.decode("ascii", errors="replace").strip()
+                    except Exception:
+                        reason = ""
+                logger.info(
+                    "agwpe: outbound connect to %s failed/terminated: %s",
+                    call_from, reason or "(link terminated)",
+                )
+                if not pending.done():
+                    pending.set_exception(ConnectionError(
+                        f"connect to {call_from} failed: "
+                        f"{reason or 'link terminated'}"
+                    ))
+                return
+
             # Remote station disconnected
             sess = self._sessions.pop(key, None)
             if sess:
@@ -923,6 +1022,7 @@ class AGWPETransport(Transport):
                 if sess.netrom_manager is not None:
                     # Tear down all NETROM circuits riding on this crosslink.
                     sess.netrom_manager.shutdown()
+                    self._note_crosslink(call_from, False)
                 sess.feed_eof()
             else:
                 logger.warning(
@@ -1031,6 +1131,19 @@ class AGWPETransport(Transport):
 
     # ── NETROM crosslink classifier (Milestone 3) ─────────────────────────────
 
+    def _note_crosslink(self, call: str, up: bool) -> None:
+        """Tell the adjacency observer (router.note_crosslink) that a NETROM
+        crosslink to *call* went up/down.  A live crosslink is proof of one-hop
+        adjacency.  No-op when unwired."""
+        if self._netrom_crosslink_observer is not None:
+            try:
+                self._netrom_crosslink_observer(call.upper(), up)
+            except Exception:
+                logger.debug(
+                    "agwpe: netrom crosslink observer failed for %s up=%s",
+                    call, up, exc_info=True,
+                )
+
     def _make_netrom_writer(
         self, sess: _AGWPESession
     ) -> _AGWPEVirtualWriter:
@@ -1121,7 +1234,119 @@ class AGWPETransport(Transport):
             info_mtu        = self._netrom_info_mtu,
             link_idle_timeout = self._netrom_link_idle_timeout,
         )
+        self._note_crosslink(sess.remote_call, True)
         sess.pending_classification = False
+
+    # ── Outbound NETROM crosslink origination (N1) ─────────────────────────────
+
+    async def connect_netrom(
+        self, neighbor: str
+    ) -> Optional[NetromCircuitManager]:
+        """Transport-interface override: originate (or reuse) a NETROM
+        crosslink to *neighbor*.  Thin wrapper over :meth:`connect_out`
+        with the default timeout so the engine/node layer can call it
+        polymorphically."""
+        return await self.connect_out(neighbor)
+
+    async def connect_out(
+        self, neighbor: str, *, timeout: float = 30.0
+    ) -> NetromCircuitManager:
+        """Originate an AX.25 crosslink to NETROM *neighbor* and return the
+        :class:`NetromCircuitManager` that owns it.
+
+        We *originate* the AX.25 connect (AGWPE 'C' frame from our registered
+        local callsign to *neighbor*).  When Direwolf confirms the link with
+        its own 'C' frame, the dispatch path builds the crosslink session +
+        manager and resolves the future this coroutine awaits.
+
+        Behaviour:
+          - **Reuse**: if a crosslink to *neighbor* already exists (inbound or
+            outbound) with a manager, return that manager immediately — no new
+            connect.
+          - **Coalesce**: concurrent calls to the same neighbor share one
+            in-flight connect / one future.
+          - **Timeout / failure**: raises ``asyncio.TimeoutError`` if no 'C'
+            confirmation arrives within *timeout*; ``ConnectionError`` on a
+            'd'/RETRYOUT rejection or if the AGWPE TCP link drops meanwhile.
+          - Raises ``ConnectionError`` if we are not currently connected to
+            AGWPE.
+
+        The returned manager is *connected at the AX.25 layer only*; the caller
+        (N2) then does ``await mgr.originate_circuit(dest_node, user)`` to open
+        a NET/ROM circuit over it.  Idle teardown is handled by the reaper.
+        """
+        neighbor_u = neighbor.upper()
+        key: _SessionKey = (self._agw_port, neighbor_u)
+
+        # Reuse an existing crosslink (inbound or outbound) to this neighbor.
+        sess = self._sessions.get(key)
+        if sess is not None and sess.netrom_manager is not None:
+            logger.info(
+                "agwpe: reusing existing NETROM crosslink to %s for connect_out",
+                neighbor_u,
+            )
+            return sess.netrom_manager
+
+        # Coalesce onto an in-flight connect to the same neighbor.
+        existing = self._pending_connects.get(key)
+        if existing is not None:
+            logger.debug(
+                "agwpe: connect_out to %s coalesced onto in-flight connect",
+                neighbor_u,
+            )
+            return await existing
+
+        if self._sock_writer is None or self._drain_lock is None:
+            raise ConnectionError(
+                "agwpe: not connected to AGWPE — cannot originate crosslink "
+                f"to {neighbor_u}"
+            )
+
+        loop = asyncio.get_running_loop()
+        fut: "asyncio.Future[NetromCircuitManager]" = loop.create_future()
+        self._pending_connects[key] = fut
+
+        # Send the connect: AGWPE 'C', call_from = our (registered) local call,
+        # call_to = neighbor, on our AGW port.  NET/ROM rides as separate 'D'
+        # frames at PID=0xCF later; the connect itself is fine at PID=0xF0.
+        frame = _build_frame(self._agw_port, "C", self._local_call, neighbor_u)
+        try:
+            self._sock_writer.write(frame)
+            async with self._drain_lock:
+                await self._sock_writer.drain()
+        except Exception as exc:
+            self._pending_connects.pop(key, None)
+            if not fut.done():
+                fut.cancel()
+            raise ConnectionError(
+                f"agwpe: failed to send connect to {neighbor_u}: {exc}"
+            ) from exc
+
+        logger.info(
+            "agwpe: originating NETROM crosslink %s → %s (timeout %.0fs)",
+            self._local_call, neighbor_u, timeout,
+        )
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._pending_connects.pop(key, None)
+            logger.warning(
+                "agwpe: connect_out to %s timed out after %.0fs (no 'C' "
+                "confirmation)", neighbor_u, timeout,
+            )
+            raise
+
+    def _fail_pending_connects(self, exc: Exception) -> None:
+        """Fail every pending connect future with *exc* and clear the table.
+
+        Called on TCP drop (in ``start()``'s finally): a connect awaiting a 'C'
+        confirmation on the dropped link will never get one, so unblock its
+        caller with an error instead of leaving it to time out.
+        """
+        for fut in self._pending_connects.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending_connects.clear()
 
     # ── Beacon ────────────────────────────────────────────────────────────────
 

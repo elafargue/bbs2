@@ -34,7 +34,9 @@ from bbs.transport.agwpe import (
     _parse_info,
     _parse_via,
 )
-from bbs.transport.base import Connection
+from bbs.ax25.netrom_frame import PID_NETROM
+from bbs.netrom.circuit import NetromCircuitManager
+from bbs.transport.base import Connection, Transport
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -770,3 +772,261 @@ class TestReadLoopIsolatesDispatchErrors:
 
         with pytest.raises(asyncio.CancelledError):
             await transport._read_loop(reader, _FakeWriter())  # type: ignore[arg-type]
+
+
+# ─── N1: outbound NETROM crosslink origination (connect_out) ──────────────────
+
+def _iter_headers(buf: bytes):
+    """Yield unpacked header dicts for each AGWPE frame in *buf*."""
+    i = 0
+    while i + _HEADER_SIZE <= len(buf):
+        h = _unpack_header(buf[i:])
+        yield h
+        i += _HEADER_SIZE + h["data_len"]
+
+
+def _count_kind(buf: bytes, kind: str) -> int:
+    return sum(1 for h in _iter_headers(buf) if h["kind"] == kind)
+
+
+_CONNECTED_WITH = b"*** CONNECTED With Station W6ELA-2\r"
+_RETRYOUT       = b"*** DISCONNECTED RETRYOUT With W6ELA-2\r"
+
+
+class TestConnectOut:
+    """N1: originate an outbound AX.25 crosslink to a NETROM neighbor.
+
+    Drives connect_out() against a fake AGWPE socket writer and simulates
+    Direwolf's 'C' confirmation / 'd' rejection by feeding _dispatch().
+    """
+
+    def _make_connected_transport(self):
+        """Transport wired as if the AGWPE TCP link is up and registered."""
+        t = _make_transport()
+        t._running = True
+        t._drain_lock = asyncio.Lock()
+        fw = _FakeWriter()
+        t._sock_writer = fw  # type: ignore[assignment]
+
+        async def _on_connect(conn: Connection) -> None:
+            try:
+                while await conn.reader.read(1024):
+                    pass
+            except Exception:
+                pass
+
+        t._on_connect = _on_connect
+        return t, fw
+
+    async def test_connect_out_sends_wellformed_C(self):
+        """connect_out emits a 'C' frame from our call to the neighbor."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        try:
+            hdrs = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "C"]
+            assert len(hdrs) == 1
+            assert hdrs[0]["call_from"] == "N0CALL-1"
+            assert hdrs[0]["call_to"] == "W6ELA-2"
+            assert (0, "W6ELA-2") in t._pending_connects
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_connect_out_confirmation_returns_manager(self):
+        """Simulated 'C' confirmation resolves connect_out to a manager and
+        registers the crosslink session."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr = await asyncio.wait_for(task, timeout=1.0)
+        assert isinstance(mgr, NetromCircuitManager)
+        assert (0, "W6ELA-2") in t._sessions
+        assert t._sessions[(0, "W6ELA-2")].netrom_manager is mgr
+        # pending entry consumed
+        assert (0, "W6ELA-2") not in t._pending_connects
+
+    async def test_connect_out_no_bbs_session_task_started(self):
+        """The outbound crosslink must NOT spin up a BBS session task."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+        assert (0, "W6ELA-2") not in t._session_tasks
+
+    async def test_originate_circuit_works_over_new_crosslink(self):
+        """After connect_out, originate_circuit sends a NETROM CONNECT REQ
+        ('D' frame, PID=0xCF) out on the same socket writer."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr = await asyncio.wait_for(task, timeout=1.0)
+
+        fw.written.clear()
+        # originate_circuit blocks awaiting a CONNECT ACK that never comes;
+        # run it briefly, then verify the CONNECT REQ went on the wire.
+        oc = asyncio.create_task(mgr.originate_circuit("W6ELA-2", "N0USER-1"))
+        await asyncio.sleep(0)
+        try:
+            d_frames = [h for h in _iter_headers(bytes(fw.written)) if h["kind"] == "D"]
+            assert len(d_frames) == 1
+            assert d_frames[0]["pid"] == PID_NETROM
+            assert d_frames[0]["call_from"] == "N0CALL-1"
+            assert d_frames[0]["call_to"] == "W6ELA-2"
+        finally:
+            oc.cancel()
+            try:
+                await oc
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_retryout_rejects_connect(self):
+        """A 'd'/RETRYOUT while pending → connect_out raises ConnectionError."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "d", 0, "W6ELA-2", "N0CALL-1", 0, _RETRYOUT, fw,  # type: ignore[arg-type]
+        )
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert (0, "W6ELA-2") not in t._sessions
+        assert (0, "W6ELA-2") not in t._pending_connects
+
+    async def test_reuse_returns_existing_manager(self):
+        """A second connect_out to a neighbor with an existing crosslink returns
+        the same manager and sends no new 'C'."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr1 = await asyncio.wait_for(task, timeout=1.0)
+
+        fw.written.clear()
+        mgr2 = await t.connect_out("W6ELA-2")
+        assert mgr2 is mgr1
+        assert _count_kind(bytes(fw.written), "C") == 0
+
+    async def test_concurrent_connects_coalesce(self):
+        """Two concurrent connect_out to the same neighbor share one 'C' and one
+        future, both resolving to the same manager."""
+        t, fw = self._make_connected_transport()
+        task1 = asyncio.create_task(t.connect_out("W6ELA-2"))
+        task2 = asyncio.create_task(t.connect_out("W6ELA-2"))
+        # Let both run up to their awaits.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert _count_kind(bytes(fw.written), "C") == 1
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr1 = await asyncio.wait_for(task1, timeout=1.0)
+        mgr2 = await asyncio.wait_for(task2, timeout=1.0)
+        assert mgr1 is mgr2
+
+    async def test_timeout_cleans_up_pending(self):
+        """No confirmation → TimeoutError and the pending entry is removed."""
+        t, fw = self._make_connected_transport()
+        with pytest.raises(asyncio.TimeoutError):
+            await t.connect_out("W6ELA-2", timeout=0.05)
+        assert (0, "W6ELA-2") not in t._pending_connects
+
+    async def test_not_connected_raises(self):
+        """connect_out with no live socket writer raises ConnectionError."""
+        t = _make_transport()
+        t._running = True
+        t._drain_lock = asyncio.Lock()
+        t._sock_writer = None
+        with pytest.raises(ConnectionError):
+            await t.connect_out("W6ELA-2")
+
+    async def test_tcp_drop_fails_pending(self):
+        """Simulated TCP drop fails an in-flight connect future."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        assert (0, "W6ELA-2") in t._pending_connects
+        # Mirror start()'s finally-block cleanup on TCP drop.
+        t._sock_writer = None
+        t._fail_pending_connects(ConnectionError("TCP lost"))
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert not t._pending_connects
+
+    async def test_crosslink_observer_fires_up_and_down(self):
+        """A live crosslink is proof of adjacency — connect_out fires the
+        observer up on confirmation and down on teardown (N0.5)."""
+        t, fw = self._make_connected_transport()
+        events: list[tuple[str, bool]] = []
+        t.set_netrom_crosslink_observer(lambda call, up: events.append((call, up)))
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch("C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw)  # type: ignore[arg-type]
+        await asyncio.wait_for(task, timeout=1.0)
+        assert ("W6ELA-2", True) in events
+        await t._dispatch("d", 0, "W6ELA-2", "N0CALL-1", 0, b"", fw)  # type: ignore[arg-type]
+        assert ("W6ELA-2", False) in events
+
+    async def test_confirmation_C_does_not_trip_duplicate_teardown(self):
+        """An outbound 'C' confirmation must be handled by the pending path,
+        not the inbound duplicate-'C' reconnect teardown."""
+        t, fw = self._make_connected_transport()
+        task = asyncio.create_task(t.connect_out("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr = await asyncio.wait_for(task, timeout=1.0)
+        # A duplicate inbound-style 'C' now (no pending) should replace the
+        # session — proving the first 'C' created exactly one crosslink and the
+        # pending path returned before the duplicate logic.
+        assert t._sessions[(0, "W6ELA-2")].netrom_manager is mgr
+
+
+class TestConnectNetromBaseDefault:
+    """base.Transport.connect_netrom default returns None."""
+
+    async def test_default_returns_none(self):
+        class _StubTransport(Transport):
+            async def start(self, on_connect):  # pragma: no cover - trivial
+                pass
+
+            async def stop(self):  # pragma: no cover - trivial
+                pass
+
+        t = _StubTransport()
+        assert await t.connect_netrom("W6ELA-2") is None
+
+    async def test_agwpe_connect_netrom_delegates_to_connect_out(self):
+        """AGWPE override returns the manager connect_out produced."""
+        t = _make_transport()
+        t._running = True
+        t._drain_lock = asyncio.Lock()
+        fw = _FakeWriter()
+        t._sock_writer = fw  # type: ignore[assignment]
+
+        async def _on_connect(conn: Connection) -> None:
+            pass
+
+        t._on_connect = _on_connect
+        task = asyncio.create_task(t.connect_netrom("W6ELA-2"))
+        await asyncio.sleep(0)
+        await t._dispatch(
+            "C", 0, "W6ELA-2", "N0CALL-1", 0, _CONNECTED_WITH, fw,  # type: ignore[arg-type]
+        )
+        mgr = await asyncio.wait_for(task, timeout=1.0)
+        assert isinstance(mgr, NetromCircuitManager)

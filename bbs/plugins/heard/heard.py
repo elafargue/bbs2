@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from bbs.ax25.netrom_frame import NodesFrame
 
@@ -332,6 +332,16 @@ class HeardPlugin(BBSPlugin):
         # Ka-Node alias → owner callsign (e.g. 'KROCK' → 'K6FB-5').
         # Loaded at startup, refreshed when sysop saves a kanode_alias.
         self._kanode_map: dict[str, str] = {}
+        # callsign → unix ts we last heard it *directly* (no digipeater H-bit).
+        # Seeded from the DB at startup and updated on every direct on_heard.
+        # This is the RF direct-heard source of truth; it is *pushed* into the
+        # NET/ROM router (which owns adjacency) via _direct_heard_observer, so
+        # the router can treat a node we hear on the air as a 1-hop neighbor.
+        self._direct_heard: dict[str, int] = {}
+        # Optional push sink: cb(call, ts) called for each seeded station when
+        # wired, and on every subsequent direct hearing.  The router registers
+        # its note_heard_direct here.  None when nothing consumes it.
+        self._direct_heard_observer: Optional[Callable[[str, float], None]] = None
 
     async def initialize(self, cfg: dict[str, Any], db_path: str) -> None:
         await super().initialize(cfg, db_path)
@@ -362,6 +372,47 @@ class HeardPlugin(BBSPlugin):
 
         self._max_age_hours = await self._load_max_age()
         await self._refresh_kanode_map()
+        await self._load_direct_heard()
+
+    async def _load_direct_heard(self) -> None:
+        """Seed the in-memory direct-heard cache from the DB so "heard directly"
+        survives a restart — otherwise the NET/ROM router would fall back to slow
+        transit routing on every cold start until each neighbor re-beacons."""
+        cache: dict[str, int] = {}
+        try:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                async with db.execute(
+                    "SELECT callsign, MAX(last_direct_heard) FROM heard_events "
+                    "WHERE last_direct_heard > 0 GROUP BY callsign"
+                ) as cur:
+                    async for call, ts in cur:
+                        if call and ts:
+                            cache[str(call).upper()] = int(ts)
+        except Exception:
+            logger.debug("heard: direct-heard cache seed skipped", exc_info=True)
+        self._direct_heard = cache
+        logger.info("heard: direct-heard cache seeded with %d station(s)", len(cache))
+
+    def heard_direct_within(self, call: str, seconds: int) -> bool:
+        """True iff *call* was heard directly (no digipeater) within the last
+        *seconds*.  Synchronous (backed by the in-memory cache)."""
+        ts = self._direct_heard.get(call.upper(), 0)
+        return ts > 0 and (int(time.time()) - ts) <= max(0, seconds)
+
+    def set_direct_heard_observer(
+        self, cb: "Callable[[str, float], None]"
+    ) -> None:
+        """Register a push sink for RF direct hearings (the NET/ROM router's
+        ``note_heard_direct``).  Immediately replays the currently-seeded cache
+        so adjacency is populated right after startup, then fires on every
+        subsequent direct ``on_heard``.  Optional — nothing breaks if unset."""
+        self._direct_heard_observer = cb
+        for call, ts in list(self._direct_heard.items()):
+            try:
+                cb(call, float(ts))
+            except Exception:
+                logger.debug("direct-heard observer replay failed for %s", call,
+                             exc_info=True)
 
     # ── Schema migrations ─────────────────────────────────────────────────────
 
@@ -799,6 +850,15 @@ class HeardPlugin(BBSPlugin):
         # BBS heard it straight from the source station.
         is_direct = not any(v.endswith("*") for v in via)
         via_base  = ",".join(v.rstrip("*") for v in via)  # normalised for digi rows
+        if is_direct:
+            # Keep the direct-heard cache current and push to the NET/ROM router.
+            self._direct_heard[src_up] = ts
+            if self._direct_heard_observer is not None:
+                try:
+                    self._direct_heard_observer(src_up, float(ts))
+                except Exception:
+                    logger.debug("direct-heard observer push failed for %s",
+                                 src_up, exc_info=True)
 
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
             # ── stations: ensure identity row exists ──────────────────────────
