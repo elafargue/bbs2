@@ -163,6 +163,14 @@ class BBSEngine:
         if not transports:
             logger.warning("No transports enabled! Check bbs.yaml.")
 
+        # Persist per-transport broadcast timestamps beside the DB so a restart
+        # honours the beacon / NODES cadence instead of transmitting immediately.
+        _state_dir = self.cfg.db_path.parent
+        for t in transports:
+            t.set_broadcast_state_path(
+                str(_state_dir / f"broadcast_state_{t.transport_id}.json")
+            )
+
         # Wire heard-station observer onto supporting transports
         heard_plugin = self.plugin_registry.get("heard")
         if heard_plugin is not None and heard_plugin.enabled:
@@ -207,7 +215,19 @@ class BBSEngine:
                 direct_heard_ttl_seconds=int(
                     netrom_cfg.get("direct_heard_ttl_minutes", 60)
                 ) * 60,
+                # N5 routing fidelity (1987 PARMS): compose advertised route
+                # qualities through our per-neighbour link (path) quality.
+                channel_quality=int(netrom_cfg.get("channel_quality", 192)),
+                neighbour_quality=netrom_cfg.get("neighbour_quality") or {},
+                worst_quality=int(netrom_cfg.get("worst_quality", 1)),
+                max_destinations=int(netrom_cfg.get("max_destinations", 200)),
+                obs_initializer=int(netrom_cfg.get("obs_initializer", 6)),
+                obs_min_to_broadcast=int(netrom_cfg.get("obs_min_to_broadcast", 5)),
             )
+            # N5b/b2: the router owns and persists the netrom_routes +
+            # netrom_neighbours tables (composed quality + obsolescence), so
+            # adjacency + link qualities survive a restart.
+            netrom_router.set_db_path(str(self.cfg.db_path))
             # Seed the in-memory routing table from the heard plugin's
             # netrom_routes table so we don't begin every restart with
             # an empty router (which would suppress NODES TX for ~30 min).
@@ -305,6 +325,11 @@ class BBSEngine:
                     apps=self._netrom_apps,
                     # N4a: gateway-safety policy (ACL / INTERLOCK / rate / caps).
                     gateway_policy=GatewayPolicy.from_netrom_cfg(netrom_cfg),
+                    # N5c: MH source — recently RF-heard stations (heard plugin).
+                    heard_recent=(
+                        heard_plugin.recent_direct_heard  # type: ignore[union-attr]
+                        if heard_plugin is not None and heard_plugin.enabled else None
+                    ),
                     connect_timeout=float(netrom_cfg.get("connect_timeout", 60.0)),
                     min_quality=int(netrom_cfg.get("connect_min_quality", 1)),
                     max_gateways=int(netrom_cfg.get("max_gateway_circuits", 4)),
@@ -327,17 +352,24 @@ class BBSEngine:
             for t in transports
         ]
 
-        # Periodic NETROM route expiry — only runs when the router is wired.
+        # Periodic NETROM obsolescence-count decay (N5b) — replaces the hard-TTL
+        # prune.  Runs at the NODES broadcast cadence (manual p.66: the scan
+        # "occurs with the same frequency as routing broadcasts"): each route's
+        # obs count is decremented and routes at 0 are deleted, while
+        # actively-broadcast routes stay refreshed.  Only runs when wired.
         netrom_prune_task: asyncio.Task | None = None
         if netrom_router is not None:
-            async def _netrom_prune_loop(router=netrom_router) -> None:
+            async def _netrom_decay_loop(
+                router=netrom_router, interval=nodes_interval_s,
+            ) -> None:
                 while True:
-                    await asyncio.sleep(60)
-                    n = router.prune_stale_routes()
+                    await asyncio.sleep(interval)
+                    n = router.decay_obsolescence()
                     if n:
-                        logger.info("netrom: pruned %d stale route(s)", n)
+                        logger.info("netrom: obsolescence scan deleted %d route(s)", n)
+                    await router.persist()   # snapshot after decay (prunes the DB)
             netrom_prune_task = asyncio.create_task(
-                _netrom_prune_loop(), name="netrom:prune"
+                _netrom_decay_loop(), name="netrom:decay"
             )
 
         self._emit_log(f"BBS {self.cfg.full_callsign} online — {len(transports)} transport(s)")

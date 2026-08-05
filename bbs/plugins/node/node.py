@@ -45,6 +45,7 @@ class NetromNodePlugin(BBSPlugin):
         self._node_call: str = ""
         self._node_alias: str = ""
         self._apps: dict[str, "LocalAppRunner"] = {}
+        self._heard_recent: Optional[Callable[[], list]] = None
         self._connect_timeout: float = 60.0
         self._min_quality: int = 1
         self._max_gateways: int = 4
@@ -63,6 +64,7 @@ class NetromNodePlugin(BBSPlugin):
         node_alias: str,
         apps: Optional[dict[str, "LocalAppRunner"]] = None,
         gateway_policy: Optional[GatewayPolicy] = None,
+        heard_recent: Optional[Callable[[], list]] = None,
         connect_timeout: float = 60.0,
         min_quality: int = 1,
         max_gateways: int = 4,
@@ -73,6 +75,7 @@ class NetromNodePlugin(BBSPlugin):
         self._node_call = node_call
         self._node_alias = node_alias
         self._apps = dict(apps or {})
+        self._heard_recent = heard_recent
         self._guard = GatewayGuard(gateway_policy or GatewayPolicy())
         self._connect_timeout = float(connect_timeout)
         self._min_quality = int(min_quality)
@@ -108,6 +111,7 @@ class NetromNodePlugin(BBSPlugin):
             router=self._router,
             transports=self._transports,
             apps=self._apps,
+            heard_recent=self._heard_recent,
             guard=self._guard,
             auth_level=auth_level,
             entry=entry,

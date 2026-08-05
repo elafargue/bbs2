@@ -56,6 +56,39 @@ _DIRECT_NEIGHBOR_QUALITY = 192
 # netrom.direct_heard_ttl_minutes, default 60).
 _DIRECT_HEARD_TTL_SECONDS = 60 * 60
 
+# ── NET/ROM 1.3 routing PARMS (manual pp.65-67), mapped to config (N5) ─────────
+# Default per-neighbour link ("path") quality for the RF channel — PARMS #3,
+# manual default 192 (a 1200-baud user-accessed frequency).  Used to compose
+# advertised route qualities on receive; see _route_quality().
+_CHANNEL_QUALITY_DEFAULT  = 192
+# PARMS #2: routes learned below this quality are ignored; 0 disables auto-
+# routing entirely (ignore all NODES).  Manual default 1.
+_WORST_QUALITY_DEFAULT    = 1
+# PARMS #1: cap on the destination list (manual default 50, max 400); raised for
+# a modern mesh.
+_MAX_DESTINATIONS_DEFAULT = 200
+# PARMS #5: obsolescence-count initialiser (manual default 6).  A route's obs
+# count is (re)set to this on add/update, decremented each broadcast cycle, and
+# the route deleted at 0.  0 disables decay (routes permanent).  obs_count == 0
+# on a manually-added route marks it locked (never auto-decremented/deleted).
+_OBS_INITIALIZER_DEFAULT = 6
+# PARMS #6: only re-advertise routes with obs >= this (manual default 5).  Used
+# by transit re-advertisement (N5c).
+_OBS_MIN_TO_BROADCAST_DEFAULT = 5
+
+
+def _route_quality(advertised: int, path_quality: int) -> int:
+    """NET/ROM receive-side route quality (1987 manual p.65, rule 5):
+
+        routequality = ((advertised × path_quality) + 128) // 256
+
+    Compose the neighbour's *advertised* route quality with OUR *link* (path)
+    quality to that neighbour — both 0-255 fractions of 256 — rounded to the
+    nearest 256th.  This is the step the pre-N5 router skipped (it stored the
+    advertised quality verbatim), so transit-route qualities were never
+    link-adjusted and mis-ranked next-hops."""
+    return ((int(advertised) * int(path_quality)) + 128) >> 8
+
 # A plausible AX.25 callsign: 1-2 char prefix, a call-area digit, a 1-4 letter
 # suffix, optional -SSID (0-15).  Used to filter NODES junk — URONode emits
 # pseudo-entries like ``##TEMP:ENABLE-0`` and ``SFRC:OFF-0`` for disabled /
@@ -82,6 +115,7 @@ class RouteEntry:
     via_call: str         # OUR adjacent neighbor (the broadcaster of this entry)
     via_alias: str        # alias of that adjacent neighbor
     last_seen: float      # unix timestamp of last NODES broadcast containing this entry
+    obs_count: int = _OBS_INITIALIZER_DEFAULT  # obsolescence count (N5b); 0 = locked
 
     @property
     def is_direct(self) -> bool:
@@ -95,9 +129,26 @@ class RouteEntry:
         alias = f"({self.alias})" if self.alias else ""
         return (
             f"{self.dest_call:<10} {alias:<8} nbr={self.neighbor_call:<10} "
-            f"q={self.quality:3d}  via {self.via_call} ({self.via_alias})  "
-            f"{age}s ago"
+            f"q={self.quality:3d} obs={self.obs_count}  "
+            f"via {self.via_call} ({self.via_alias})  {age}s ago"
         )
+
+
+@dataclass
+class NeighbourEntry:
+    """One entry in the neighbour list (1987 manual p.63): an adjacent node we
+    can reach in one hop, with OUR link (``path``) quality to it.
+
+    ``path_quality`` composes the advertised quality of every route learned via
+    this neighbour (see :func:`_route_quality`).  N5a populates it; the full
+    use-count lifecycle + obsolescence persistence land in N5b."""
+    call:         str
+    port:         str   = ""                        # transport/channel (single RF port for now)
+    path_quality: int   = _CHANNEL_QUALITY_DEFAULT  # 0-255; 0 = ignore this neighbour
+    use_count:    int   = 0                          # routes currently via it (N5b lifecycle)
+    locked:       bool  = False                      # operator-set quality, never auto-updated
+    crosslink:    bool  = False                      # a live AX.25 crosslink exists now (enrichment)
+    last_heard:   float = 0.0                        # unix ts of last NODES / RF-direct hearing
 
 
 class NetromRouter:
@@ -118,12 +169,38 @@ class NetromRouter:
         min_advert_quality:       int   = _MIN_ADVERT_QUALITY,
         advertise_self_only:      bool  = True,
         direct_heard_ttl_seconds: float = _DIRECT_HEARD_TTL_SECONDS,
+        channel_quality:          int   = _CHANNEL_QUALITY_DEFAULT,
+        neighbour_quality:        Optional[dict[str, int]] = None,
+        worst_quality:            int   = _WORST_QUALITY_DEFAULT,
+        max_destinations:         int   = _MAX_DESTINATIONS_DEFAULT,
+        obs_initializer:          int   = _OBS_INITIALIZER_DEFAULT,
+        obs_min_to_broadcast:     int   = _OBS_MIN_TO_BROADCAST_DEFAULT,
     ) -> None:
         self._call  = node_call.upper()
         self._alias = node_alias.upper()[:6]
         # dest_call (upper) → list of alternate routes, sorted by quality desc,
         # truncated to _MAX_ROUTES_PER_DEST.  Keyed for fast lookup.
         self._routes: dict[str, list[RouteEntry]] = {}
+        # ── Neighbour list (N5, 1987 manual p.63) ────────────────────────────
+        # Adjacent nodes + OUR link (path) quality to each — the vehicle for the
+        # receive-side route-quality formula.  Keyed by callsign (upper).
+        self._neighbours: dict[str, NeighbourEntry] = {}
+        # PARMS-mapped routing knobs (see _route_quality / _process_nodes).
+        self._channel_quality = max(0, min(255, int(channel_quality)))
+        self._neighbour_quality = {
+            str(k).upper(): max(0, min(255, int(v)))
+            for k, v in (neighbour_quality or {}).items()
+        }
+        self._worst_quality  = max(0, min(255, int(worst_quality)))
+        self._max_destinations = max(1, int(max_destinations))
+        # Obsolescence-count lifecycle (N5b, PARMS #5/#6): routes decay a count
+        # each broadcast cycle and are deleted at 0, instead of a hard TTL.
+        self._obs_initializer = max(0, min(255, int(obs_initializer)))
+        self._obs_min_to_broadcast = max(1, min(255, int(obs_min_to_broadcast)))
+        # Persistence (N5b/b2): when set, the router snapshots its composed
+        # routing + neighbour tables here so they survive a restart.  None ⇒ no
+        # persistence (tests / heard disabled).
+        self._db_path: Optional[str] = None
         self._nodes_observer: Optional[NodesFrameCallback] = None
         # ── Adjacency enrichment (N0.5) ──────────────────────────────────────
         # The router is the single authority for "is X a directly-reachable
@@ -174,6 +251,9 @@ class NetromRouter:
             self._crosslinks.add(c)
         else:
             self._crosslinks.discard(c)
+            # A neighbour kept alive only by the (now-gone) crosslink and with no
+            # routes should age out.
+            self._reconcile_neighbours()
 
     # ── Transport observer ────────────────────────────────────────────────────
 
@@ -199,6 +279,8 @@ class NetromRouter:
                         logger.exception(
                             "netrom nodes observer error for frame from %s", src_call
                         )
+                # Snapshot the (composed) tables so they survive a restart.
+                await self.persist()
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -247,42 +329,88 @@ class NetromRouter:
             del bucket[_MAX_ROUTES_PER_DEST:]
         return is_new
 
+    # ── Neighbour list (N5) ─────────────────────────────────────────────────
+
+    def _default_path_quality(self, call: str) -> int:
+        """OUR link (path) quality to *call*: an operator override
+        (``neighbour_quality`` config) if set, else the channel default
+        (1987 manual p.65 rule 3)."""
+        return self._neighbour_quality.get(call.upper(), self._channel_quality)
+
+    def _get_or_create_neighbour(self, call: str, when: float) -> NeighbourEntry:
+        """Ensure a neighbour-list entry for *call* (the source of a NODES
+        broadcast is a one-hop neighbour), refreshing ``last_heard`` and, unless
+        operator-locked, its channel-default path quality."""
+        c = call.upper()
+        nbr = self._neighbours.get(c)
+        if nbr is None:
+            nbr = NeighbourEntry(
+                call=c, path_quality=self._default_path_quality(c), last_heard=when,
+            )
+            self._neighbours[c] = nbr
+        else:
+            nbr.last_heard = when
+            if not nbr.locked:
+                nbr.path_quality = self._default_path_quality(c)
+        return nbr
+
     def _process_nodes(self, frame: NodesFrame) -> None:
         now = time.time()
+        # Rule 1 (p.65): worst_quality == 0 disables auto-routing entirely.
+        if self._worst_quality == 0:
+            return
         new_count = 0
         updated_count = 0
-        via_call_up  = frame.source_call.upper()
 
-        # Auto-add the broadcast SOURCE as a direct neighbor.  Receiving a
-        # NODES broadcast implies the source is directly RF-reachable — we
-        # just heard them.  Without this, polite-client nodes that only
-        # send Len=7 header-only NODES (like KI6ZHD-5 / SCLARA on 145.05)
-        # would never appear in our routing table because they're not
-        # included as entries in their own broadcasts.  Quality 192 matches
-        # the NORCAL convention for direct-RF NETROM neighbors.
+        # The broadcast SOURCE is a one-hop neighbour (NODES are link-local):
+        # ensure a neighbour-list entry with OUR link quality to it (rule 3).
+        # path_quality == 0 means the operator has told us to ignore this
+        # neighbour, including disregarding its broadcasts (manual p.23).
+        nbr = self._get_or_create_neighbour(frame.source_call, now)
+        path_q = nbr.path_quality
+        if path_q == 0:
+            return
+
+        # Rule 4: a DIRECT route to the source exists at our link (path) quality.
+        # (Also covers polite-client nodes whose header-only NODES carry no
+        # entries — they still enter the table as a direct neighbour.)
         source_route = RouteEntry(
             dest_call     = frame.source_call,
             alias         = frame.source_alias,
             neighbor_call = frame.source_call,   # direct: neighbor == dest
-            quality       = _DIRECT_NEIGHBOR_QUALITY,
-            via_call      = frame.source_call,   # we hear them on our radio
+            quality       = path_q,
+            via_call      = frame.source_call,
             via_alias     = frame.source_alias,
             last_seen     = now,
+            obs_count     = self._obs_initializer,   # (re)init on hearing (p.66)
         )
         if self._upsert_route(source_route):
             new_count += 1
         else:
             updated_count += 1
 
+        # Rules 5-9: an INDIRECT route to each advertised destination via the
+        # source, with the quality composed through our link to the source.
         for entry in frame.entries:
+            dest_up = entry.dest_call.upper()
+            if entry.neighbor_call.upper() == self._call:
+                rq = 0                               # rule 6: trivial loop → q0
+            else:
+                rq = _route_quality(entry.quality, path_q)   # rule 5
+            if rq < self._worst_quality:             # rule 8 (also drops q0 loops)
+                continue
+            if dest_up not in self._routes and \
+                    len(self._routes) >= self._max_destinations:
+                continue                             # rule 9: destination cap
             re = RouteEntry(
                 dest_call=entry.dest_call,
                 alias=entry.alias,
                 neighbor_call=entry.neighbor_call,
-                quality=entry.quality,
+                quality=rq,
                 via_call=frame.source_call,
                 via_alias=frame.source_alias,
                 last_seen=now,
+                obs_count=self._obs_initializer,     # (re)init on hearing (p.66)
             )
             if self._upsert_route(re):
                 new_count += 1
@@ -291,10 +419,10 @@ class NetromRouter:
 
         logger.info(
             "netrom NODES from %s (%s): %d entries (%d new, %d updated) — "
-            "routing table now has %d destinations",
+            "path_q=%d, routing table now has %d destinations",
             frame.source_call, frame.source_alias,
             len(frame.entries), new_count, updated_count,
-            len(self._routes),
+            path_q, len(self._routes),
         )
         if logger.isEnabledFor(logging.DEBUG):
             for e in frame.entries:
@@ -303,42 +431,129 @@ class NetromRouter:
                     e.dest_call, f"({e.alias})", e.neighbor_call, e.quality,
                 )
 
-    # ── Persistence ───────────────────────────────────────────────────────────
+    # ── Persistence (N5b/b2) ────────────────────────────────────────────────
+
+    def set_db_path(self, db_path: str) -> None:
+        """Enable persistence: the router snapshots its (composed) routing +
+        neighbour tables to this DB after each NODES update and on the decay
+        scan, so adjacency + link qualities survive a restart.  Unset ⇒ no
+        persistence."""
+        self._db_path = db_path or None
+
+    async def _ensure_netrom_schema(self, db) -> None:
+        """Create/upgrade the routing-table schema the router owns.  Additive
+        only (no PK migration): create the tables if absent and add the N5
+        ``obs_count`` column to a pre-N5 ``netrom_routes``."""
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS netrom_routes ("
+            " dest_call TEXT NOT NULL COLLATE NOCASE,"
+            " neighbor_call TEXT NOT NULL COLLATE NOCASE,"
+            " alias TEXT NOT NULL DEFAULT '',"
+            " quality INTEGER NOT NULL DEFAULT 0,"
+            " via_call TEXT NOT NULL COLLATE NOCASE,"
+            " via_alias TEXT NOT NULL DEFAULT '',"
+            " last_seen INTEGER NOT NULL,"
+            " obs_count INTEGER NOT NULL DEFAULT 6,"
+            " PRIMARY KEY (dest_call, neighbor_call))"
+        )
+        async with db.execute("PRAGMA table_info(netrom_routes)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "obs_count" not in cols:
+            await db.execute(
+                "ALTER TABLE netrom_routes ADD COLUMN "
+                "obs_count INTEGER NOT NULL DEFAULT 6"
+            )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS netrom_neighbours ("
+            " call TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,"
+            " port TEXT NOT NULL DEFAULT '',"
+            " path_quality INTEGER NOT NULL DEFAULT 192,"
+            " use_count INTEGER NOT NULL DEFAULT 0,"
+            " locked INTEGER NOT NULL DEFAULT 0,"
+            " last_heard INTEGER NOT NULL DEFAULT 0)"
+        )
+
+    async def persist(self) -> None:
+        """Snapshot the current routing + neighbour tables to the DB (full
+        replace → the DB mirrors memory and stale rows are pruned for free).
+        Composed qualities + obs counts are stored, closing the persistence
+        seam.  Best-effort; no-op when persistence is disabled."""
+        if not self._db_path:
+            return
+        import aiosqlite
+        # De-dup routes by the DB key (dest_call, neighbor_call), keeping the
+        # best-quality one — matches the table PK (rare same-neighbour alternates
+        # collapse, as they did under the heard writer).
+        best: dict[tuple[str, str], RouteEntry] = {}
+        for bucket in self._routes.values():
+            for r in bucket:
+                k = (r.dest_call.upper(), r.neighbor_call.upper())
+                if k not in best or r.quality > best[k].quality:
+                    best[k] = r
+        route_rows = [
+            (r.dest_call.upper(), r.neighbor_call.upper(), r.alias, r.quality,
+             r.via_call.upper(), r.via_alias, int(r.last_seen), r.obs_count)
+            for r in best.values()
+        ]
+        nbr_rows = [
+            (n.call.upper(), n.port, n.path_quality, n.use_count,
+             1 if n.locked else 0, int(n.last_heard))
+            for n in self._neighbours.values()
+        ]
+        try:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                await self._ensure_netrom_schema(db)
+                await db.execute("DELETE FROM netrom_routes")
+                await db.executemany(
+                    "INSERT INTO netrom_routes (dest_call, neighbor_call, alias,"
+                    " quality, via_call, via_alias, last_seen, obs_count)"
+                    " VALUES (?,?,?,?,?,?,?,?)", route_rows,
+                )
+                await db.execute("DELETE FROM netrom_neighbours")
+                await db.executemany(
+                    "INSERT INTO netrom_neighbours (call, port, path_quality,"
+                    " use_count, locked, last_heard) VALUES (?,?,?,?,?,?)", nbr_rows,
+                )
+                await db.commit()
+        except Exception:
+            logger.warning("netrom router persist failed", exc_info=True)
 
     async def seed_from_db(self, db_path: str) -> int:
-        """Restore in-memory routes from the heard plugin's netrom_routes table.
+        """Restore the in-memory routing + neighbour tables from the DB at
+        startup, so adjacency + composed link qualities survive a restart
+        instead of rebuilding blind (and NODES TX has something to advertise
+        immediately).  Only rows within the route TTL are loaded.  Missing
+        tables (fresh deployment) ⇒ nothing to seed; returns the routes loaded.
 
-        Called once at engine startup so the router does not begin every
-        session with an empty table — otherwise build_nodes_payload() would
-        return None for the first ~30 minutes after each restart and we'd be
-        invisible on the air during that window.
-
-        Only rows whose last_seen is within self._route_ttl_seconds of now
-        are loaded.  The nodes_observer is NOT fired for seeded entries —
-        they are historical rather than freshly-received broadcasts, and
-        re-emitting them through the heard pipeline would cause spurious
-        update churn against rows that are already there.
-
-        Missing table (heard plugin disabled or fresh deployment) is treated
-        as "nothing to seed" — returns 0, no exception.
-
-        Returns the number of routes loaded.
-        """
+        The nodes_observer is NOT fired for seeded entries — they are historical
+        rather than freshly-received broadcasts."""
         import aiosqlite
         cutoff = int(time.time() - self._route_ttl_seconds)
         loaded = 0
         try:
             async with aiosqlite.connect(db_path, timeout=30) as db:
+                await self._ensure_netrom_schema(db)
+                # Neighbour list first, so adjacency is authoritative on restart.
+                async with db.execute(
+                    "SELECT call, port, path_quality, use_count, locked, last_heard "
+                    "FROM netrom_neighbours WHERE last_heard >= ?", (cutoff,),
+                ) as cur:
+                    async for row in cur:
+                        if not _is_routable_callsign(row[0]):
+                            continue
+                        c = row[0].upper()
+                        self._neighbours[c] = NeighbourEntry(
+                            call=c, port=row[1] or "",
+                            path_quality=int(row[2]), use_count=int(row[3]),
+                            locked=bool(row[4]), last_heard=float(row[5]),
+                        )
                 async with db.execute(
                     "SELECT dest_call, alias, neighbor_call, quality, "
-                    "       via_call, via_alias, last_seen "
+                    "       via_call, via_alias, last_seen, obs_count "
                     "FROM netrom_routes WHERE last_seen >= ? "
-                    "ORDER BY quality DESC",
-                    (cutoff,),
+                    "ORDER BY quality DESC", (cutoff,),
                 ) as cursor:
                     async for row in cursor:
-                        # Don't resurrect non-callsign junk persisted before the
-                        # ingest filter existed (it ages out of the DB on its own).
                         if not _is_routable_callsign(row[0]):
                             continue
                         entry = RouteEntry(
@@ -349,12 +564,9 @@ class NetromRouter:
                             via_call      = row[4],
                             via_alias     = row[5] or "",
                             last_seen     = float(row[6]),
+                            obs_count     = int(row[7]),
                         )
-                        key = entry.dest_call.upper()
-                        bucket = self._routes.setdefault(key, [])
-                        # Skip duplicates (defensive — table PK should
-                        # prevent them, but seeding may run after a
-                        # partial in-memory population in odd cases).
+                        bucket = self._routes.setdefault(entry.dest_call.upper(), [])
                         if any(r.via_call.upper() == entry.via_call.upper()
                                for r in bucket):
                             continue
@@ -364,15 +576,13 @@ class NetromRouter:
                             del bucket[_MAX_ROUTES_PER_DEST:]
                         loaded += 1
         except aiosqlite.OperationalError as exc:
-            # "no such table: netrom_routes" — heard plugin never ran, or
-            # this is a fresh deployment.  Treat as empty seed.
             logger.debug("netrom router seed: %s", exc)
             return 0
-        if loaded:
+        if loaded or self._neighbours:
             logger.info(
-                "netrom router seeded %d route(s) from heard DB "
+                "netrom router seeded %d route(s), %d neighbour(s) from DB "
                 "(%d destinations)",
-                loaded, len(self._routes),
+                loaded, len(self._neighbours), len(self._routes),
             )
         return loaded
 
@@ -383,6 +593,10 @@ class NetromRouter:
         Remove RouteEntry records that haven't been refreshed within the TTL.
         If a destination loses all its routes, the destination key is removed.
         Returns the count of pruned entries.
+
+        Superseded by :meth:`decay_obsolescence` under N5b (the engine now runs
+        the obsolescence-count scan instead of this TTL prune); kept for the
+        ``seed_from_db`` cutoff and back-compat.
         """
         cutoff = (now if now is not None else time.time()) - self._route_ttl_seconds
         pruned = 0
@@ -397,6 +611,43 @@ class NetromRouter:
         for k in empty_keys:
             del self._routes[k]
         return pruned
+
+    def decay_obsolescence(self) -> int:
+        """Decrement every route's obsolescence count and delete routes that
+        reach 0 (1987 manual p.66) — the periodic scan the engine runs at the
+        NODES broadcast cadence, replacing the hard-TTL prune.
+
+        A route's ``obs_count`` is (re)set to ``obs_initializer`` whenever it is
+        heard/updated, so an actively-broadcast route never ages out, while one
+        that goes quiet is deleted after ``obs_initializer`` missed cycles —
+        giving the stable, ROCK-like table the TTL model lacked.  ``obs_count ==
+        0`` marks a **locked** (manually-added) route: never decremented or
+        deleted.  ``obs_initializer == 0`` disables decay entirely (permanent
+        routes).  Returns the number of routes deleted."""
+        if self._obs_initializer == 0:
+            return 0
+        deleted = 0
+        empty_keys: list[str] = []
+        for key, bucket in self._routes.items():
+            kept: list[RouteEntry] = []
+            for r in bucket:
+                if r.obs_count == 0:          # locked — never auto-touched
+                    kept.append(r)
+                    continue
+                r.obs_count -= 1
+                if r.obs_count > 0:
+                    kept.append(r)
+                else:
+                    deleted += 1              # reached 0 → delete (never sits at 0)
+            if kept:
+                bucket[:] = kept
+            else:
+                empty_keys.append(key)
+        for k in empty_keys:
+            del self._routes[k]
+        # Age out neighbour-list entries whose routes all decayed away.
+        self._reconcile_neighbours()
+        return deleted
 
     # ── Public accessors ──────────────────────────────────────────────────────
 
@@ -426,19 +677,25 @@ class NetromRouter:
     def adjacent_neighbors(self) -> set[str]:
         """Uppercased callsigns of all nodes we can currently reach in ONE hop.
 
-        The coherent adjacency set (N0.5): every known node for which
-        :meth:`is_direct_neighbor` is True, plus any live crosslink.  This is
-        the union of the three enrichment sources — NODES-source nodes we still
-        hear, RF direct-heard nodes, and active crosslinks — NOT the raw
-        ``via_call`` set (which was transit-polluted and TTL-fragile).  Callers
-        that classify a single call should use :meth:`is_direct_neighbor`.
+        N5b: the neighbour list (entries with a non-zero path quality), plus any
+        live crosslink, plus any dest reachable by a fresh direct route (the last
+        covers routes seeded from the DB before the neighbour list is persisted).
+        Filtered through :meth:`is_direct_neighbor` so the same authority governs
+        both the set and single-call classification.
         """
-        known = {
+        candidates = set(self._neighbours) | set(self._crosslinks)
+        candidates |= {
             r.dest_call.upper()
-            for routes in self._routes.values()
-            for r in routes
+            for bucket in self._routes.values()
+            for r in bucket if r.is_direct
         }
-        return {c for c in known if self.is_direct_neighbor(c)} | set(self._crosslinks)
+        return {c for c in candidates if self.is_direct_neighbor(c)}
+
+    @property
+    def neighbour_list(self) -> list["NeighbourEntry"]:
+        """The neighbour table (N5), sorted by callsign — the classic NET/ROM
+        ``ROUTES`` view (call, port, path quality, use-count, locked)."""
+        return sorted(self._neighbours.values(), key=lambda n: n.call)
 
     def get_route(self, dest: str) -> RouteEntry | None:
         """
@@ -498,22 +755,47 @@ class NetromRouter:
         """The ONE adjacency authority: True iff *call* is a directly-reachable
         NET/ROM node — reachable in a single AX.25 hop right now.
 
-        Combines all three enrichment sources:
+        N5b: the **neighbour list** is the authority (a node is a neighbour once
+        it broadcasts NODES, and is aged out by the obsolescence lifecycle when
+        it goes quiet).  Layered with bbs2's enrichments:
           - a **live crosslink** to it (definitive proof), OR
-          - it is a **known node** AND either heard **directly** on the air
-            within the direct-heard TTL, OR has a fresh direct NODES route.
+          - it is in the **neighbour list** with a non-zero path quality, OR
+          - it is a **known node** heard **directly** on the air within the
+            direct-heard TTL (covers a node we hear as a beacon but that does
+            not send us NODES).
 
         Used for inbound classification (crosslink vs BBS user), outbound
-        next-hop selection, and first-hop hardening.
+        next-hop selection, and INTERLOCK.
         """
         c = call.upper()
         if c in self._crosslinks:
             return True
-        if not self._is_known_node(c):
-            return False
-        if time.time() - self._heard_direct.get(c, 0.0) <= self._direct_heard_ttl:
+        nbr = self._neighbours.get(c)
+        if nbr is not None and nbr.path_quality > 0:
             return True
+        if self._is_known_node(c) and \
+                time.time() - self._heard_direct.get(c, 0.0) <= self._direct_heard_ttl:
+            return True
+        # Enrichment: a fresh *direct* route (via == dest) also implies one-hop
+        # reachability — covers routes seeded from the DB after a restart, before
+        # the neighbour list is persisted (N5b/b), and legacy direct routes.
         return self._has_fresh_direct_route(c)
+
+    def _reconcile_neighbours(self) -> None:
+        """Recompute each neighbour's use-count (routes forwarding via it) and
+        delete an entry that carries no routes and has no live crosslink, unless
+        operator-locked (manual p.23: an unlocked neighbour whose use-count
+        reaches 0 is removed).  Called after the obsolescence scan."""
+        use_count: dict[str, int] = {}
+        for bucket in self._routes.values():
+            for r in bucket:
+                v = r.via_call.upper()
+                use_count[v] = use_count.get(v, 0) + 1
+        for c in list(self._neighbours):
+            nbr = self._neighbours[c]
+            nbr.use_count = use_count.get(c, 0)
+            if nbr.use_count == 0 and not nbr.locked and c not in self._crosslinks:
+                del self._neighbours[c]
 
     def best_neighbor_for(self, dest: str, *, min_quality: int = 1) -> str | None:
         """The neighbor to open a crosslink to in order to reach *dest* (callsign
@@ -564,8 +846,11 @@ class NetromRouter:
         For each destination, advertise the BEST known route with:
           - ``neighbor_call`` = our OWN adjacent neighbor (the route's via_call),
             so peers know which AX.25 link to use when they forward through us.
-          - ``quality`` decremented by hop_cost; routes that fall below
-            min_advert_quality are skipped.
+          - ``quality`` = our already-composed route quality; the receiver
+            re-composes it through *their* link to us, so multi-hop degradation
+            is inherent (N5 — ``hop_cost`` / ``min_advert_quality`` are retired).
+          - gated on ``obs_min_to_broadcast`` (manual p.66 PARMS #6): stale
+            routes are not propagated; ``obs_count == 0`` (locked) always is.
         Returns None when nothing would be advertised.
 
         Only enable transit-node mode if the network admins have explicitly
@@ -578,18 +863,19 @@ class NetromRouter:
         if not self._routes:
             return None
         entries: list[NodeEntry] = []
-        for key, bucket in self._routes.items():
+        for bucket in self._routes.values():
             if not bucket:
                 continue
             best = bucket[0]
-            degraded = max(0, best.quality - self._hop_cost)
-            if degraded < self._min_advert_quality:
+            # Obsolescence gate (p.66): don't propagate stale routes.  A locked
+            # route (obs 0) is permanent and always advertised.
+            if best.obs_count != 0 and best.obs_count < self._obs_min_to_broadcast:
                 continue
             entries.append(NodeEntry(
                 dest_call=best.dest_call,
                 alias=best.alias,
                 neighbor_call=best.via_call,  # OUR next hop, not upstream's
-                quality=degraded,
+                quality=best.quality,          # composed; receiver re-composes
             ))
         if not entries:
             return None

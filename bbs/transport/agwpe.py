@@ -59,7 +59,9 @@ with exponential back-off up to 60 seconds.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import socket
 import struct
 import time
@@ -499,6 +501,10 @@ class AGWPETransport(Transport):
         # callsign) so callers can reach ax25d-style external services on
         # those SSIDs.  Populated via set_extra_callsigns() before start().
         self._extra_callsigns: list[str] = []
+        # Persist the last beacon / NODES broadcast timestamps here so that after
+        # a restart we honour the configured cadence instead of transmitting
+        # immediately (politer on a shared channel).  None ⇒ not persisted.
+        self._broadcast_state_path: Optional[str] = None
 
     def set_netrom_nodes_interval(self, seconds: int) -> None:
         self._netrom_nodes_interval = max(60, seconds)
@@ -549,6 +555,43 @@ class AGWPETransport(Transport):
         inbound connects to the node identity reach us."""
         c = (call or "").upper().strip()
         self._netrom_node_call = c or self._local_call
+
+    def set_broadcast_state_path(self, path: str) -> None:
+        """Persist the last beacon / NODES broadcast timestamps to *path* so a
+        restart respects the configured cadence instead of transmitting right
+        away.  Unset ⇒ not persisted (beacons/NODES fire immediately on start,
+        the pre-existing behaviour)."""
+        self._broadcast_state_path = path or None
+
+    def _load_broadcast_state(self) -> dict:
+        if not self._broadcast_state_path:
+            return {}
+        try:
+            with open(self._broadcast_state_path, encoding="ascii") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_broadcast_state(self, key: str, when: float) -> None:
+        """Record the timestamp of the last *key* ("beacon"/"nodes") broadcast."""
+        if not self._broadcast_state_path:
+            return
+        state = self._load_broadcast_state()
+        state[key] = float(when)
+        try:
+            tmp = f"{self._broadcast_state_path}.tmp"
+            with open(tmp, "w", encoding="ascii") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, self._broadcast_state_path)   # atomic
+        except OSError:
+            logger.debug("agwpe: could not save broadcast state", exc_info=True)
+
+    def _initial_broadcast_delay(self, key: str, interval: float) -> float:
+        """Seconds to wait before the first *key* broadcast after (re)connect so
+        we honour *interval* across restarts — 0 when overdue or never sent."""
+        last = float(self._load_broadcast_state().get(key, 0.0) or 0.0)
+        return max(0.0, interval - (time.time() - last))
 
     def set_extra_callsigns(self, calls: list[str]) -> None:
         """Register extra callsign-SSIDs to accept (ax25d-style services).
@@ -1395,6 +1438,16 @@ class AGWPETransport(Transport):
             logger.warning("agwpe: registration not confirmed after 30 s; sending beacon anyway")
         except asyncio.CancelledError:
             return
+        # Respect the cadence across restarts: if we beaconed recently (persisted
+        # timestamp), wait out the remainder rather than transmitting on startup.
+        delay = self._initial_broadcast_delay("beacon", self._beacon_interval)
+        if delay > 0:
+            logger.info("agwpe: honouring beacon cadence — first beacon in %.0f min",
+                        delay / 60)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
         try:
             while self._running:
                 if self._sessions:
@@ -1420,6 +1473,7 @@ class AGWPETransport(Transport):
                     writer.write(frame)
                     async with drain_lock:
                         await writer.drain()
+                    self._save_broadcast_state("beacon", time.time())
                     logger.info(
                         "agwpe beacon sent to %s%s",
                         self._beacon_dest,
@@ -1444,6 +1498,16 @@ class AGWPETransport(Transport):
             logger.warning("agwpe: registration not confirmed after 30 s; sending NODES anyway")
         except asyncio.CancelledError:
             return
+        # Respect the cadence across restarts (as for the beacon) so we don't
+        # spam a NODES broadcast onto the mesh immediately on every startup.
+        delay = self._initial_broadcast_delay("nodes", self._netrom_nodes_interval)
+        if delay > 0:
+            logger.info("agwpe: honouring NODES cadence — first NODES in %.0f min",
+                        delay / 60)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
         try:
             while self._running:
                 assert self._netrom_nodes_builder is not None
@@ -1458,6 +1522,7 @@ class AGWPETransport(Transport):
                         writer.write(frame)
                         async with drain_lock:
                             await writer.drain()
+                        self._save_broadcast_state("nodes", time.time())
                         logger.info(
                             "agwpe NETROM NODES broadcast sent: %d bytes", len(payload)
                         )

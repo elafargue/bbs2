@@ -399,6 +399,13 @@ class HeardPlugin(BBSPlugin):
         ts = self._direct_heard.get(call.upper(), 0)
         return ts > 0 and (int(time.time()) - ts) <= max(0, seconds)
 
+    def recent_direct_heard(self, limit: int = 30) -> list[tuple[str, int]]:
+        """Recently RF-direct-heard stations as ``(callsign, unix_ts)``, most
+        recent first — the NET/ROM node's ``MH`` (MHEARD) source.  Synchronous
+        (in-memory cache)."""
+        items = sorted(self._direct_heard.items(), key=lambda kv: kv[1], reverse=True)
+        return [(c, ts) for c, ts in items[:max(1, limit)]]
+
     def set_direct_heard_observer(
         self, cb: "Callable[[str, float], None]"
     ) -> None:
@@ -1154,27 +1161,14 @@ class HeardPlugin(BBSPlugin):
                     (src_up, ts, ts),
                 )
 
-            # Upsert each route entry into netrom_routes and stations/heard_events.
+            # Upsert each advertised destination into stations/heard_events (for
+            # the map + graph + alias backfill).  The netrom_routes table itself
+            # is owned and persisted by the NET/ROM router (N5b/b2) — it stores
+            # the *composed* route quality + obsolescence count, which the heard
+            # plugin (seeing only the raw advertised frame) cannot compute.
             for e in frame.entries:
                 dest_up  = e.dest_call.upper()
                 alias_up = e.alias.upper() if e.alias else ''
-                nbr_up   = e.neighbor_call.upper()
-
-                await db.execute(
-                    """
-                    INSERT INTO netrom_routes
-                        (dest_call, neighbor_call, alias, quality,
-                         via_call, via_alias, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(dest_call, neighbor_call) DO UPDATE SET
-                        alias     = excluded.alias,
-                        quality   = excluded.quality,
-                        via_call  = excluded.via_call,
-                        via_alias = excluded.via_alias,
-                        last_seen = excluded.last_seen
-                    """,
-                    (dest_up, nbr_up, alias_up, e.quality, src_up, src_alias, ts),
-                )
 
                 if alias_up:
                     await db.execute(

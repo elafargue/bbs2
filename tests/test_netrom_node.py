@@ -133,6 +133,10 @@ def _seeded_router() -> NetromRouter:
     r._upsert_route(_route("K2YE-5", "MONTC", "KF6ANX-4", "JOHN", 144))
     # Our own node (for the local-loop guard).
     r._upsert_route(_route("W6ELA-1", "PALO", "KF6ANX-4", "JOHN", 144))
+    # N5: register the direct neighbours in the neighbour list (in production
+    # _process_nodes does this; these tests seed routes directly via _upsert_route).
+    for _call in ("KF6ANX-4", "K6FB-5"):
+        r._get_or_create_neighbour(_call, time.time())
     return r
 
 
@@ -203,35 +207,41 @@ class TestListings:
         assert "MONTC:K2YE-5" in txt
         assert "JOHN:KF6ANX-4" not in txt
 
-    async def test_routes_no_arg_lists_neighbor_table(self):
+    async def test_routes_no_arg_lists_neighbour_table(self):
+        # N5c: the ROCK-style neighbour list — "[>] port call path_q use_count".
         n = _make_node(); t = n._term
         await n.cmd_routes("")
         txt = t.text()
         assert "Routes:" in txt
-        assert "JOHN:KF6ANX-4 q=192" in txt   # adjacent neighbor + link quality
-        assert "ROCK:K6FB-5 q=192" in txt
-        assert "MONTC:K2YE-5" not in txt        # transit dest, not a neighbor
+        assert "KF6ANX-4 192" in txt          # neighbour call + path quality
+        assert "K6FB-5 192" in txt
+        assert "K2YE-5" not in txt            # transit dest, not a neighbour
 
-    async def test_routes_shows_direct_and_transit(self):
+    async def test_routes_target_shows_quality_obs_neighbour(self):
+        # N5c: "[>] quality obs port neighbour" per route to the dest.
         n = _make_node(); t = n._term
-        await n.cmd_routes("JOHN")
-        assert "direct" in t.text()
-        t.out.clear()
         await n.cmd_routes("MONTC")
-        assert "via KF6ANX-4" in t.text()
+        txt = t.text()
+        assert "Routes to MONTC:K2YE-5" in txt
+        assert "144 6 0 KF6ANX-4" in txt      # quality obs port neighbour
 
     async def test_routes_unknown(self):
         n = _make_node(); t = n._term
         await n.cmd_routes("NOPE")
         assert "No route" in t.text()
 
-    async def test_mheard_lists_adjacent_neighbors(self):
-        n = _make_node(); t = n._term
+    async def test_mheard_falls_back_to_neighbours_without_heard(self):
+        n = _make_node(); t = n._term       # no heard_recent wired
         await n.cmd_mheard("")
         txt = t.text()
-        assert "JOHN:KF6ANX-4" in txt       # adjacent neighbor (a via_call)
-        assert "ROCK:K6FB-5" in txt          # adjacent neighbor (a via_call)
-        assert "MONTC:K2YE-5" not in txt     # transit dest, NOT a neighbor
+        assert "KF6ANX-4" in txt and "K6FB-5" in txt
+
+    async def test_mheard_uses_heard_recent_when_available(self):
+        import time as _t
+        n = _make_node(heard_recent=lambda: [("W1AW-3", int(_t.time()) - 120)])
+        t = n._term
+        await n.cmd_mheard("")
+        assert "W1AW-3" in t.text()
 
     async def test_info(self):
         n = _make_node(); t = n._term

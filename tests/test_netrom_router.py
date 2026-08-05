@@ -11,11 +11,30 @@ from bbs.ax25.netrom_frame import (
     decode_nodes_broadcast,
     encode_nodes_broadcast,
 )
-from bbs.netrom.router import NetromRouter, RouteEntry, _is_routable_callsign
+from bbs.netrom.router import (
+    NetromRouter, RouteEntry, _is_routable_callsign, _route_quality,
+)
 
 
 def _nodes_payload(alias: str, entries: list[NodeEntry]) -> bytes:
     return encode_nodes_broadcast(alias, entries)
+
+
+class TestRouteQuality:
+    """N5: receive-side quality = ((advertised × path_quality) + 128) >> 8
+    (1987 manual p.65, rule 5)."""
+
+    def test_formula_values(self):
+        assert _route_quality(200, 192) == 150     # (38400+128)>>8
+        assert _route_quality(220, 192) == 165
+        assert _route_quality(255, 255) == 254     # near-perfect link, near-perfect route
+        assert _route_quality(0, 192) == 0
+        assert _route_quality(100, 0) == 0         # path quality 0 → ignore neighbour
+
+    def test_composition_caps_below_direct(self):
+        # A transit route through a 192-quality link can never beat a 1-hop
+        # direct route (quality == path quality 192): max is _route_quality(255,192).
+        assert _route_quality(255, 192) < 192
 
 
 class TestNetromRouterReceive:
@@ -36,7 +55,7 @@ class TestNetromRouterReceive:
         route = r.get_route("K6FB-5")
         assert route is not None
         assert route.alias == "ROCK"
-        assert route.quality == 200
+        assert route.quality == 150   # 200 advertised × 192 link ÷ 256 (N5)
         assert route.via_call == "N6ZX-5"
         assert route.via_alias == "WBAY"
 
@@ -76,8 +95,191 @@ class TestNetromRouterReceive:
         asyncio.run(r.on_netrom_frame("K6FB-5", "NODES", p2))
         route = r.get_route("K2YE-5")
         assert route is not None
-        assert route.quality == 220
+        assert route.quality == 165   # 220 × 192 ÷ 256 (composed; ordering preserved)
         assert route.via_call == "K6FB-5"
+
+
+class TestReceiveAlgorithm:
+    """N5 — the 1987 receive-a-NODES algorithm (manual p.65, rules 1-9)."""
+
+    def test_direct_route_is_path_quality_transit_is_composed(self):
+        r = NetromRouter("W6ELA-1", "PALO", channel_quality=192)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.get_route("N6ZX-5").quality == 192                 # rule 4: direct = path q
+        assert r.get_route("K2YE-5").quality == _route_quality(200, 192)  # rule 5
+
+    def test_per_neighbour_override_changes_all_routes_via_it(self):
+        r = NetromRouter("W6ELA-1", "PALO", neighbour_quality={"N6ZX-5": 255})
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.get_route("N6ZX-5").quality == 255                 # direct = override
+        assert r.get_route("K2YE-5").quality == _route_quality(200, 255)
+
+    def test_trivial_loop_route_dropped(self):
+        # A route whose advertised best-neighbour is US → q0 → below worst_quality.
+        r = NetromRouter("W6ELA-1", "PALO")
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "W6ELA-1", 200)])))
+        assert r.get_route("K2YE-5") is None        # rule 6 + rule 8
+        assert r.get_route("N6ZX-5") is not None    # source still added
+
+    def test_worst_quality_filters_low_routes(self):
+        r = NetromRouter("W6ELA-1", "PALO", worst_quality=100)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 60)])))
+        assert r.get_route("K2YE-5") is None        # composed 45 < 100 (rule 8)
+
+    def test_worst_quality_zero_ignores_all_nodes(self):
+        r = NetromRouter("W6ELA-1", "PALO", worst_quality=0)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.node_count == 0                     # rule 1
+
+    def test_path_quality_zero_disregards_broadcast(self):
+        r = NetromRouter("W6ELA-1", "PALO", neighbour_quality={"N6ZX-5": 0})
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.node_count == 0                     # neighbour disabled (p.23)
+
+    def test_max_destinations_cap(self):
+        r = NetromRouter("W6ELA-1", "PALO", max_destinations=2)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", _nodes_payload("WBAY", [
+            NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200),
+            NodeEntry("K6FB-5", "ROCK", "K6FB-5", 200),
+        ])))
+        assert r.node_count == 2                     # rule 9: source + 1 dest fill the cap
+        assert r.get_route("K2YE-5") is not None
+        assert r.get_route("K6FB-5") is None
+
+
+class TestObsolescence:
+    """N5b — obsolescence-count lifecycle (1987 manual p.66)."""
+
+    def test_route_gets_obs_initializer(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=6)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.get_route("K2YE-5").obs_count == 6
+        assert r.get_route("N6ZX-5").obs_count == 6      # the direct source route too
+
+    def test_decay_decrements_then_deletes_at_zero(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=3)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.decay_obsolescence() == 0 and r.get_route("K2YE-5").obs_count == 2
+        assert r.decay_obsolescence() == 0 and r.get_route("K2YE-5").obs_count == 1
+        assert r.decay_obsolescence() == 2               # K2YE-5 + N6ZX-5 hit 0 → deleted
+        assert r.node_count == 0
+
+    def test_rebroadcast_reinitialises_obs(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=6)
+        p = _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", p))
+        r.decay_obsolescence(); r.decay_obsolescence()
+        assert r.get_route("K2YE-5").obs_count == 4
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", p))   # heard again
+        assert r.get_route("K2YE-5").obs_count == 6            # refreshed to initializer
+
+    def test_obs_initializer_zero_disables_decay(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=0)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert r.get_route("K2YE-5").obs_count == 0           # permanent
+        assert r.decay_obsolescence() == 0                    # scan is a no-op
+        assert r.node_count == 2
+
+    def test_locked_route_untouched_by_decay(self):
+        # A manually-added route with obs_count == 0 (locked) survives the scan.
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=6)
+        r._upsert_route(RouteEntry(
+            "K2YE-5", "MONTC", "K2YE-5", 200, "K2YE-5", "MONTC", time.time(),
+            obs_count=0))
+        r.decay_obsolescence()
+        assert r.get_route("K2YE-5") is not None
+        assert r.get_route("K2YE-5").obs_count == 0           # still locked
+
+
+class TestPersistence:
+    """N5b/b2 — the router owns netrom_routes + netrom_neighbours, persisting
+    composed quality + obs, surviving a restart, and auto-pruning."""
+
+    def _populated(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=6)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        return r
+
+    def test_persist_seed_roundtrip(self, tmp_path):
+        db = str(tmp_path / "n.db")
+        r = self._populated(); r.set_db_path(db)
+        asyncio.run(r.persist())
+        r2 = NetromRouter("W6ELA-1", "PALO")
+        loaded = asyncio.run(r2.seed_from_db(db))
+        assert loaded >= 1
+        assert r2.get_route("K2YE-5").quality == _route_quality(200, 192)  # composed
+        assert r2.get_route("K2YE-5").obs_count == 6                        # obs survived
+        assert r2.is_direct_neighbor("N6ZX-5") is True                     # neighbour survived
+        assert "N6ZX-5" in r2.adjacent_neighbors
+
+    def test_persist_snapshot_prunes_stale_rows(self, tmp_path):
+        db = str(tmp_path / "n.db")
+        r = self._populated(); r.set_db_path(db)
+        asyncio.run(r.persist())
+        r._routes.clear(); r._neighbours.clear()      # everything decayed away
+        asyncio.run(r.persist())                       # snapshot is now empty
+        r2 = NetromRouter("W6ELA-1", "PALO")
+        assert asyncio.run(r2.seed_from_db(db)) == 0
+        assert r2.adjacent_neighbors == set()
+
+    def test_persist_is_noop_without_db_path(self):
+        asyncio.run(self._populated().persist())       # must not raise
+
+    def test_seed_migrates_pre_n5_routes(self, tmp_path):
+        import sqlite3
+        db = str(tmp_path / "old.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE netrom_routes (dest_call TEXT, neighbor_call TEXT,"
+                    " alias TEXT, quality INT, via_call TEXT, via_alias TEXT,"
+                    " last_seen INT, PRIMARY KEY(dest_call, neighbor_call))")
+        con.execute("INSERT INTO netrom_routes VALUES "
+                    "('K2YE-5','K2YE-5','MONTC',150,'N6ZX-5','WBAY',?)",
+                    (int(time.time()),))
+        con.commit(); con.close()
+        r = NetromRouter("W6ELA-1", "PALO")
+        assert asyncio.run(r.seed_from_db(db)) == 1
+        assert r.get_route("K2YE-5").obs_count == 6    # column added, default filled
+
+
+class TestNeighbourLifecycle:
+    """N5b — neighbour-list lifecycle + is_direct_neighbor keyed off it."""
+
+    def test_adjacent_neighbors_are_the_broadcast_sources(self):
+        r = NetromRouter("W6ELA-1", "PALO")
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        # N6ZX-5 broadcast → a neighbour; K2YE-5 is transit-only → not one.
+        assert r.adjacent_neighbors == {"N6ZX-5"}
+        assert r.is_direct_neighbor("N6ZX-5") is True
+        assert r.is_direct_neighbor("K2YE-5") is False
+
+    def test_neighbour_ages_out_when_routes_decay(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=1)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES",
+            _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 200)])))
+        assert "N6ZX-5" in r.adjacent_neighbors
+        r.decay_obsolescence()      # obs 1→0: routes deleted → neighbour reconciled out
+        assert r.is_direct_neighbor("N6ZX-5") is False
+        assert r.adjacent_neighbors == set()
+
+    def test_crosslink_pins_neighbour_until_link_drops(self):
+        r = NetromRouter("W6ELA-1", "PALO", obs_initializer=1)
+        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", _nodes_payload("WBAY", [])))
+        r.note_crosslink("N6ZX-5", up=True)
+        r.decay_obsolescence()      # routes gone, but the live crosslink pins it
+        assert r.is_direct_neighbor("N6ZX-5") is True
+        r.note_crosslink("N6ZX-5", up=False)   # link down → reconciled out
+        assert r.is_direct_neighbor("N6ZX-5") is False
 
 
 class TestNetromRouterMultiRoute:
@@ -96,7 +298,8 @@ class TestNetromRouterMultiRoute:
 
         routes = r.get_routes("K2YE-5")
         assert len(routes) == 3
-        assert [rt.quality for rt in routes] == [220, 180, 150]
+        # composed via ×192÷256: 220→165, 180→135, 150→113 (order preserved)
+        assert [rt.quality for rt in routes] == [165, 135, 113]
         # W6OAK-5 (lowest quality) was dropped
         assert all(rt.via_call != "W6OAK-5" for rt in routes)
 
@@ -109,7 +312,7 @@ class TestNetromRouterMultiRoute:
         asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", p2))
         routes = r.get_routes("K2YE-5")
         assert len(routes) == 1
-        assert routes[0].quality == 180
+        assert routes[0].quality == 135   # 180 × 192 ÷ 256 (refreshed, not appended)
 
     def test_routing_table_includes_alternates(self):
         r = NetromRouter("W6ELA-1", "PALO")
@@ -213,45 +416,43 @@ class TestNetromRouterBuildNodes:
         # Our broadcast advertises N6ZX-5 (our actual next hop), NOT ABC-1.
         assert k2ye.neighbor_call == "N6ZX-5"
 
-    def test_payload_degrades_quality(self):
-        r = NetromRouter("W6ELA-1", "PALO", hop_cost=25, advertise_self_only=False)
-        payload = _nodes_payload("WBAY", [
-            NodeEntry("K2YE-5", "COOL", "K2YE-5", 200),
-        ])
-        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", payload))
-
-        result = r.build_nodes_payload()
-        frame = decode_nodes_broadcast("W6ELA-1", result)
+    def test_payload_advertises_composed_quality(self):
+        # N5: no hop_cost degradation — we advertise our composed route quality
+        # verbatim (the receiver re-composes through its own link to us).
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False)
+        r._upsert_route(RouteEntry(
+            "K2YE-5", "COOL", "K2YE-5", 150, "N6ZX-5", "WBAY", time.time()))
+        frame = decode_nodes_broadcast("W6ELA-1", r.build_nodes_payload())
         assert frame is not None
-        # 200 - 25 = 175
-        assert frame.entries[0].quality == 175
+        assert frame.entries[0].quality == 150            # advertised as-is
 
-    def test_payload_skips_below_min_quality(self):
-        r = NetromRouter(
-            "W6ELA-1", "PALO", hop_cost=25, min_advert_quality=180,
-            advertise_self_only=False,
-        )
-        payload = _nodes_payload("WBAY", [
-            NodeEntry("K2YE-5", "COOL", "K2YE-5", 200),  # → degraded 175 < 180, skipped
-            NodeEntry("KK6XY-9",  "GOOD", "KK6XY-9",  220),  # → degraded 195 ≥ 180, kept
-        ])
-        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", payload))
-
-        result = r.build_nodes_payload()
-        frame = decode_nodes_broadcast("W6ELA-1", result)
+    def test_payload_obs_gate_skips_stale_routes(self):
+        # A route below obs_min_to_broadcast is too stale to propagate (p.66).
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False,
+                         obs_min_to_broadcast=5)
+        now = time.time()
+        r._upsert_route(RouteEntry("K2YE-5", "COOL", "K2YE-5", 150,
+                                   "N6ZX-5", "WBAY", now, obs_count=6))   # fresh → advertised
+        r._upsert_route(RouteEntry("KK6XY-9", "GOOD", "KK6XY-9", 160,
+                                   "N6ZX-5", "WBAY", now, obs_count=2))   # stale → skipped
+        frame = decode_nodes_broadcast("W6ELA-1", r.build_nodes_payload())
         assert frame is not None
-        dest_calls = {e.dest_call for e in frame.entries}
-        assert dest_calls == {"KK6XY-9"}
+        assert {e.dest_call for e in frame.entries} == {"K2YE-5"}
 
-    def test_payload_returns_none_when_all_skipped(self):
-        r = NetromRouter(
-            "W6ELA-1", "PALO", hop_cost=100, min_advert_quality=200,
-            advertise_self_only=False,
-        )
-        payload = _nodes_payload("WBAY", [
-            NodeEntry("K2YE-5", "COOL", "K2YE-5", 150),  # degraded 50 < 200
-        ])
-        asyncio.run(r.on_netrom_frame("N6ZX-5", "NODES", payload))
+    def test_payload_locked_route_always_advertised(self):
+        # obs_count == 0 marks a locked route — advertised regardless of the gate.
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False,
+                         obs_min_to_broadcast=5)
+        r._upsert_route(RouteEntry("K2YE-5", "COOL", "K2YE-5", 150,
+                                   "N6ZX-5", "WBAY", time.time(), obs_count=0))
+        frame = decode_nodes_broadcast("W6ELA-1", r.build_nodes_payload())
+        assert {e.dest_call for e in frame.entries} == {"K2YE-5"}
+
+    def test_payload_returns_none_when_all_stale(self):
+        r = NetromRouter("W6ELA-1", "PALO", advertise_self_only=False,
+                         obs_min_to_broadcast=5)
+        r._upsert_route(RouteEntry("K2YE-5", "COOL", "K2YE-5", 150,
+                                   "N6ZX-5", "WBAY", time.time(), obs_count=1))
         assert r.build_nodes_payload() is None
 
     def test_payload_uses_only_best_alternate(self):
@@ -269,9 +470,9 @@ class TestNetromRouterBuildNodes:
         assert frame is not None
         # Entries: K2YE-5 (best alternate only) + N6ZX-5 + K6FB-5 (auto-added).
         k2ye = next(e for e in frame.entries if e.dest_call == "K2YE-5")
-        # Best route is via K6FB-5 with quality 220.
+        # Best route is via K6FB-5; quality composed 220 × 192 ÷ 256 = 165.
         assert k2ye.neighbor_call == "K6FB-5"
-        assert k2ye.quality == 220
+        assert k2ye.quality == 165
 
 
 # ── Polite-client (self-only) mode ──────────────────────────────────────────
@@ -555,11 +756,13 @@ class TestOutboundNeighbor:
         assert r.is_direct_neighbor("K6FB-5") is True
         assert r.is_direct_neighbor("K2YE-5") is False   # only reachable via N6ZX-5
 
-    def test_best_neighbor_prefers_direct_over_higher_transit(self):
+    def test_best_neighbor_prefers_direct_over_transit(self):
         r = self._direct_and_transit()
-        # get_route picks the higher-quality transit route…
-        assert r.get_route("N6ZX-5").via_call == "K6FB-5"
-        # …but for originating we prefer the direct link to N6ZX-5 itself.
+        # N5: with link-adjusted quality a 1-hop direct route (= path quality)
+        # always outranks a 2-hop transit route through an equal-quality link,
+        # so get_route already returns the direct route…
+        assert r.get_route("N6ZX-5").via_call == "N6ZX-5"
+        # …and best_neighbor_for prefers the direct link to N6ZX-5 itself.
         assert r.best_neighbor_for("N6ZX-5") == "N6ZX-5"
 
     def test_best_neighbor_transit(self):
@@ -576,8 +779,9 @@ class TestOutboundNeighbor:
         asyncio.run(r.on_netrom_frame(
             "N6ZX-5", "NODES",
             _nodes_payload("WBAY", [NodeEntry("K2YE-5", "MONTC", "K2YE-5", 60)])))
+        # 60 advertised × 192 ÷ 256 = 45 composed.
         assert r.best_neighbor_for("K2YE-5", min_quality=100) is None
-        assert r.best_neighbor_for("K2YE-5", min_quality=50) == "N6ZX-5"
+        assert r.best_neighbor_for("K2YE-5", min_quality=40) == "N6ZX-5"
 
     def test_best_neighbor_prefers_direct_heard_over_transit(self):
         """A known dest reachable only via transit is crosslinked to DIRECTLY

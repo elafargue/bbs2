@@ -209,10 +209,38 @@ netrom:
   # Route expiry: a learned route is dropped if its advertiser has been silent
   # for this many minutes (default 180 = 3 hours, ~3× the default broadcast cadence)
   route_ttl_minutes: 180
-  # Quality decrement applied when re-advertising a learned route (default 25)
+  # hop_cost / min_advert_quality are RETIRED under N5 (routing fidelity): route
+  # quality is now composed through per-neighbour link quality on receive, and
+  # transit re-advertisement is gated by obs_min_to_broadcast (below) — these two
+  # keys are still parsed for back-compat but have no effect.
   hop_cost: 25
-  # Minimum quality required to re-advertise a route after decrement (default 10)
   min_advert_quality: 10
+  # ── Routing-table fidelity (N5, from the 1987 NET/ROM 1.3 manual) ──────────
+  # Receive-side route quality = (advertised × path_quality + 128) / 256, i.e.
+  # the neighbour's advertised quality composed with OUR link quality to it —
+  # so transit qualities are link-adjusted (they'll read lower than the raw
+  # advertised numbers; that's correct). These map to the NET/ROM PARMS:
+  #   channel_quality  — default per-neighbour link (path) quality for the RF
+  #                      port (PARMS #3; 192 = a 1200-baud user channel).
+  #   worst_quality    — ignore learned routes below this (PARMS #2); 0 = ignore
+  #                      ALL incoming NODES (isolated node).
+  #   max_destinations — cap on the destination table (PARMS #1; manual 50/max 400).
+  #   obs_initializer  — obsolescence count set on a route when heard/used
+  #                      (PARMS #5, default 6); the periodic scan decrements it
+  #                      each NODES cycle and deletes the route at 0, instead of
+  #                      a hard TTL — so a briefly-quiet neighbour lingers a few
+  #                      cycles (stable tables). 0 = routes never decay.
+  #   obs_min_to_broadcast — only re-advertise routes with obs >= this (PARMS
+  #                      #6, default 5); used only in transit-node mode (N5c).
+  channel_quality: 192
+  worst_quality: 1
+  max_destinations: 200
+  obs_initializer: 6
+  obs_min_to_broadcast: 5
+  # Optional per-neighbour link-quality overrides (the ROUTES+ equivalent):
+  #   neighbour_quality:
+  #     KF6ANX-4: 200      # a stronger link than the channel default
+  #     N6ZX-5: 128        # a marginal/HF link
   # Idle-crosslink teardown: once the last NET/ROM circuit on a neighbor
   # crosslink closes, disconnect the underlying AX.25 link after this many
   # seconds with no circuits (default 900 = 15 min). 0 = keep links up

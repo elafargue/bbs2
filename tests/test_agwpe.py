@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import re
 import struct
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1128,3 +1129,47 @@ class TestNetromNodeCallSourcing:
         t.set_extra_callsigns(["N0CALL-5", "W6ELA-9"])
         assert "N0CALL-5" not in t._extra_callsigns   # registered once, in start()
         assert "W6ELA-9" in t._extra_callsigns
+
+
+# ─── Broadcast cadence across restarts (beacon / NODES timestamp persistence) ──
+
+class TestBroadcastCadence:
+    """QoL: persist the last beacon/NODES broadcast so a restart respects the
+    configured cadence instead of transmitting immediately (politer on air)."""
+
+    def test_no_state_path_sends_immediately(self):
+        t = _make_transport()                          # persistence not wired
+        assert t._initial_broadcast_delay("beacon", 1200) == 0.0
+
+    def test_never_broadcast_sends_immediately(self, tmp_path):
+        t = _make_transport()
+        t.set_broadcast_state_path(str(tmp_path / "s.json"))
+        assert t._initial_broadcast_delay("nodes", 1800) == 0.0
+
+    def test_recent_broadcast_defers_the_remainder(self, tmp_path):
+        t = _make_transport()
+        t.set_broadcast_state_path(str(tmp_path / "s.json"))
+        t._save_broadcast_state("beacon", time.time())     # just transmitted
+        d = t._initial_broadcast_delay("beacon", 1200)
+        assert 1100 < d <= 1200                            # ~full interval left
+
+    def test_overdue_broadcast_sends_immediately(self, tmp_path):
+        t = _make_transport()
+        t.set_broadcast_state_path(str(tmp_path / "s.json"))
+        t._save_broadcast_state("nodes", time.time() - 3600)   # an hour ago
+        assert t._initial_broadcast_delay("nodes", 1800) == 0.0
+
+    def test_state_roundtrips_with_independent_keys(self, tmp_path):
+        p = str(tmp_path / "s.json")
+        t = _make_transport(); t.set_broadcast_state_path(p)
+        t._save_broadcast_state("beacon", 100.0)
+        t._save_broadcast_state("nodes", 200.0)
+        t2 = _make_transport(); t2.set_broadcast_state_path(p)  # a "restart"
+        st = t2._load_broadcast_state()
+        assert st["beacon"] == 100.0 and st["nodes"] == 200.0
+
+    def test_corrupt_state_file_is_ignored(self, tmp_path):
+        p = tmp_path / "s.json"; p.write_text("not json{")
+        t = _make_transport(); t.set_broadcast_state_path(str(p))
+        assert t._load_broadcast_state() == {}
+        assert t._initial_broadcast_delay("beacon", 1200) == 0.0

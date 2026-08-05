@@ -69,6 +69,7 @@ class NetromNode:
         node_alias: str,           # our node alias (e.g. PALO)
         router: NetromRouter,
         transports: list[Transport],
+        heard_recent: Optional[Callable[[], list]] = None,  # MH: recent RF-heard stations
         apps: Optional[dict[str, LocalAppRunner]] = None,  # local apps: C BBS / C <svc>
         may_connect: bool = True,           # gateway auth gate (full ACL is N4)
         connect_timeout: float = 60.0,
@@ -96,6 +97,10 @@ class NetromNode:
         self.node_alias = (node_alias or node_call).upper()
         self.router = router
         self.transports = list(transports)
+        # MH source: () -> list[(callsign, unix_ts)] of recently RF-heard
+        # stations, most-recent first (heard plugin).  None ⇒ MH falls back to
+        # the neighbour list.
+        self._heard_recent = heard_recent
         # Local applications reachable via ``C <name>`` (N3): the built-in BBS
         # as ``BBS`` plus each ax25d-style service by its called SSID.  Keyed
         # uppercase; resolved BEFORE NET/ROM node resolution in cmd_connect so a
@@ -281,51 +286,64 @@ class NetromNode:
         await self._send_columns(tokens)
 
     async def cmd_routes(self, arg: str = "") -> None:
-        """Routes table.
+        """Routes table (1987 manual p.22 / p.18 layout, matching peer nodes).
 
-        With **no argument** — list our adjacent-neighbor links with quality
-        (the classic NET/ROM ``ROUTES`` view: the nodes we crosslink to directly).
-        With a **target** — the alternate routes to that specific destination,
-        in quality order.
+        With **no argument** — the neighbour list: one row per adjacent node as
+        ``[>] port neighbour path-quality use-count [!]`` (``>`` = a live
+        crosslink, ``!`` = operator-locked).
+        With a **target** — up to three routes to that destination as
+        ``[>] quality obs port neighbour`` (``>`` = the route in use).
         """
         target = arg.strip()
         if not target:
-            neighbors = sorted(self.router.adjacent_neighbors)
-            if not neighbors:
+            neighbours = self.router.neighbour_list
+            if not neighbours:
                 await self.term.sendln("No routes.")
                 return
             await self.term.sendln("Routes:")
-            for call in neighbors:
-                route = self.router.get_route(call)
-                alias = route.alias if (route and route.alias) else "-"
-                quality = route.quality if route else 0
-                await self.term.sendln(f"  {alias}:{call} q={quality}")
+            for n in neighbours:
+                flag = ">" if n.crosslink else " "
+                lock = " !" if n.locked else ""
+                await self.term.sendln(
+                    f" {flag} {n.port or '0'} {n.call} {n.path_quality} "
+                    f"{n.use_count}{lock}"
+                )
             return
         routes = self.router.get_routes(target)
         if not routes:
             await self.term.sendln(f"No route to {target.upper()}.")
             return
+        best = routes[0]
+        await self.term.sendln(f"Routes to {best.alias or '-'}:{best.dest_call}:")
         for r in routes:
-            tag = "direct" if r.is_direct else f"via {r.via_call}({r.via_alias})"
+            cur = ">" if r is best else " "
             await self.term.sendln(
-                f"{r.alias or '-'}:{r.dest_call} q={r.quality} {tag}"
+                f" {cur} {r.quality} {r.obs_count} 0 {r.via_call}"
             )
 
     async def cmd_mheard(self, _arg: str = "") -> None:
-        """Adjacent NET/ROM neighbors — nodes whose NODES broadcasts we receive
-        directly, i.e. the nodes we can open a crosslink to in one hop.
+        """Recently heard stations (MHEARD) — callsigns we've heard *directly* on
+        the air (RF beacons / IDs), most-recent first, from the heard plugin.
 
-        (Sourced from the router's adjacent-neighbor set — the ``via_call`` of
-        every route — not from ``is_direct`` dest routes, which aren't persisted
-        across restarts and so are empty until each neighbor re-broadcasts.)
-        """
-        tokens: list[str] = []
-        for call in sorted(self.router.adjacent_neighbors):
-            route = self.router.get_route(call)
-            alias = route.alias if (route and route.alias) else "-"
-            tokens.append(f"{alias}:{call}")
+        Distinct from ``R`` (the neighbour list of NODES broadcasters).  Falls
+        back to the neighbour list when the heard plugin is unavailable."""
+        if self._heard_recent is not None:
+            try:
+                heard = self._heard_recent()
+            except Exception:
+                heard = []
+            if heard:
+                now = time.time()
+                tokens = [
+                    f"{call}({int(max(0, now - ts) // 60)}m)"
+                    for call, ts in heard
+                ]
+                await self._send_columns(tokens)
+                return
+        # Fallback: the neighbour list (nodes whose NODES we hear directly).
+        tokens = [n.call for n in self.router.neighbour_list]
         if not tokens:
-            await self.term.sendln("No neighbors heard.")
+            await self.term.sendln("Nothing heard.")
             return
         await self._send_columns(tokens)
 

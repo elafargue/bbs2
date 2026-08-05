@@ -188,6 +188,14 @@ class Transport(ABC):
         Default-implementation no-op; AGWPE overrides.
         """
 
+    def set_broadcast_state_path(self, path: str) -> None:
+        """Persist the last beacon / NODES broadcast timestamps to *path* so that
+        after a restart the transport respects the configured cadence instead of
+        transmitting immediately (politer on a shared channel).
+
+        Default-implementation no-op; AGWPE overrides.
+        """
+
     def set_extra_callsigns(self, calls: list[str]) -> None:
         """Register additional callsign-SSIDs this transport should accept.
 
