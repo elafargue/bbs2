@@ -186,7 +186,11 @@ class Terminal:
     @staticmethod
     def _visible_len(text: str) -> int:
         """Return the printable length of *text*, ignoring ANSI escape codes."""
-        plain = _RE_CSI.sub("", _RE_ESC.sub("", text))
+        # Strip CSI sequences first, then any stray ESC pairs — the same order as
+        # _encode().  Doing ESC first would consume the "\x1b[" of a CSI sequence,
+        # leaving its parameter bytes (e.g. "38;2;110;223;255m") counted as
+        # visible and inflating the width of truecolor-styled text.
+        plain = _RE_ESC.sub("", _RE_CSI.sub("", text))
         return len(plain)
 
     def style(self, text: str, tone: str = "accent", *, bold: bool = False) -> str:

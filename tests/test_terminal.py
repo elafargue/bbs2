@@ -69,3 +69,24 @@ async def test_paginate_q_char_mode_no_trailing_enter():
         timeout=5,
     )
     assert result is False               # still quits promptly, does not hang
+
+
+# ── _visible_len: ANSI-aware width (used by send_menu column padding) ──────────
+
+def test_visible_len_ignores_truecolor_csi():
+    # Regression: stripping ESC before CSI consumed the "\x1b[" of a truecolor
+    # sequence, leaving its parameter bytes counted as visible (width was 29).
+    styled = "\x1b[38;2;110;223;255m###--  67 \x1b[0m"
+    assert Terminal._visible_len(styled) == 10
+
+
+def test_visible_len_ansi16_and_plain():
+    assert Terminal._visible_len("\x1b[1m\x1b[36mHELLO\x1b[0m") == 5
+    assert Terminal._visible_len("plain text") == len("plain text")
+
+
+def test_visible_len_matches_style_output():
+    # Whatever style() emits in truecolor, its visible length is the raw text
+    # length — this is the invariant send_menu relies on for column alignment.
+    t = Terminal(None, None, color_mode="truecolor")
+    assert Terminal._visible_len(t.style("N6ABC", "accent", bold=True)) == 5
