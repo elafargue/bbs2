@@ -30,6 +30,7 @@ from bbs.transport.agwpe import (
     _build_frame,
     _build_unproto_via_frame,
     _decode_call,
+    _decode_signal,
     _encode_call,
     _PID_NO_L3,
     _parse_info,
@@ -735,7 +736,7 @@ class TestReadLoopIsolatesDispatchErrors:
 
         calls: list[str] = []
 
-        async def _boom_then_ok(kind, port, call_from, call_to, pid, payload, writer):
+        async def _boom_then_ok(kind, port, call_from, call_to, pid, payload, writer, user_reserved=b""):
             calls.append(kind)
             if len(calls) == 1:
                 raise RuntimeError("simulated per-frame dispatch failure")
@@ -763,7 +764,7 @@ class TestReadLoopIsolatesDispatchErrors:
         transport._running = True
         transport._drain_lock = asyncio.Lock()
 
-        async def _cancel(kind, port, call_from, call_to, pid, payload, writer):
+        async def _cancel(kind, port, call_from, call_to, pid, payload, writer, user_reserved=b""):
             raise asyncio.CancelledError()
 
         transport._dispatch = _cancel  # type: ignore[assignment]
@@ -1197,3 +1198,178 @@ class TestBroadcastCadence:
         t = _make_transport(); t.set_broadcast_state_path(str(p))
         assert t._load_broadcast_state() == {}
         assert t._initial_broadcast_delay("beacon", 1200) == 0.0
+
+
+# ─── Signal-quality extension (Direwolf AGWPE opt-in) ─────────────────────────
+
+class TestDecodeSignal:
+    """_decode_signal() — extract per-frame signal from user_reserved bytes."""
+
+    def test_populated(self):
+        assert _decode_signal(bytes([28, 10, 6, 0])) == (28, 10, 6, 0)
+
+    def test_non_afsk_sentinel_passed_through(self):
+        # 0xFF mark/space (non-AFSK) decoded verbatim; the plugin maps it to NULL.
+        assert _decode_signal(bytes([40, 0xFF, 0xFF, 1])) == (40, 255, 255, 1)
+
+    def test_all_zero_is_none(self):
+        assert _decode_signal(bytes([0, 0, 0, 0])) is None
+
+    def test_short_or_empty_is_none(self):
+        assert _decode_signal(b"\x1c") is None
+        assert _decode_signal(b"") is None
+
+
+class TestSignalQualityExtension:
+    """Opt-in 'q' handshake and per-frame signal on monitor frames."""
+
+    _MON = (b" 1:Fm N6ZX To BEACON <UI pid=F0 Len=5 PF=0 >[15:13:21]\rhi\r\r\x00")
+
+    def setup_method(self):
+        self.transport = _make_transport()
+        self.transport._running = True
+        self.transport._drain_lock = asyncio.Lock()
+        self.fake_writer = _FakeWriter()
+        self.heard: list[tuple] = []
+
+        async def _observer(src, dest, via, ts, transport, info, signal=None,
+                            count_it=True, log_signal=True):
+            self.heard.append((src, dest, via, info, signal, count_it, log_signal))
+
+        self.transport._heard_observer = _observer
+
+    @staticmethod
+    def _written_kinds(writer) -> list[str]:
+        buf = bytes(writer.written)
+        kinds, i = [], 0
+        while i + _HEADER_SIZE <= len(buf):
+            hdr = _unpack_header(buf[i:])
+            kinds.append(hdr["kind"])
+            i += _HEADER_SIZE + hdr["data_len"]
+        return kinds
+
+    async def test_q_opt_in_sent_after_m(self):
+        self.transport._registered = asyncio.Event()
+        self.transport._monitoring_on = False
+        await self.transport._dispatch("X", 0, "", "", 0, b"\x01", self.fake_writer)
+        kinds = self._written_kinds(self.fake_writer)
+        assert "m" in kinds and "q" in kinds
+        assert kinds.index("q") > kinds.index("m")  # opt-in follows monitor-enable
+
+    async def test_q_opt_in_suppressed_when_disabled(self):
+        t = _make_transport({"signal_quality": False})
+        t._running = True
+        t._drain_lock = asyncio.Lock()
+        t._registered = asyncio.Event()
+        w = _FakeWriter()
+        await t._dispatch("X", 0, "", "", 0, b"\x01", w)
+        kinds = self._written_kinds(w)
+        assert "m" in kinds and "q" not in kinds
+
+    async def test_q_ack_activates_extension(self):
+        assert self.transport._ext_sig_active is False
+        await self.transport._dispatch("q", 0, "", "", 0, b"ExtSig=1\x00", self.fake_writer)
+        assert self.transport._ext_sig_active is True
+
+    async def test_monitor_frame_carries_signal_when_active(self):
+        self.transport._ext_sig_active = True
+        await self.transport._dispatch(
+            "U", 0, "N6ZX", "BEACON", 0xF0, self._MON,
+            self.fake_writer, bytes([28, 10, 6, 0]),
+        )
+        assert len(self.heard) == 1
+        assert self.heard[0][0] == "N6ZX"
+        assert self.heard[0][4] == (28, 10, 6, 0)
+
+    async def test_monitor_frame_no_signal_when_inactive(self):
+        # Un-acked transport must ignore the bytes even if populated.
+        self.transport._ext_sig_active = False
+        await self.transport._dispatch(
+            "U", 0, "N6ZX", "BEACON", 0xF0, self._MON,
+            self.fake_writer, bytes([28, 10, 6, 0]),
+        )
+        assert len(self.heard) == 1
+        assert self.heard[0][4] is None
+
+    _NODES = (b" 1:Fm KI6ZHD-5 To NODES <UI pid=CF >[15:13:21]\r\x01SCLARA\r\x00")
+
+    async def test_netrom_nodes_frame_records_signal_uncounted(self):
+        # NET/ROM frames go to the routing observer AND now feed a signal-only,
+        # uncounted heard record for the transmitter (beacon text suppressed).
+        self.transport._ext_sig_active = True
+        netrom_seen = []
+
+        async def _netrom(src, dest, binary):
+            netrom_seen.append((src, dest, binary))
+        self.transport._netrom_observer = _netrom
+
+        await self.transport._dispatch(
+            "U", 0, "KI6ZHD-5", "NODES", 0xF0, self._NODES,
+            self.fake_writer, bytes([57, 11, 9, 0]),
+        )
+        assert netrom_seen and netrom_seen[0][0] == "KI6ZHD-5"   # routing still ran
+        assert len(self.heard) == 1
+        src, dest, via, info, signal, count_it, log_signal = self.heard[0]
+        assert src == "KI6ZHD-5"
+        assert signal == (57, 11, 9, 0)
+        assert info == ""            # binary payload not stored as beacon text
+        assert count_it is False     # not double-counted
+
+    async def test_netrom_frame_no_signal_when_extension_inactive(self):
+        # Without the extension the NET/ROM path is unchanged: routing only.
+        self.transport._ext_sig_active = False
+
+        async def _netrom(src, dest, binary):
+            pass
+        self.transport._netrom_observer = _netrom
+
+        await self.transport._dispatch(
+            "U", 0, "KI6ZHD-5", "NODES", 0xF0, self._NODES,
+            self.fake_writer, bytes([57, 11, 9, 0]),
+        )
+        assert len(self.heard) == 0
+
+    # Connected-mode monitored frames (a live BBS caller): 'I' = info, 'S' = RR/SABM.
+    _INFO = b" 1:Fm KK6FPP To W6ELA-1 <I S0 R0 pid=F0 >[10:29:43]\rh\r\x00"
+    _RR   = b" 1:Fm KK6FPP To W6ELA-1 <RR R15 >[10:29:28]\r\x00"
+
+    async def test_connected_info_frame_records_signal_realtime(self):
+        self.transport._ext_sig_active = True
+        await self.transport._dispatch(
+            "I", 0, "KK6FPP", "W6ELA-1", 0xF0, self._INFO,
+            self.fake_writer, bytes([59, 16, 11, 0]),
+        )
+        assert len(self.heard) == 1
+        src, dest, via, info, signal, count_it, log_signal = self.heard[0]
+        assert src == "KK6FPP"
+        assert signal == (59, 16, 11, 0)   # the caller's live level
+        assert info == ""                  # session data, not beacon text
+        assert count_it is False           # not counted per-frame
+        assert log_signal is False         # quiet: no per-frame log spam
+
+    async def test_connected_supervisory_frame_records_signal(self):
+        self.transport._ext_sig_active = True
+        await self.transport._dispatch(
+            "S", 0, "KK6FPP", "W6ELA-1", 0xF0, self._RR,
+            self.fake_writer, bytes([61, 16, 11, 0]),
+        )
+        assert len(self.heard) == 1
+        assert self.heard[0][0] == "KK6FPP"
+        assert self.heard[0][4] == (61, 16, 11, 0)
+
+    async def test_connected_own_frame_not_recorded(self):
+        # Our own transmitted frames arrive as 'T', but guard anyway.
+        self.transport._ext_sig_active = True
+        await self.transport._dispatch(
+            "I", 0, "N0CALL-1", "KK6FPP", 0xF0, self._INFO,   # local call = N0CALL-1
+            self.fake_writer, bytes([59, 16, 11, 0]),
+        )
+        assert len(self.heard) == 0
+
+    async def test_connected_frame_no_signal_when_extension_inactive(self):
+        self.transport._ext_sig_active = False
+        await self.transport._dispatch(
+            "I", 0, "KK6FPP", "W6ELA-1", 0xF0, self._INFO,
+            self.fake_writer, bytes([59, 16, 11, 0]),
+        )
+        assert len(self.heard) == 0

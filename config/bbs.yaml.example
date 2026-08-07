@@ -90,6 +90,12 @@ transports:
     beacon_dest: "BEACON"
     beacon_interval: 20   # minutes
     beacon_path: ""       # e.g. "WIDE1-1,WIDE2-1"
+    # Opt into the Direwolf RF signal-quality extension (per-frame audio level
+    # for directly-heard stations, shown in the heard plugin). Harmless against
+    # a stock Direwolf — it ignores the opt-in and this stays inactive. Set
+    # false to never send the opt-in. Requires a Direwolf build with the
+    # extension (elafargue fork, branch agwpe-signal-quality).
+    signal_quality: true
 
   # Plain TCP (for Telnet / local testing)
   tcp:

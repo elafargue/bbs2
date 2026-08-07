@@ -85,7 +85,23 @@ def heard_list():
                            WHEN e2.transport = 'netrom' THEN 1
                            ELSE 2 END,
                       e2.last_heard DESC
-                  LIMIT 1) AS transport
+                  LIMIT 1) AS transport,
+                -- RF signal quality (v5), aggregated across this callsign's
+                -- rows (direct + digi): current reading from the freshest
+                -- signal-bearing row; best_level is the peak ever seen.
+                (SELECT e2.last_level FROM heard_events e2
+                  WHERE e2.callsign = s.callsign AND e2.last_level IS NOT NULL
+                  ORDER BY e2.last_heard DESC LIMIT 1) AS signal_level,
+                (SELECT e2.last_tone_mark FROM heard_events e2
+                  WHERE e2.callsign = s.callsign AND e2.last_level IS NOT NULL
+                  ORDER BY e2.last_heard DESC LIMIT 1) AS signal_tone_mark,
+                (SELECT e2.last_tone_space FROM heard_events e2
+                  WHERE e2.callsign = s.callsign AND e2.last_level IS NOT NULL
+                  ORDER BY e2.last_heard DESC LIMIT 1) AS signal_tone_space,
+                (SELECT e2.last_copy_quality FROM heard_events e2
+                  WHERE e2.callsign = s.callsign AND e2.last_level IS NOT NULL
+                  ORDER BY e2.last_heard DESC LIMIT 1) AS signal_copy,
+                MAX(e.best_level) AS signal_best
             FROM stations s
             LEFT JOIN heard_events e ON e.callsign = s.callsign
             GROUP BY s.callsign

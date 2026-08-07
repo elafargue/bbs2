@@ -74,6 +74,58 @@ function fmtTs(unix) {
   return new Date(unix * 1000).toLocaleString()
 }
 
+// RF signal quality (Direwolf AGWPE extension). signal_level is Direwolf's
+// audio level (~0–100, aim ~50). Rendered as a single-hue magnitude bar; copy
+// quality is a reserved status icon, details in the tooltip.
+function signalPct(level) {
+  return Math.max(0, Math.min(100, level))
+}
+
+// "Twist" = the amplitude balance of the two AFSK tones, in dB:
+//   20·log10(mark/space).  Positive → the 1200 Hz (low/mark) tone is stronger;
+//   negative → the 2200 Hz (high/space) tone is stronger.  It reflects the
+//   sender's TX audio (pre-emphasis/deviation) as heard at *this* receiver, so
+//   it's a relative diagnostic: stations far from the local cluster have
+//   unusual audio.  null for non-AFSK (mark/space N/A).
+function twistDb(item) {
+  const m = item.signal_tone_mark, s = item.signal_tone_space
+  if (m == null || s == null || m <= 0 || s <= 0) return null
+  return 20 * Math.log10(m / s)
+}
+function twistText(db) {
+  if (db == null) return null
+  const sign = db >= 0 ? '+' : ''
+  const lean = Math.abs(db) < 1.0
+    ? 'tones balanced'
+    : (db > 0 ? 'low-tone heavy' : 'high-tone heavy')
+  return `twist ${sign}${db.toFixed(1)} dB (${lean})`
+}
+// Diverging glyph fill: grows from the centre toward the heavier tone, length
+// ∝ |twist| clamped to ±6 dB.  Warm = low-tone heavy, cool = high-tone heavy
+// (a validated diverging pair; direction is also carried by side, not colour).
+function twistFillStyle(db) {
+  const frac = Math.min(Math.abs(db) / 6, 1)
+  const halfPct = `${50 * frac}%`
+  return db >= 0
+    ? { right: '50%', width: halfPct, backgroundColor: '#b5651d' }
+    : { left: '50%',  width: halfPct, backgroundColor: '#2a9d8f' }
+}
+
+function signalTooltip(item) {
+  const parts = [`Signal level ${item.signal_level}`]
+  const tw = twistText(twistDb(item))
+  if (tw) parts.push(tw)
+  if (item.signal_tone_mark != null && item.signal_tone_space != null)
+    parts.push(`mark ${item.signal_tone_mark} / space ${item.signal_tone_space}`)
+  if (item.signal_best != null && item.signal_best !== item.signal_level)
+    parts.push(`best ${item.signal_best}`)
+  parts.push(item.signal_copy > 0
+    ? `marginal copy (${item.signal_copy} retr${item.signal_copy === 1 ? 'y' : 'ies'})`
+    : 'clean copy')
+  if (item.signal_level > 110) parts.push('input too hot')
+  return parts.join(' · ')
+}
+
 async function load() {
   loading.value = true
   const [listRes, cfgRes] = await Promise.all([
@@ -379,6 +431,7 @@ onMounted(load)
             { title: 'Comment',    key: 'comment',     sortable: true },
             { title: 'Last Heard',  key: 'last_heard',  sortable: true },
             { title: 'Count',       key: 'count',       sortable: true },
+            { title: 'Signal',      key: 'signal_level', sortable: true },
             { title: '',            key: 'actions',     sortable: false },
           ]"
           :items="stations"
@@ -423,6 +476,28 @@ onMounted(load)
           </template>
           <template #item.last_heard="{ item }">
             <span v-if="item.source === 'heard' || item.last_heard">{{ fmtTs(item.last_heard) }}</span>
+            <span v-else class="text-disabled">—</span>
+          </template>
+          <template #item.signal_level="{ item }">
+            <div v-if="item.signal_level != null"
+                 class="d-flex align-center" style="gap:6px; min-width:120px"
+                 :title="signalTooltip(item)">
+              <v-progress-linear
+                :model-value="signalPct(item.signal_level)"
+                color="info" bg-color="grey-lighten-1"
+                height="8" rounded style="max-width:56px"
+              />
+              <span class="text-caption">{{ item.signal_level }}</span>
+              <!-- Tone-balance ("twist") diverging glyph: centre = balanced,
+                   fill leans toward the heavier tone. Direction is also in the
+                   tooltip, so it isn't conveyed by colour alone. -->
+              <div v-if="twistDb(item) != null" class="twist-glyph" aria-hidden="true">
+                <div class="twist-fill" :style="twistFillStyle(twistDb(item))"></div>
+                <div class="twist-center"></div>
+              </div>
+              <v-icon v-if="item.signal_copy > 0" size="x-small" color="warning"
+                      icon="mdi-alert-outline" title="marginal copy" />
+            </div>
             <span v-else class="text-disabled">—</span>
           </template>
           <template #item.first_heard="{ item }">
@@ -1012,3 +1087,32 @@ onMounted(load)
     </v-snackbar>
   </v-container>
 </template>
+
+<style scoped>
+/* Tone-balance ("twist") diverging glyph — a neutral track with a centre tick;
+   the fill grows from centre toward the heavier tone. Colours are a validated
+   warm/cool diverging pair (light+dark), but side already encodes direction. */
+.twist-glyph {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(128, 128, 128, 0.18);
+}
+.twist-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+.twist-center {
+  position: absolute;
+  left: 50%;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  transform: translateX(-0.5px);
+  background: rgba(128, 128, 128, 0.65);
+}
+</style>

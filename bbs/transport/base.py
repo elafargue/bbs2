@@ -71,8 +71,16 @@ ConnectionCallback = Callable[[Connection], Awaitable[None]]
 # Type alias: callback fired by transports when a frame is heard but NOT
 # addressed to the BBS callsign.
 # Arguments: src_call, dest_call, via (digipeater path), unix_ts, transport_id,
-#            info (decoded AX.25 information field, may be empty).
-HeardFrameCallback = Callable[[str, str, list[str], int, str, str], Awaitable[None]]
+#            info (decoded AX.25 information field, may be empty),
+#            signal (optional per-frame RF quality (rec, mark, space, retries)
+#                    from the Direwolf AGWPE signal-quality extension; None when
+#                    the transport has no signal data).
+# Implementations default `signal` to None so transports that don't provide it
+# (e.g. KISS) can omit the argument.
+HeardFrameCallback = Callable[
+    [str, str, list[str], int, str, str, "Optional[tuple[int, int, int, int]]"],
+    Awaitable[None],
+]
 
 # Type alias: callback fired by transports when a NETROM UI frame arrives
 # (PID=0xCF).  Arguments: src_call, dest_call, binary_payload (raw AX.25

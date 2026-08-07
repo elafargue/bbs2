@@ -159,6 +159,23 @@ def _parse_info(monitor_text: str) -> str:
     return ""
 
 
+def _decode_signal(user_reserved: bytes) -> "tuple[int, int, int, int] | None":
+    """Decode per-frame signal quality from the 4 user_reserved header bytes.
+
+    Layout (Direwolf AGWPE signal-quality extension): [rec, mark, space,
+    retries].  Returns None when the field is absent or all-zero — i.e. no
+    measurement (a real reception is never rec=mark=space=0).
+    """
+    if len(user_reserved) < 4:
+        return None
+    rec, mark, space, retries = (
+        user_reserved[0], user_reserved[1], user_reserved[2], user_reserved[3],
+    )
+    if rec == 0 and mark == 0 and space == 0 and retries == 0:
+        return None
+    return (rec, mark, space, retries)
+
+
 def _append_monitor_log(path: str, text: str) -> None:
     """Append one raw AGWPE 'U' monitor string to *path* (one line per frame)."""
     import datetime
@@ -453,6 +470,14 @@ class AGWPETransport(Transport):
         # service SSIDs) each 'X' ack would otherwise re-toggle it — an even
         # count silences the heard/display plugins.  Guarded by this flag.
         self._monitoring_on: bool = False
+        # Direwolf AGWPE signal-quality extension (see
+        # bbs/plugins/heard/SIGNAL_QUALITY_SPEC.md).  We send the opt-in 'q'
+        # command after 'm'; _ext_sig_active flips true only when the patched
+        # Direwolf acknowledges with a 'q' frame.  Against a stock Direwolf the
+        # 'q' is ignored (no ack) and this stays false, so the extension is a
+        # no-op.  Config key transports.agwpe.signal_quality (default on).
+        self._signal_quality_enabled: bool = bool(cfg.get("signal_quality", True))
+        self._ext_sig_active: bool = False
         # Serialises all drain() calls on the shared AGWPE TCP writer across
         # concurrent session tasks and the beacon loop (Python 3.9 fix).
         self._drain_lock: Optional[asyncio.Lock] = None
@@ -793,6 +818,11 @@ class AGWPETransport(Transport):
             call_from = _decode_call(call_from_raw)
             call_to   = _decode_call(call_to_raw)
             kind      = chr(kind_byte)
+            # The 4-byte user_reserved header field (offset 32) carries per-frame
+            # signal quality on monitor frames when the Direwolf signal-quality
+            # extension is active; zero/ignored otherwise.  Sliced raw to stay
+            # endianness-agnostic.
+            user_reserved = raw[32:36]
 
             logger.debug(
                 "agwpe frame #%d kind=%r port=%d from=%r to=%r data_len=%d sessions=%d",
@@ -821,7 +851,7 @@ class AGWPETransport(Transport):
             # would drop every connected user and bounce the TCP link).  Log
             # and move on; only cancellation propagates.
             try:
-                await self._dispatch(kind, port, call_from, call_to, pid, payload, writer)
+                await self._dispatch(kind, port, call_from, call_to, pid, payload, writer, user_reserved)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -847,6 +877,7 @@ class AGWPETransport(Transport):
         pid: int,
         payload: bytes,
         writer: asyncio.StreamWriter,
+        user_reserved: bytes = b"",
     ) -> None:
         key: _SessionKey = (port, call_from.upper())
 
@@ -871,10 +902,30 @@ class AGWPETransport(Transport):
                     async with self._drain_lock:
                         await writer.drain()
                     logger.info("agwpe: monitoring enabled for hop-count tracking and heard-station logging")
+                    # Opt into the Direwolf signal-quality extension right after
+                    # 'm'.  Harmless against a stock Direwolf (unknown command,
+                    # ignored, no ack) — _ext_sig_active only flips on the 'q' ack.
+                    if self._signal_quality_enabled:
+                        writer.write(_build_frame(self._agw_port, "q", "", ""))
+                        async with self._drain_lock:
+                            await writer.drain()
+                        logger.debug("agwpe: requested signal-quality extension ('q')")
             else:
                 logger.warning(
                     "agwpe: callsign registration FAILED for %s on port %d",
                     self._local_call, port,
+                )
+
+        elif kind == "q":
+            # Ack of our signal-quality opt-in from a patched Direwolf.  Only a
+            # server that understands the extension sends this, so its arrival is
+            # the positive signal that monitor frames now carry per-frame levels
+            # in user_reserved.  (Stock Direwolf never sends 'q'.)
+            if not self._ext_sig_active:
+                self._ext_sig_active = True
+                logger.info(
+                    "agwpe: signal-quality extension active (%s)",
+                    payload.split(b"\x00", 1)[0].decode("ascii", "replace") or "ExtSig",
                 )
 
         elif kind == "C":
@@ -1104,12 +1155,14 @@ class AGWPETransport(Transport):
                     call_from, key, list(self._sessions.keys()),
                 )
 
-        elif kind in ("U", "S"):
+        elif kind in ("U", "S", "I"):
             # Monitored frame. Direwolf splits these by frame class:
-            #   'U' — UI / unproto frames
-            #   'S' — supervisory + all non-UI U-frames (SABM, SABME, UA, DM, …)
-            # SABM/SABME for an incoming connection arrives under 'S', so the
-            # hop-count cache MUST observe both kinds to populate before 'C'.
+            #   'U' — UI / unproto frames (beacons, APRS, NET/ROM NODES)
+            #   'S' — supervisory + non-UI U-frames (SABM, SABME, UA, RR, REJ, …)
+            #   'I' — connected-mode information frames
+            # 'U' drives heard-station tracking; SABM/SABME (under 'S') feeds the
+            # hop-count cache; and 'S'/'I' additionally keep a connected station's
+            # live RF level current (signal extension) for the Signals view.
             # 1. NETROM UI frames — extract binary payload and dispatch to the
             #    NETROM observer before any text decoding.  Use both PID and
             #    destination as discriminators: some AGWPE implementations
@@ -1123,7 +1176,23 @@ class AGWPETransport(Transport):
                         await self._netrom_observer(call_from, call_to, binary_info)
                     except Exception:
                         logger.exception("netrom observer error for frame from %s", call_from)
-                return  # NETROM frames are not heard-station traffic
+                # A NET/ROM frame is still a directly-heard radio, so record the
+                # RF signal for the transmitter — attributed direct-source /
+                # last-hop-digi like any frame.  Beacon text is suppressed (the
+                # payload is binary routing data) and the observation is NOT
+                # counted: the routing path above already counts it on the
+                # 'netrom' row, so this only adds the level to the 'agwpe' row.
+                # Gated on a decoded signal, so it's a no-op without the extension.
+                signal = _decode_signal(user_reserved) if self._ext_sig_active else None
+                if (signal is not None and self._heard_observer is not None
+                        and call_from.upper() != self._local_call.upper()):
+                    via = (_parse_via(payload.decode("ascii", errors="replace"))
+                           if payload else [])
+                    await self._heard_observer(  # type: ignore[call-arg]
+                        call_from, call_to, via, int(time.time()),
+                        self.transport_id, "", signal, count_it=False,
+                    )
+                return  # routing handled; heard-beacon tracking is skipped
             # 2. Cache the via-path length when a SABM/SABME is directed at us.
             if payload and call_to.upper() == self._local_call.upper():
                 try:
@@ -1134,8 +1203,25 @@ class AGWPETransport(Transport):
                             self._pending_hop_counts[call_from.upper()] = len(_via)
                 except Exception:
                     pass
+            # 2b. Connected-mode frames ('S' supervisory/SABM, 'I' info) carry the
+            #     sender's signal too.  Record it real-time (uncounted, and quiet
+            #     so a live session doesn't spam the log) so a connected station
+            #     sees its own level in the Signals view and can tune against it.
+            #     Attribution is the usual direct-source / last-hop-digi rule.
+            if kind in ("S", "I"):
+                signal = _decode_signal(user_reserved) if self._ext_sig_active else None
+                if (signal is not None and self._heard_observer is not None
+                        and call_from.upper() != self._local_call.upper()):
+                    via_cm = (_parse_via(payload.decode("ascii", errors="replace"))
+                              if payload else [])
+                    await self._heard_observer(  # type: ignore[call-arg]
+                        call_from, call_to, via_cm, int(time.time()),
+                        self.transport_id, "", signal,
+                        count_it=False, log_signal=False,
+                    )
+
             # 3. Heard-station tracking is UI-frame only — that's the scope of
-            #    "stations heard on the air". Skip for 'S' kind.
+            #    "stations heard on the air". Skip for 'S'/'I' kinds.
             if kind != "U":
                 return
             if self._heard_observer is None:
@@ -1153,6 +1239,7 @@ class AGWPETransport(Transport):
                     info = _parse_info(text)
                 except Exception:
                     pass
+            signal = _decode_signal(user_reserved) if self._ext_sig_active else None
             await self._heard_observer(
                 call_from,
                 call_to,
@@ -1160,6 +1247,7 @@ class AGWPETransport(Transport):
                 int(time.time()),
                 self.transport_id,
                 info,
+                signal,
             )
 
         # All other frame types (version info, port info, etc.) are

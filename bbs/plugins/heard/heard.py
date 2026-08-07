@@ -22,6 +22,7 @@ Schema (v2)
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -83,6 +84,16 @@ CREATE TABLE IF NOT EXISTS heard_events (
     last_direct_heard INTEGER NOT NULL DEFAULT 0,
     dest              TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
     via               TEXT    NOT NULL DEFAULT '',
+    -- RF signal quality of the most recent *direct* reception (v5). NULL until
+    -- a directly-heard frame carried signal data (Direwolf AGWPE extension).
+    -- last_level = audio level (rec); tone_mark/space = AFSK tone-filter levels
+    -- (NULL/255 = N/A for non-AFSK); copy_quality = retry/FEC level (0 = clean);
+    -- best_level = strongest rec seen.
+    last_level        INTEGER,
+    last_tone_mark    INTEGER,
+    last_tone_space   INTEGER,
+    last_copy_quality INTEGER,
+    best_level        INTEGER,
     PRIMARY KEY (callsign, transport)
 );
 CREATE TABLE IF NOT EXISTS heard_paths (
@@ -124,7 +135,10 @@ _MAX_BEACON_TEXT = 256
 #      stations by base callsign.
 # v4 = add stations.position_ts (when a position was last written) so the
 #      physical-station reference position is the freshest beacon across SSIDs.
-_HEARD_SCHEMA_VERSION = 4
+# v5 = add heard_events RF signal-quality columns (last_level, last_tone_mark,
+#      last_tone_space, last_copy_quality, best_level), fed by the Direwolf
+#      AGWPE signal-quality extension for directly-heard stations.
+_HEARD_SCHEMA_VERSION = 5
 
 
 def _merge_via(stored: str, incoming: str) -> str:
@@ -162,6 +176,37 @@ def _merge_via(stored: str, incoming: str) -> str:
         _base(s) + ("*" if s.endswith("*") or n.endswith("*") else "")
         for s, n in zip(stored_parts, incoming_parts)
     )
+
+
+def _fmt_signal_cell(term, level, copy, width: int = 10) -> str:
+    """Compact fixed-width RF-signal indicator for the text UI.
+
+    A 5-segment ASCII magnitude bar + numeric level + a '~' marker when the copy
+    was marginal (retries > 0).  ASCII only — BBS output is ascii-encoded, so no
+    Unicode block glyphs.  Single accent hue on ANSI terminals (magnitude bar),
+    warning hue when marginal; plain text when colour is off.  Blank when *level*
+    is None so the column stays aligned.
+    """
+    if level is None:
+        return " " * width
+    segs = max(0, min(5, round(level / 20)))
+    bar = "#" * segs + "-" * (5 - segs)
+    marker = "~" if (copy or 0) > 0 else " "
+    raw = f"{bar} {level:>3}{marker}".ljust(width)[:width]
+    if (copy or 0) > 0:
+        return term.warn(raw)
+    return term.style(raw, "accent")
+
+
+def _fmt_twist(mark, space) -> str:
+    """Tone-balance ("twist") for the text UI: 20·log10(mark/space) in dB, signed,
+    with the heavier tone named.  Positive → 1200 Hz (mark) tone stronger; negative
+    → 2200 Hz (space) tone stronger.  "n/a" for non-AFSK (mark/space unknown)."""
+    if mark is None or space is None or mark <= 0 or space <= 0:
+        return "n/a"
+    db = 20 * math.log10(mark / space)
+    lean = "even" if abs(db) < 1.0 else ("mark" if db > 0 else "space")
+    return f"{db:+.1f} dB {lean}"
 
 
 # ── <MAP:lat,lon,call[,nodename]> location-beacon tag ─────────────────────────
@@ -450,6 +495,7 @@ class HeardPlugin(BBSPlugin):
             (2, self._heard_migration_v2),
             (3, self._heard_migration_v3),
             (4, self._heard_migration_v4),
+            (5, self._heard_migration_v5),
         ]
         for target, migrate in migrations:
             if target > version:
@@ -762,6 +808,33 @@ class HeardPlugin(BBSPlugin):
             " WHERE lat IS NOT NULL AND position_ts = 0"
         )
 
+    async def _heard_migration_v5(self, db) -> None:
+        """v5 — add RF signal-quality columns to heard_events.
+
+        Populated only for *directly-heard* frames when the Direwolf AGWPE
+        signal-quality extension is active (see
+        bbs/plugins/heard/SIGNAL_QUALITY_SPEC.md).  Columns are nullable: NULL
+        means "no signal measurement recorded yet".
+        """
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='heard_events'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return
+        for col in (
+            "last_level",
+            "last_tone_mark",
+            "last_tone_space",
+            "last_copy_quality",
+            "best_level",
+        ):
+            try:
+                async with db.execute(f"SELECT {col} FROM heard_events LIMIT 1") as _c:
+                    await _c.fetchall()
+            except Exception:
+                await db.execute(f"ALTER TABLE heard_events ADD COLUMN {col} INTEGER")
+                logger.info("heard plugin: added heard_events.%s (v5)", col)
+
     async def _reconcile_entities(self, db) -> None:
         """Assign base_call to any newly-inserted stations and ensure a
         station_entities row exists for each base callsign.  Called at the end
@@ -842,11 +915,31 @@ class HeardPlugin(BBSPlugin):
     async def on_heard(
         self, src: str, dest: str, via: list[str], ts: int, transport: str,
         info: str = "",
+        signal: "Optional[tuple[int, int, int, int]]" = None,
+        count_it: bool = True,
+        log_signal: bool = True,
     ) -> None:
         """
         Called by RF transports when a frame is received that is NOT addressed
         to the BBS.  Records/updates the stations, heard_events and heard_paths
         tables.
+
+        *count_it* increments the observation count (default).  Pass False when
+        the frame is already counted elsewhere, or should not count as a distinct
+        observation — e.g. a NET/ROM NODES broadcast (counted on its own 'netrom'
+        row) or a connected-mode frame (one of many in a session); here we only
+        want to record the RF reception's signal on the 'agwpe' row without
+        inflating the count.
+
+        *log_signal* controls the one-line INFO log of the recorded signal.  Pass
+        False for high-frequency captures (connected-mode frames) so a live BBS
+        session doesn't spam the journal — the Signals view is the readout there.
+
+        *signal*, when provided (Direwolf AGWPE signal-quality extension), is
+        (rec, mark, space, retries) for this reception.  It is attributed to the
+        station whose RF was actually received: the source when heard direct, or
+        the last-hop digipeater (the last H-bit-set via entry) when the frame was
+        relayed — so each digipeated copy keeps its relaying digi's level current.
         """
         src_up   = src.upper()
         dest_up  = dest.upper()
@@ -867,7 +960,60 @@ class HeardPlugin(BBSPlugin):
                     logger.debug("direct-heard observer push failed for %s",
                                  src_up, exc_info=True)
 
+        # Decode the optional per-frame signal quality once (tone 0xFF = N/A).
+        # It is attributed below to whoever transmitted the copy we received: the
+        # source when heard direct, otherwise the last-hop digipeater.
+        sig_cols: "Optional[tuple[int, Optional[int], Optional[int], int]]" = None
+        if signal is not None:
+            _rec, _mark, _space, _ret = signal
+            sig_cols = (
+                _rec,
+                None if _mark  == 0xFF else _mark,
+                None if _space == 0xFF else _space,
+                _ret,
+            )
+
         async with aiosqlite.connect(self._db_path, timeout=30) as db:
+            async def _apply_signal(callsign: str, transport_key: str,
+                                    heard_as: str | None = None) -> None:
+                """Write sig_cols onto one heard_events row (row must already
+                exist).  last_* take the newest reading; best_level the strongest.
+
+                *callsign* is the transmitter whose RF we actually received (always
+                a direct reception of that radio): the frame's originator when we
+                heard it straight, or the last-hop digipeater when the frame
+                reached us through the network.  *heard_as* is the callsign as it
+                appeared on the air (a Ka-Node tactical alias); when it differs
+                from *callsign* (the resolved owner) both are shown in the log so
+                it correlates with Direwolf's "Digipeater X" line."""
+                if sig_cols is None:
+                    return
+                _rc, _mk, _sp, _rt = sig_cols
+                await db.execute(
+                    """
+                    UPDATE heard_events
+                       SET last_level        = ?,
+                           last_tone_mark    = ?,
+                           last_tone_space   = ?,
+                           last_copy_quality = ?,
+                           best_level        = MAX(COALESCE(best_level, 0), ?)
+                     WHERE callsign = ? AND transport = ?
+                    """,
+                    (_rc, _mk, _sp, _rt, _rc, callsign, transport_key),
+                )
+                if log_signal:
+                    who = (
+                        callsign if not heard_as or heard_as == callsign
+                        else f"{heard_as} (→ {callsign})"
+                    )
+                    logger.info(
+                        "heard: RF signal from %s — level %d, tone %s, copy %d",
+                        who,
+                        _rc,
+                        f"{_mk}/{_sp}" if _mk is not None else "n/a",
+                        _rt,
+                    )
+
             # ── stations: ensure identity row exists ──────────────────────────
             await db.execute(
                 "INSERT OR IGNORE INTO stations (callsign, first_seen, last_seen)"
@@ -891,15 +1037,16 @@ class HeardPlugin(BBSPlugin):
                 )
 
             # ── heard_events: upsert per-transport observation ────────────────
+            _cnt = 1 if count_it else 0
             await db.execute(
                 """
                 INSERT INTO heard_events
                     (callsign, transport, source, first_heard, last_heard,
                      count, last_direct_heard, dest, via)
-                VALUES (?, ?, 'heard', ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, 'heard', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(callsign, transport) DO UPDATE SET
                     last_heard        = excluded.last_heard,
-                    count             = count + 1,
+                    count             = count + ?,
                     dest              = excluded.dest,
                     via               = excluded.via,
                     source            = 'heard',
@@ -909,9 +1056,15 @@ class HeardPlugin(BBSPlugin):
                     END
                 """,
                 (src_up, transport, ts, ts,
-                 ts if is_direct else 0, dest_up, via_str,
-                 1 if is_direct else 0),
+                 _cnt, ts if is_direct else 0, dest_up, via_str,
+                 _cnt, 1 if is_direct else 0),
             )
+
+            # ── RF signal quality (v5) — source, direct receptions only ───────
+            # A digipeated frame's measured level belongs to the last relaying
+            # digi (attributed in the via-path loop below), not the source.
+            if is_direct:
+                await _apply_signal(src_up, transport)
 
             # ── Auto-seed relay digipeaters from the via path ─────────────────
             # Three tiers based on position relative to the last H-bit (*):
@@ -974,6 +1127,11 @@ class HeardPlugin(BBSPlugin):
                         """,
                         (_effective_digi, ts, ts, ts),
                     )
+                    # This copy was received directly off this digi's RF, so the
+                    # per-frame signal quality belongs to it.  Digi rows use the
+                    # empty transport key; _digi is the on-air (alias) callsign so
+                    # the log correlates with Direwolf even after alias→owner merge.
+                    await _apply_signal(_effective_digi, "", heard_as=_digi)
                 else:
                     if _part.endswith("*"):
                         # Some transports mark intermediate digis with '*'.
@@ -1313,6 +1471,20 @@ class HeardPlugin(BBSPlugin):
         except Exception:
             return 0
 
+    async def _signal_station_count(self, cutoff: int = 0) -> int:
+        """Number of stations that have an RF signal level (extension active)."""
+        try:
+            async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                async with db.execute(
+                    "SELECT COUNT(DISTINCT callsign) FROM heard_events"
+                    " WHERE last_level IS NOT NULL AND last_heard >= ?",
+                    (cutoff,),
+                ) as cur:
+                    row = await cur.fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception:
+            return 0
+
     async def handle_session(self, session: "BBSSession") -> None:
         term = session.term
         self._max_age_hours = await self._load_max_age()
@@ -1340,6 +1512,13 @@ class HeardPlugin(BBSPlugin):
             menu: list[tuple[str, str]] = [
                 ("H",  h_label),
                 ("HS", hs_label),
+            ]
+            # Only offer the Signals view when the Direwolf signal-quality
+            # extension is feeding us levels for some stations.
+            sig_count = await self._signal_station_count(cutoff)
+            if sig_count > 0:
+                menu.append(("S", f"Signals ({sig_count} w/ RF level & twist)"))
+            menu += [
                 ("M",  "Map (digis only)"),
                 ("MS", "Map (with stations)"),
                 ("Q",  "Quit"),
@@ -1368,6 +1547,74 @@ class HeardPlugin(BBSPlugin):
                     term=term,
                 )
                 await term.paginate(map_lines, timeout=float(session.cfg.idle_timeout) or None)
+                continue
+
+            if action == "S":
+                # Only the stations we have an RF signal for — strongest first —
+                # with level and tone-balance (twist).
+                async with aiosqlite.connect(self._db_path, timeout=30) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute(
+                        """
+                        SELECT
+                            s.callsign,
+                            s.last_seen AS last_heard,
+                            (SELECT e.last_level FROM heard_events e
+                              WHERE e.callsign = s.callsign AND e.last_level IS NOT NULL
+                              ORDER BY e.last_heard DESC LIMIT 1) AS signal_level,
+                            (SELECT e.last_tone_mark FROM heard_events e
+                              WHERE e.callsign = s.callsign AND e.last_level IS NOT NULL
+                              ORDER BY e.last_heard DESC LIMIT 1) AS signal_mark,
+                            (SELECT e.last_tone_space FROM heard_events e
+                              WHERE e.callsign = s.callsign AND e.last_level IS NOT NULL
+                              ORDER BY e.last_heard DESC LIMIT 1) AS signal_space,
+                            (SELECT e.last_copy_quality FROM heard_events e
+                              WHERE e.callsign = s.callsign AND e.last_level IS NOT NULL
+                              ORDER BY e.last_heard DESC LIMIT 1) AS signal_copy
+                        FROM stations s
+                        WHERE EXISTS (
+                            SELECT 1 FROM heard_events e
+                             WHERE e.callsign = s.callsign
+                               AND e.last_level IS NOT NULL
+                               AND e.last_heard >= ?
+                        )
+                        ORDER BY signal_level DESC
+                        LIMIT ?
+                        """,
+                        (cutoff, limit),
+                    ) as cur:
+                        rows = await cur.fetchall()
+
+                if not rows:
+                    await term.sendln(term.note(
+                        f"No stations with RF signal data yet ({age_label})."))
+                else:
+                    header = f"SIGNALS  ({len(rows)} stations, {age_label})"
+                    await term.sendln(term.label(header, "meta"))
+                    await term.sendln(term.note("-" * min(len(header), term.width)))
+                    col_call, col_ts, col_sig = 9, 14, 10
+                    col_hdr = (
+                        f"{'CALLSIGN':<{col_call}} "
+                        f"{'LAST HEARD':<{col_ts}} "
+                        f"{'SIGNAL':<{col_sig}} TWIST"
+                    )
+                    await term.sendln(term.label(col_hdr, "meta"))
+                    await term.sendln(term.note("-" * min(len(col_hdr), term.width)))
+                    await term.flush()
+                    lines = []
+                    for row in rows:
+                        call  = str(row["callsign"]).upper().ljust(col_call)[:col_call]
+                        last  = time.strftime(
+                            "%y-%m-%d %H:%M", time.localtime(row["last_heard"])
+                        ).ljust(col_ts)[:col_ts]
+                        sig   = _fmt_signal_cell(
+                            term, row["signal_level"], row["signal_copy"], col_sig)
+                        twist = _fmt_twist(row["signal_mark"], row["signal_space"])
+                        lines.append(
+                            f"{term.style(call, 'accent')} {term.note(last)} "
+                            f"{sig} {term.note(twist)}"
+                        )
+                    await term.paginate(lines, timeout=float(session.cfg.idle_timeout) or None)
                 continue
 
             if action in ("H", "HS"):
