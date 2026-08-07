@@ -966,6 +966,21 @@ class NetromCircuitManager:
         if not self._ax25_writer.is_closing():
             self._ax25_writer.close()
 
+    def reap_now_if_idle(self) -> None:
+        """Drop the crosslink immediately if it carries no circuits — e.g. right
+        after a failed connect-out, so we don't hold an idle AX.25 link for the
+        full idle timeout and let the neighbor's own inactivity timer reap us
+        first (which looks like we failed to clean up)."""
+        if self._closed or self._by_local_key:
+            return
+        self._cancel_idle_timer()
+        logger.info(
+            "netrom: crosslink to %s idle after failed connect — disconnecting now",
+            self._via_node,
+        )
+        if not self._ax25_writer.is_closing():
+            self._ax25_writer.close()
+
     # ── Crosslink teardown ───────────────────────────────────────────────────
 
     def shutdown(self) -> None:

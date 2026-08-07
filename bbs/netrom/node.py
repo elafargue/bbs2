@@ -146,6 +146,7 @@ class NetromNode:
     # (canonical name, handler attribute, takes an argument)
     _COMMANDS: list[tuple[str, str, bool]] = [
         ("CONNECT", "cmd_connect", True),
+        ("BBS",     "cmd_bbs",     False),
         ("NODES",   "cmd_nodes",   True),
         ("ROUTES",  "cmd_routes",  True),
         ("USERS",   "cmd_users",   False),
@@ -155,8 +156,11 @@ class NetromNode:
         ("BYE",     "cmd_bye",     False),
         ("HELP",    "cmd_help",    False),
     ]
+    # "B" stays BYE (long-standing habit) now that BBS also starts with B; the
+    # BBS is reachable typed out ("BBS") or via "C BBS".
     _ALIASES: dict[str, str] = {
         "MH": "MHEARD", "?": "HELP", "H": "HELP", "Q": "BYE", "QUIT": "BYE",
+        "B": "BYE",
     }
 
     def _resolve(self, verb: str) -> Optional[tuple[str, str, bool]]:
@@ -369,6 +373,10 @@ class NetromNode:
         await self.term.sendln(f"73 from {self.node_alias}")
         self._running = False
 
+    async def cmd_bbs(self, _arg: str = "") -> None:
+        """Shortcut for ``C BBS`` — connect to the local BBS (a NET/ROM app)."""
+        await self.cmd_connect("BBS")
+
     async def _send_columns(self, tokens: list[str]) -> None:
         """Pack *tokens* into space-efficient lines within the terminal width."""
         width = getattr(self.term, "width", 80) or 80
@@ -460,19 +468,23 @@ class NetromNode:
                 return
 
             # 5. Originate the L3 circuit to the destination through the crosslink.
+            circuit = None
             try:
                 circuit = await mgr.originate_circuit(
                     dest_call, self.user_call, timeout=self.connect_timeout
                 )
             except asyncio.TimeoutError:
                 await self.term.sendln(f"{alias} did not answer.")
-                return
             except ConnectionRefusedError:
                 await self.term.sendln(f"{alias} refused the connection.")
-                return
             except (ConnectionError, Exception) as exc:  # defensive
                 logger.info("netrom node: originate to %s failed: %s", dest_call, exc)
                 await self.term.sendln(f"Could not connect to {alias}.")
+            if circuit is None:
+                # Connect failed — don't leave the neighbor crosslink sitting idle
+                # (its own inactivity timer would reap us first); drop it now if
+                # nothing else is riding on it.
+                mgr.reap_now_if_idle()
                 return
 
             # 6. Bridge the two sessions until one side closes.

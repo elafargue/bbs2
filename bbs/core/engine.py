@@ -132,6 +132,10 @@ class BBSEngine:
         # node prompt in _on_connection.  self._netrom_apps is the node's
         # local-application registry (BBS + services) reachable via C <app>.
         self._netrom_node_call: Optional[str] = None
+        # The node alias (e.g. "PALO").  When the node has its own SSID identity,
+        # inbound connects to the alias land in the node prompt exactly like the
+        # node SSID (registered as a listener on the transport).  "" = none.
+        self._netrom_node_alias: str = ""
         self._netrom_apps: dict[str, "Callable[[Connection], Awaitable[None]]"] = {}
 
     # ── Startup & shutdown ────────────────────────────────────────────────────
@@ -201,6 +205,9 @@ class BBSEngine:
             # None so _on_connection never diverts to the native landing.
             self._netrom_node_call = self.cfg.netrom_node_call
             effective_node_call = self._netrom_node_call or self.cfg.full_callsign
+            # The alias lands in the node prompt like the node SSID, so only wire
+            # it when the node has its own SSID identity (native landing active).
+            self._netrom_node_alias = netrom_alias if self._netrom_node_call else ""
             netrom_router = NetromRouter(
                 effective_node_call,
                 netrom_alias,
@@ -271,7 +278,7 @@ class BBSEngine:
             # many seconds with no circuits (0 = keep it up indefinitely, like
             # the Linux AX.25 IDLE=0 default). Frees the link and stops needless
             # T3 keepalives once the last circuit closes.
-            link_idle_timeout = float(netrom_cfg.get("link_idle_timeout", 900))
+            link_idle_timeout = float(netrom_cfg.get("link_idle_timeout", 300))
             # Classification of incoming AX.25 connections as NETROM vs. direct
             # BBS delegates to the router's single adjacency authority
             # (is_direct_neighbor): live crosslink, or a known node heard
@@ -291,6 +298,8 @@ class BBSEngine:
                 # (the node SSID when configured, else the BBS callsign) and, on
                 # AGWPE, register that SSID so inbound connects to it reach us.
                 t.set_netrom_node_call(effective_node_call)
+                if self._netrom_node_alias:
+                    t.set_netrom_node_alias(self._netrom_node_alias)
                 if netrom_alias:
                     # Only register the builder (and thus start the broadcast
                     # loop) when we have a node alias to advertise.
@@ -424,11 +433,14 @@ class BBSEngine:
         # never reaches here — the transport classifies it via is_direct_neighbor
         # and never calls back into the engine; only genuine user sessions and
         # per-user NET/ROM circuits addressed to the node SSID arrive here.)
-        if self._netrom_node_call and (
-            (conn.local_addr or "").upper() == self._netrom_node_call.upper()
-        ):
-            await self._run_node_native(conn)
-            return
+        if self._netrom_node_call:
+            _called = (conn.local_addr or "").upper()
+            # Connects to the node SSID *or* its alias (e.g. PALO) land natively.
+            if _called == self._netrom_node_call.upper() or (
+                self._netrom_node_alias and _called == self._netrom_node_alias
+            ):
+                await self._run_node_native(conn)
+                return
 
         # ax25d-style dispatch: route to an external program by called SSID,
         # BEFORE any BBS banner/menu is emitted.

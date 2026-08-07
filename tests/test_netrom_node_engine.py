@@ -94,6 +94,20 @@ class TestDispatch:
         await eng._on_connection(_conn("W6ELA-5"))
         assert seen == ["node"]                     # node wins, no service/BBS
 
+    async def test_node_alias_routes_to_native_landing(self, monkeypatch):
+        # connect <alias> (e.g. PALO) lands in the node prompt like the SSID.
+        eng = BBSEngine(_cfg(node_ssid=5, services=_SVC))
+        eng._services = ServiceDispatcher(_SVC)
+        eng._netrom_node_call = "W6ELA-5"
+        eng._netrom_node_alias = "PALO"
+        seen: list = []
+        monkeypatch.setattr(eng, "_run_node_native",
+                            lambda conn: _record(seen, "node"))
+        monkeypatch.setattr(eng, "_run_external_service",
+                            lambda conn, route: _record(seen, "svc"))
+        await eng._on_connection(_conn("PALO"))
+        assert seen == ["node"]
+
     async def test_node_ssid_wins_over_service_on_same_ssid(self, monkeypatch):
         # A service also mapped on W6ELA-5 must NOT shadow the node landing.
         svc = {"enabled": True, "routes": {"W6ELA-5": {"exec": "/bin/cat"}}}

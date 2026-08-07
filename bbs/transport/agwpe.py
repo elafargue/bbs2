@@ -447,6 +447,10 @@ class AGWPETransport(Transport):
         # callsign (today's behavior) and the engine overrides it with the node
         # SSID via set_netrom_node_call() when netrom.node_ssid is configured.
         self._netrom_node_call: str = self._local_call
+        # NET/ROM node alias (e.g. PALO). Registered with AGWPE as an additional
+        # listening callsign so `connect <alias>` reaches the node, exactly like
+        # the node SSID. Empty when no alias is configured. Set by the engine.
+        self._netrom_node_alias: str = ""
         self._host: str = cfg.get("host", "127.0.0.1")
         self._port: int = int(cfg.get("port", 8000))
         self._agw_port: int = int(cfg.get("agw_port", 0))
@@ -581,6 +585,12 @@ class AGWPETransport(Transport):
         c = (call or "").upper().strip()
         self._netrom_node_call = c or self._local_call
 
+    def set_netrom_node_alias(self, alias: str) -> None:
+        """Register the NET/ROM node *alias* (e.g. PALO) as an extra listening
+        callsign so inbound `connect <alias>` reaches the node, like the node
+        SSID.  Empty/blank disables it.  Registered in :meth:`start`."""
+        self._netrom_node_alias = (alias or "").upper().strip()
+
     def set_broadcast_state_path(self, path: str) -> None:
         """Persist the last beacon / NODES broadcast timestamps to *path* so a
         restart respects the configured cadence instead of transmitting right
@@ -696,6 +706,18 @@ class AGWPETransport(Transport):
                     logger.info(
                         "agwpe: registering NET/ROM node callsign %s on port %d",
                         self._netrom_node_call, self._agw_port,
+                    )
+                # Register the NET/ROM node ALIAS (e.g. PALO) as another listener
+                # so `connect <alias>` reaches the node exactly like the node SSID.
+                if (self._netrom_node_alias
+                        and self._netrom_node_alias != self._local_call.upper()
+                        and self._netrom_node_alias != self._netrom_node_call.upper()):
+                    writer.write(
+                        _build_frame(self._agw_port, "X", self._netrom_node_alias, "")
+                    )
+                    logger.info(
+                        "agwpe: registering NET/ROM node alias %s on port %d",
+                        self._netrom_node_alias, self._agw_port,
                     )
                 # Register any extra service SSIDs (ax25d-style hosting) so
                 # Direwolf also routes connects for those to us.

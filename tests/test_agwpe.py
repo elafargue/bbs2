@@ -1373,3 +1373,26 @@ class TestSignalQualityExtension:
             self.fake_writer, bytes([59, 16, 11, 0]),
         )
         assert len(self.heard) == 0
+
+
+def test_set_netrom_node_alias_normalizes():
+    t = _make_transport()
+    assert t._netrom_node_alias == ""      # default: no alias
+    t.set_netrom_node_alias(" palo ")
+    assert t._netrom_node_alias == "PALO"  # uppercased + stripped
+    t.set_netrom_node_alias("")
+    assert t._netrom_node_alias == ""
+
+
+def test_base_transport_has_all_engine_netrom_setters():
+    """The engine wires NET/ROM onto EVERY transport via t.set_netrom_*(...); each
+    such setter must exist on the base Transport so non-AGWPE transports (TCP,
+    KISS) don't AttributeError at startup.  Regression: set_netrom_node_alias was
+    added to AGWPE only, which crashed bbs2 when a TCP transport was configured."""
+    import re, inspect
+    from bbs.core import engine as engine_mod
+    src = inspect.getsource(engine_mod)
+    called = set(re.findall(r"\bt\.(set_netrom_[a-z_]+)\s*\(", src))
+    assert called  # sanity: we actually found some
+    missing = sorted(m for m in called if not hasattr(Transport, m))
+    assert not missing, f"base Transport missing engine-called setters: {missing}"

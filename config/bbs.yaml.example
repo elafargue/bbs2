@@ -249,10 +249,12 @@ netrom:
   #     N6ZX-5: 128        # a marginal/HF link
   # Idle-crosslink teardown: once the last NET/ROM circuit on a neighbor
   # crosslink closes, disconnect the underlying AX.25 link after this many
-  # seconds with no circuits (default 900 = 15 min). 0 = keep links up
-  # indefinitely (the Linux AX.25 IDLE=0 default), i.e. rely on the neighbor to
-  # drop them. Mirrors the kernel AX.25 idle timer; T3 keepalives don't reset it.
-  link_idle_timeout: 900
+  # seconds with no circuits (default 300 = 5 min). Keep this BELOW your
+  # neighbours' own inactivity timeouts so *we* drop an idle link before they
+  # reap us (a failed connect-out also reaps the link immediately). 0 = keep
+  # links up indefinitely, i.e. rely on the neighbour to drop them. Mirrors the
+  # kernel AX.25 idle timer; T3 keepalives don't reset it.
+  link_idle_timeout: 300
   # Gateway safety (N4a) — protects the outbound gateway (C <node>) on a live,
   # publicly-reachable node.  Omit the whole block for safe defaults (identified
   # callers only, INTERLOCK on, rate 6/min, caps 2 per-user / 4 node-wide).

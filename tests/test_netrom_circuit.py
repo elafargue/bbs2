@@ -996,6 +996,22 @@ class TestIdleReaper:
         assert ax25.closed is False                # must NOT cut a live circuit
         sessions.release_all(); await asyncio.sleep(0)
 
+    async def test_reap_now_if_idle_disconnects_immediately(self):
+        # Explicit reap-on-failed-connect drops an idle crosslink right away —
+        # even when the idle *timer* is disabled (timeout 0) — so the neighbour's
+        # own inactivity timer never gets the chance to reap us first.
+        mgr, ax25, sessions = _mgr_with_idle(0.0)
+        assert ax25.closed is False
+        mgr.reap_now_if_idle()
+        assert ax25.closed is True
+
+    async def test_reap_now_if_idle_noop_when_circuit_active(self):
+        mgr, ax25, sessions = _mgr_with_idle(60.0)
+        await _open_one(mgr)                        # a live circuit
+        mgr.reap_now_if_idle()
+        assert ax25.closed is False                # must not cut a live link
+        sessions.release_all(); await asyncio.sleep(0)
+
     async def test_disabled_never_arms(self):
         mgr, ax25, sessions = _mgr_with_idle(0.0)   # 0 = disabled
         c = await _open_one(mgr)

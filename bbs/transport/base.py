@@ -197,6 +197,14 @@ class Transport(ABC):
         Default-implementation no-op; AGWPE overrides.
         """
 
+    def set_netrom_node_alias(self, alias: str) -> None:
+        """Register the NET/ROM node alias (e.g. PALO) as an extra listening
+        callsign so inbound ``connect <alias>`` reaches the node, like the node
+        SSID.
+
+        Default-implementation no-op; AGWPE overrides.
+        """
+
     def set_broadcast_state_path(self, path: str) -> None:
         """Persist the last beacon / NODES broadcast timestamps to *path* so that
         after a restart the transport respects the configured cadence instead of

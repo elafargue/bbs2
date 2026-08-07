@@ -84,6 +84,7 @@ class FakeManager:
         self._circuit = circuit
         self._exc = exc
         self.originate_calls: list[tuple[str, str]] = []
+        self.reap_calls = 0
 
     async def originate_circuit(self, dest_call, user_call, *,
                                 proposed_window=4, timeout=30.0):
@@ -91,6 +92,9 @@ class FakeManager:
         if self._exc is not None:
             raise self._exc
         return self._circuit
+
+    def reap_now_if_idle(self) -> None:
+        self.reap_calls += 1
 
 
 class FakeTransport(Transport):
@@ -173,6 +177,14 @@ class TestResolve:
         assert n._resolve("I")[0] == "INFO"
         assert n._resolve("P")[0] == "PORTS"
         assert n._resolve("B")[0] == "BYE"
+
+    async def test_bbs_command_keeps_b_as_bye(self):
+        # BBS is a new B-command; "B" must still resolve to BYE (long habit),
+        # while "BB"/"BBS" reach the BBS shortcut.
+        n = _make_node()
+        assert n._resolve("B")[0] == "BYE"
+        assert n._resolve("BB")[0] == "BBS"
+        assert n._resolve("BBS")[0] == "BBS"
 
     async def test_aliases(self):
         n = _make_node()
@@ -355,6 +367,7 @@ class TestConnectFlow:
         )
         await node.cmd_connect("JOHN")
         assert "did not answer" in node._term.text()
+        assert mgr.reap_calls == 1   # failed connect drops the idle crosslink now
 
     async def test_originate_refused(self):
         node, transport, mgr = self._node_with_stack(
@@ -362,6 +375,7 @@ class TestConnectFlow:
         )
         await node.cmd_connect("JOHN")
         assert "refused" in node._term.text()
+        assert mgr.reap_calls == 1   # failed connect drops the idle crosslink now
 
     async def test_no_crosslink_transport(self):
         # A router with routes but no crosslink-capable transport at all.
