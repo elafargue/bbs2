@@ -1125,14 +1125,30 @@ class AGWPETransport(Transport):
             elif not payload:
                 pass  # empty 'D' is a no-op
             elif sess.netrom_manager is not None:
-                frame = decode_l3_frame(payload)
-                if frame is None:
-                    logger.warning(
-                        "agwpe: undecodable NETROM L3 frame on crosslink %s (%d bytes)",
-                        call_from, len(payload),
+                # Established NET/ROM crosslink: only PID 0xCF frames are
+                # NET/ROM L3.  Some neighbors (URONode/MONTC) emit plain-text
+                # banners, prompts and notices on the link as PID 0xF0 I-frames
+                # ("Welcome to K2YE-5", "Inactivity timeout...", "=> "); their
+                # ASCII bytes coincidentally decode to NET/ROM opcodes and churn
+                # the circuit manager with bogus DISC/CONNECT/undecodable frames.
+                # Gate on the AX.25 PID — definitive, and (unlike a header
+                # heuristic) it does not reject valid frames from nodes that
+                # leave the SSID reserved bits set.
+                if pid != PID_NETROM:
+                    logger.debug(
+                        "agwpe: non-NETROM (pid=0x%02x) frame on crosslink %s "
+                        "(%d bytes) — dropped: %r",
+                        pid, call_from, len(payload), payload[:40],
                     )
                 else:
-                    await sess.netrom_manager.dispatch(frame)
+                    frame = decode_l3_frame(payload)
+                    if frame is None:
+                        logger.warning(
+                            "agwpe: undecodable NETROM L3 frame on crosslink %s (%d bytes)",
+                            call_from, len(payload),
+                        )
+                    else:
+                        await sess.netrom_manager.dispatch(frame)
             elif pid == PID_NETROM:
                 # Cold-start fallback (router didn't know this neighbor yet).
                 await self._promote_to_netrom_crosslink(key, sess)

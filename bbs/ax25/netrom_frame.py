@@ -220,6 +220,20 @@ def _is_netrom_callsign_char(ch: int) -> bool:
     )
 
 
+def _wire_call_is_valid(data: bytes) -> bool:
+    """True if the six callsign characters of a 7-byte wire address are all
+    valid NET/ROM callsign characters (A-Z, 0-9, space, NUL).
+
+    Used to sanity-check the user/origin callsigns carried in a CONNECT REQ
+    tail.  On an established crosslink we decode every incoming frame as
+    NET/ROM L3, so a neighbor that sends a plain-text notice on the link
+    (e.g. URONode's "Inactivity timeout! Disconnecting you...") can, by
+    coincidence, land opcode CONNECT REQ in header byte 19 and have its ASCII
+    body decode into a bogus callsign — minting a phantom user.  Rejecting a
+    CONNECT REQ whose callsign fields aren't real callsigns stops that."""
+    return all(_is_netrom_callsign_char((b >> 1) & 0x7F) for b in data[:6])
+
+
 @dataclass
 class L3Header:
     """The 20-byte NETROM L3+L4 header (raw byte values)."""
@@ -391,13 +405,19 @@ def decode_l3_frame(data: bytes) -> L3Frame | None:
     if op == OPCODE_CONNECT_REQ:
         if len(rest) < 1 + _ADDR_WIRE_LEN + _ADDR_WIRE_LEN:
             return None
+        user_wire   = rest[1:1 + _ADDR_WIRE_LEN]
+        origin_wire = rest[1 + _ADDR_WIRE_LEN: 1 + 2 * _ADDR_WIRE_LEN]
+        # A CONNECT REQ whose user/origin fields aren't valid callsigns is not a
+        # real connect — it's a non-NET/ROM frame (e.g. a neighbor's plain-text
+        # notice on the crosslink) whose bytes happened to decode to opcode
+        # CONNECT REQ.  Drop it rather than open a circuit / mint a phantom user.
+        if not (_wire_call_is_valid(user_wire) and _wire_call_is_valid(origin_wire)):
+            return None
         return ConnectRequest(
             header           = header,
             proposed_window  = rest[0],
-            user_call        = decode_wire_call(rest[1:1 + _ADDR_WIRE_LEN]),
-            origin_node_call = decode_wire_call(
-                rest[1 + _ADDR_WIRE_LEN: 1 + 2 * _ADDR_WIRE_LEN]
-            ),
+            user_call        = decode_wire_call(user_wire),
+            origin_node_call = decode_wire_call(origin_wire),
         )
 
     if op == OPCODE_CONNECT_ACK:

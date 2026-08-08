@@ -1435,6 +1435,44 @@ def test_netrom_circuits_snapshot_aggregates_across_sessions():
     assert users == {"KN6PE-7", "KF6ANX-9"}
 
 
+async def test_crosslink_drops_nonnetrom_pid_frames():
+    """On an established NET/ROM crosslink, a neighbor's plain-text banner
+    (PID 0xF0 — e.g. URONode's welcome/prompt) must be dropped, not fed to the
+    circuit manager where its ASCII bytes would decode to bogus NET/ROM frames.
+    A real NET/ROM frame (PID 0xCF) must still be dispatched."""
+    from bbs.ax25.netrom_frame import (
+        L3Header, OPCODE_INFORMATION_ACK, encode_l3_frame,
+    )
+    t = _make_transport()
+
+    class _Mgr:
+        def __init__(self):
+            self.dispatched = []
+        async def dispatch(self, frame):
+            self.dispatched.append(frame)
+
+    mgr = _Mgr()
+
+    class _Sess:
+        remote_call = "K2YE-5"
+        netrom_manager = mgr
+
+    t._sessions = {(0, "K2YE-5"): _Sess()}
+
+    # URONode banner as PID 0xF0 — coincidentally decodes to NET/ROM garbage.
+    banner = b"URONode v2.15 - Welcome to K2YE-5\r=> "
+    await t._dispatch("D", 0, "K2YE-5", "W6ELA-5", 0xF0, banner, None)  # type: ignore
+    assert mgr.dispatched == []          # dropped, not dispatched
+
+    # A genuine NET/ROM frame (PID 0xCF) still flows through.
+    hdr = L3Header(origin_call="K2YE-5", dest_call="W6ELA-5", ttl=25,
+                   circuit_idx=0, circuit_id=1, tx_seq=0, rx_seq=0,
+                   opcode_flags=OPCODE_INFORMATION_ACK)
+    await t._dispatch("D", 0, "K2YE-5", "W6ELA-5", PID_NETROM,
+                      encode_l3_frame(hdr, b""), None)  # type: ignore
+    assert len(mgr.dispatched) == 1
+
+
 def test_base_transport_has_all_engine_netrom_setters():
     """The engine wires NET/ROM onto EVERY transport via t.(set_)netrom_*(...);
     each such method must exist on the base Transport so non-AGWPE transports
