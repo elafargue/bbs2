@@ -1374,6 +1374,25 @@ class TestSignalQualityExtension:
         )
         assert len(self.heard) == 0
 
+    async def test_garbage_source_sentinel_dropped(self):
+        # Direwolf's "??????" placeholder = "(Not AX.25)" noise with no valid
+        # source address. Must be dropped before ANY subsystem — no phantom
+        # heard/signal row, and not dispatched to the NET/ROM observer either.
+        self.transport._ext_sig_active = True
+        netrom_seen = []
+
+        async def _netrom(src, dest, binary):
+            netrom_seen.append(src)
+        self.transport._netrom_observer = _netrom
+
+        for k in ("U", "S", "I"):
+            await self.transport._dispatch(
+                k, 0, "??????", "??????", 0xF0, self._MON,
+                self.fake_writer, bytes([70, 11, 10, 0]),
+            )
+        assert self.heard == []
+        assert netrom_seen == []
+
 
 def test_set_netrom_node_alias_normalizes():
     t = _make_transport()

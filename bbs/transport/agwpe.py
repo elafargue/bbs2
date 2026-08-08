@@ -1185,6 +1185,14 @@ class AGWPETransport(Transport):
             # 'U' drives heard-station tracking; SABM/SABME (under 'S') feeds the
             # hop-count cache; and 'S'/'I' additionally keep a connected station's
             # live RF level current (signal extension) for the Signals view.
+            #
+            # 0. Drop noise. Direwolf writes the literal "??????" placeholder as
+            #    the address when a frame has no valid AX.25 source — e.g. a
+            #    "(Not AX.25)" burst that demodulated but has zero addresses
+            #    (ax25_get_addr_with_ssid). There's no station to attribute, so
+            #    skip before any subsystem records a phantom entry.
+            if call_from == "??????":
+                return
             # 1. NETROM UI frames — extract binary payload and dispatch to the
             #    NETROM observer before any text decoding.  Use both PID and
             #    destination as discriminators: some AGWPE implementations
