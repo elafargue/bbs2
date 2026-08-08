@@ -137,6 +137,20 @@ _MAX_LOCAL_CIRCUITS: int = 256
 # peer is broken or hostile — we drop the partial rather than accumulate.
 _MAX_REASSEMBLY_BYTES: int = 64 * 1024
 
+# When WE initiate a disconnect (the BBS session ended) we send a DISC REQ and
+# wait for the peer's DISC ACK before removing the circuit.  Normally the ACK
+# comes back within an AX.25 round trip.  But if the path is dead — the peer is
+# unreachable, or the ACK is lost on a degrading RF link — that ACK never
+# arrives and the circuit hangs in DISCONNECTING indefinitely: it keeps the
+# crosslink "busy" so the idle reaper can't drop it, and we sit half-open until
+# the neighbor's own inactivity timer eventually kills the whole link minutes
+# later.  This guard force-closes the circuit locally after a bounded wait so
+# the crosslink becomes idle-reapable promptly.  It is NOT a T1 retransmit (L3
+# rides on AX.25 ARQ — see the V1 notes above); it is a give-up timer.  Chosen
+# well below typical neighbor inactivity timeouts (~7-10 min on the air) yet
+# comfortably above a slow-RF AX.25 round trip.
+_DISC_GUARD_TIMEOUT: float = 30.0
+
 
 class CircuitState(IntEnum):
     """Lifecycle states of one NETROM circuit."""
@@ -294,6 +308,14 @@ class NetromCircuit:
     # Backreference to the underlying AX.25 writer for the crosslink.
     # Populated by the manager.
     _ax25_writer: Optional[_AX25WriterProto] = None
+
+    # Backreference to the owning manager — populated post-init by the manager
+    # so a self-initiated disconnect that never gets its DISC ACK can force its
+    # own removal (see _initiate_disconnect / _reap_disconnecting).
+    _manager: Optional["NetromCircuitManager"] = None
+
+    # Guard timer armed while we await a DISC ACK for a disconnect WE initiated.
+    _disc_guard_handle: Optional[asyncio.TimerHandle] = None
 
     # Set when the circuit transitions to CLOSED.
     _closed_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -574,11 +596,66 @@ class NetromCircuit:
             "netrom: circuit %d/%d — BBS ended, sent DISC REQ to %s",
             self.local_idx, self.local_id, self.origin_node_call,
         )
+        # Guard against a DISC ACK that never comes (dead path): force-close
+        # after a bounded wait so the crosslink doesn't hang half-open.
+        self._arm_disc_guard()
+
+    def _arm_disc_guard(self) -> None:
+        """Arm the DISCONNECTING give-up timer.  If no DISC ACK arrives before
+        it fires we force-close locally instead of hanging half-open forever."""
+        self._cancel_disc_guard()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop (e.g. a unit test) — skip the guard
+        self._disc_guard_handle = loop.call_later(
+            _DISC_GUARD_TIMEOUT, self._reap_disconnecting
+        )
+
+    def _cancel_disc_guard(self) -> None:
+        if self._disc_guard_handle is not None:
+            self._disc_guard_handle.cancel()
+            self._disc_guard_handle = None
+
+    def _reap_disconnecting(self) -> None:
+        """Guard fired: the peer never ACK'd our DISC REQ.  Force-close locally
+        and let the manager drop the circuit — which re-arms the crosslink idle
+        reaper so the now-circuit-less link can be released promptly."""
+        self._disc_guard_handle = None
+        if self.state != CircuitState.DISCONNECTING:
+            return  # already closed via a DISC ACK in the meantime — nothing to do
+        logger.warning(
+            "netrom: circuit %d/%d — no DISC ACK from %s after %.0fs; "
+            "force-closing (path likely dead)",
+            self.local_idx, self.local_id, self.origin_node_call,
+            _DISC_GUARD_TIMEOUT,
+        )
+        self._set_closed()
+        if self._manager is not None:
+            self._manager._remove_circuit(self)
+
+    def describe(self) -> dict:
+        """JSON-serializable snapshot of this circuit for the web node
+        dashboard.  ``dest`` is the remote node the circuit terminates at
+        (the destination for a circuit we originated, the origin node for one
+        opened on our behalf); ``via`` is the adjacent AX.25 neighbor whose
+        crosslink carries it."""
+        return {
+            "user": self.user_call,
+            "dest": self.origin_node_call,
+            "via": self.via_node,
+            "state": self.state.name,
+            "local_circuit": f"{self.local_idx}/{self.local_id}",
+            "remote_circuit": f"{self.remote_idx}/{self.remote_id}",
+            "window": self.accepted_window,
+        }
 
     def _set_closed(self) -> None:
         if self.state == CircuitState.CLOSED:
             return
         self.state = CircuitState.CLOSED
+        # A pending disconnect guard (if we initiated the DISC) is now moot.
+        self._cancel_disc_guard()
         # Wake any sender that was blocked on _wait_for_window so it can
         # observe the closed state and bail out instead of stalling forever.
         self._window_event.set()
@@ -839,6 +916,7 @@ class NetromCircuitManager:
             info_mtu         = self._info_mtu,
         )
         circuit._ax25_writer = self._ax25_writer
+        circuit._manager = self
         circuit.writer = _NetromCircuitWriter(circuit)
         self._by_local_key[(local_idx, local_id)] = circuit
         logger.info(
@@ -905,6 +983,7 @@ class NetromCircuitManager:
             info_mtu         = self._info_mtu,
         )
         circuit._ax25_writer = self._ax25_writer
+        circuit._manager = self
         circuit.writer = _NetromCircuitWriter(circuit)
         self._by_local_key[(local_idx, local_id)]   = circuit
         self._by_remote_key[(req.header.circuit_idx, req.header.circuit_id)] = circuit

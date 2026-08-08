@@ -848,10 +848,23 @@ class BBSEngine:
         if node_plugin is None or not getattr(node_plugin, "enabled", False):
             return {"enabled": False}
         try:
-            return node_plugin.activity_snapshot()  # type: ignore[attr-defined]
+            snap = node_plugin.activity_snapshot()  # type: ignore[attr-defined]
         except Exception:
             logger.exception("netrom_snapshot failed")
             return {"enabled": False}
+        # Surface live L4 circuits across every transport's crosslinks.  The
+        # node-session view (self._live) only shows users still attached at the
+        # => prompt or bridged onward — it does NOT show a circuit that outlives
+        # its BBS session (e.g. a self-initiated DISC still awaiting its ACK),
+        # which is exactly the state that can hang a crosslink.
+        circuits: list[dict[str, Any]] = []
+        for t in self._transports:
+            try:
+                circuits.extend(t.netrom_circuits_snapshot())
+            except Exception:
+                logger.exception("netrom_circuits_snapshot failed on %r", t)
+        snap["circuits"] = circuits
+        return snap
 
     def recent_log_lines(self, n: int = 100) -> list[str]:
         return list(self.log_buffer)[-n:]

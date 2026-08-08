@@ -128,7 +128,7 @@ class TestAbbrevTransport:
 
     def test_unknown_returns_upper_truncated(self):
         result = _abbrev_transport("my_very_long_transport_name")
-        assert len(result) <= 8
+        assert len(result) <= 14
         assert result == result.upper()
 
     def test_unknown_short(self):

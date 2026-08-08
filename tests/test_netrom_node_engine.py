@@ -286,6 +286,38 @@ class TestActivitySnapshot:
         monkeypatch.setattr(eng.plugin_registry, "get", lambda name: None)
         assert eng.netrom_snapshot() == {"enabled": False}
 
+    def test_engine_snapshot_includes_circuits_from_transports(self, monkeypatch):
+        eng = BBSEngine(_cfg(node_ssid=5))
+        plugin = self._bound_plugin()
+        monkeypatch.setattr(eng.plugin_registry, "get",
+                            lambda name: plugin if name == "node" else None)
+
+        class _T:
+            def netrom_circuits_snapshot(self):
+                return [{"user": "KN6PE-7", "state": "DISCONNECTING", "via": "N6ZX-5"}]
+
+        eng._transports = [_T()]
+        snap = eng.netrom_snapshot()
+        assert snap["enabled"] is True
+        assert snap["circuits"] == [
+            {"user": "KN6PE-7", "state": "DISCONNECTING", "via": "N6ZX-5"}
+        ]
+
+    def test_engine_snapshot_survives_transport_error(self, monkeypatch):
+        eng = BBSEngine(_cfg(node_ssid=5))
+        plugin = self._bound_plugin()
+        monkeypatch.setattr(eng.plugin_registry, "get",
+                            lambda name: plugin if name == "node" else None)
+
+        class _Boom:
+            def netrom_circuits_snapshot(self):
+                raise RuntimeError("boom")
+
+        eng._transports = [_Boom()]
+        snap = eng.netrom_snapshot()
+        assert snap["enabled"] is True
+        assert snap["circuits"] == []
+
 
 class TestNativeLanding:
     async def test_bye_closes_the_connection(self, monkeypatch):

@@ -575,6 +575,20 @@ class AGWPETransport(Transport):
         circuits (0 = keep it up indefinitely). See NetromCircuitManager."""
         self._netrom_link_idle_timeout = max(0.0, float(seconds))
 
+    def netrom_circuits_snapshot(self) -> list[dict]:
+        """Live NET/ROM L4 circuits across all crosslinks on this transport,
+        for the web node dashboard.  Each entry is annotated with the adjacent
+        neighbor (``via``) carrying it.  Thread-safe: reads only; the session
+        list and each manager's circuit list are copied."""
+        out: list[dict] = []
+        for sess in list(self._sessions.values()):
+            mgr = sess.netrom_manager
+            if mgr is None:
+                continue
+            for circuit in mgr.active_circuits:
+                out.append(circuit.describe())
+        return out
+
     def set_netrom_node_call(self, call: str) -> None:
         """Source outbound NETROM crosslinks + NODES broadcasts from *call* (N3).
 

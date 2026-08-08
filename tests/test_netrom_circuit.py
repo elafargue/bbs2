@@ -544,6 +544,114 @@ class TestDisconnectFromUs:
         await mgr.dispatch(Disconnect(header=ack_header))
         assert circuit.state == CircuitState.CLOSED
         assert mgr.circuit_count == 0
+        # The give-up guard is disarmed once the ACK closes the circuit.
+        assert circuit._disc_guard_handle is None
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_guard_armed_while_awaiting_disc_ack(self, setup):
+        mgr, ax25, sessions = setup
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        circuit.writer.close()
+        assert circuit.state == CircuitState.DISCONNECTING
+        # A bounded give-up guard is armed while we wait for the DISC ACK.
+        assert circuit._disc_guard_handle is not None
+        circuit._cancel_disc_guard()
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_guard_force_closes_circuit_when_no_ack(self, setup):
+        """The peer never returns a DISC ACK (dead path): the guard force-closes
+        the circuit locally so the crosslink doesn't hang half-open."""
+        mgr, ax25, sessions = setup
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        circuit.writer.close()
+        assert mgr.circuit_count == 1
+        # Simulate the guard timer firing with no ACK having arrived.
+        circuit._reap_disconnecting()
+        assert circuit.state == CircuitState.CLOSED
+        assert mgr.circuit_count == 0
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_guard_noop_if_already_closed(self, setup):
+        """A guard that fires after the circuit already closed (late ACK race)
+        is a harmless no-op."""
+        mgr, ax25, sessions = setup
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        circuit.writer.close()
+        circuit._set_closed()
+        mgr._remove_circuit(circuit)
+        assert mgr.circuit_count == 0
+        # Firing the guard now must not raise or double-remove.
+        circuit._reap_disconnecting()
+        assert mgr.circuit_count == 0
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_guard_timer_fires_and_reaps(self, setup, monkeypatch):
+        """End-to-end: with a tiny guard timeout the real loop timer fires and
+        the circuit is force-removed without any ACK."""
+        import bbs.netrom.circuit as circuit_mod
+        monkeypatch.setattr(circuit_mod, "_DISC_GUARD_TIMEOUT", 0.01)
+        mgr, ax25, sessions = setup
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        circuit.writer.close()
+        assert mgr.circuit_count == 1
+        await asyncio.sleep(0.05)
+        assert circuit.state == CircuitState.CLOSED
+        assert mgr.circuit_count == 0
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+    async def test_guard_rearms_idle_reaper(self):
+        """Force-closing the last circuit leaves the crosslink circuit-less, so
+        the idle reaper arms — the very cleanup that was stuck before."""
+        ax25 = FakeAX25Writer()
+        sessions = CapturedSessions()
+        mgr = NetromCircuitManager(
+            local_call      = "W6ELA-1",
+            via_node        = "N6ZX-5",
+            ax25_writer     = ax25,
+            on_user_connect = sessions.on_user_connect,
+            link_idle_timeout = 60.0,
+        )
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        assert mgr._idle_handle is None          # busy — reaper not armed
+        circuit.writer.close()
+        circuit._reap_disconnecting()            # peer never ACK'd
+        assert mgr.circuit_count == 0
+        assert mgr._idle_handle is not None       # now circuit-less → armed
+        mgr._cancel_idle_timer()
+        sessions.release_all()
+        await asyncio.sleep(0)
+
+
+# ── Circuit introspection (web dashboard) ────────────────────────────────────
+
+class TestCircuitDescribe:
+    async def test_describe_shape(self, setup):
+        mgr, ax25, sessions = setup
+        await mgr.dispatch(decode_l3_frame(_connect_req_bytes()))
+        await asyncio.sleep(0)
+        circuit = mgr.active_circuits[0]
+        d = circuit.describe()
+        assert d["user"] == "KN6PE-7"
+        assert d["dest"] == "N6ZX-5"
+        assert d["via"] == "N6ZX-5"
+        assert d["state"] == "CONNECTED"
+        assert "/" in d["local_circuit"]
+        assert isinstance(d["window"], int)
         sessions.release_all()
         await asyncio.sleep(0)
 

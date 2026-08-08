@@ -205,6 +205,15 @@ class Transport(ABC):
         Default-implementation no-op; AGWPE overrides.
         """
 
+    def netrom_circuits_snapshot(self) -> list[dict]:
+        """Live NET/ROM L4 circuits across every crosslink this transport
+        carries, as JSON-serializable dicts, for the web node dashboard.
+
+        Default-implementation returns an empty list; AGWPE (the only transport
+        that demultiplexes NET/ROM circuits) overrides it.
+        """
+        return []
+
     def set_broadcast_state_path(self, path: str) -> None:
         """Persist the last beacon / NODES broadcast timestamps to *path* so that
         after a restart the transport respects the configured cadence instead of

@@ -243,7 +243,7 @@ class Renderer:
                               font=self._font("normal"), fill=C_ACTIVE)
                     draw.text((pad + 74, y + 2),  trn_str,
                               font=self._font("small"),  fill=C_ACTIVE)
-                    draw.text((pad + 120, y + 2), "\u25cf LIVE",
+                    draw.text((pad + 160, y + 2), "\u25cf LIVE",
                               font=self._font("small"),  fill=C_ACTIVE)
                 else:
                     ts_str = _fmt_ts(c.timestamp)
@@ -251,7 +251,7 @@ class Renderer:
                               font=self._font("normal"), fill=C_CALLSIGN)
                     draw.text((pad + 74, y + 2),  trn_str,
                               font=self._font("small"),  fill=C_DIM_TEXT)
-                    draw.text((pad + 120, y + 2), ts_str,
+                    draw.text((pad + 160, y + 2), ts_str,
                               font=self._font("small"),  fill=C_DIM_TEXT)
             else:
                 draw.text((pad, y + 3), "—",
@@ -510,4 +510,4 @@ def _abbrev_transport(tid: str) -> str:
         "tcp":         "TCP",
         "web":         "WEB",
     }
-    return mapping.get(tid, tid[:8].upper())
+    return mapping.get(tid, tid[:14].upper())

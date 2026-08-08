@@ -1403,15 +1403,48 @@ def test_set_netrom_node_alias_normalizes():
     assert t._netrom_node_alias == ""
 
 
+def test_netrom_circuits_snapshot_empty_by_default():
+    assert _make_transport().netrom_circuits_snapshot() == []
+
+
+def test_netrom_circuits_snapshot_aggregates_across_sessions():
+    """The transport flattens every crosslink's active circuits into one list,
+    skipping sessions that carry no NET/ROM manager."""
+    t = _make_transport()
+
+    class _Circ:
+        def __init__(self, user):
+            self.user = user
+        def describe(self):
+            return {"user": self.user, "state": "CONNECTED"}
+
+    class _Mgr:
+        def __init__(self, circuits):
+            self.active_circuits = circuits
+
+    class _Sess:
+        def __init__(self, mgr):
+            self.netrom_manager = mgr
+
+    t._sessions = {
+        ("p", "A"): _Sess(_Mgr([_Circ("KN6PE-7")])),
+        ("p", "B"): _Sess(None),                         # no crosslink manager
+        ("p", "C"): _Sess(_Mgr([_Circ("KF6ANX-9")])),
+    }
+    users = {c["user"] for c in t.netrom_circuits_snapshot()}
+    assert users == {"KN6PE-7", "KF6ANX-9"}
+
+
 def test_base_transport_has_all_engine_netrom_setters():
-    """The engine wires NET/ROM onto EVERY transport via t.set_netrom_*(...); each
-    such setter must exist on the base Transport so non-AGWPE transports (TCP,
-    KISS) don't AttributeError at startup.  Regression: set_netrom_node_alias was
-    added to AGWPE only, which crashed bbs2 when a TCP transport was configured."""
+    """The engine wires NET/ROM onto EVERY transport via t.(set_)netrom_*(...);
+    each such method must exist on the base Transport so non-AGWPE transports
+    (TCP, KISS) don't AttributeError at startup.  Regressions: set_netrom_node_alias
+    (a setter) and netrom_circuits_snapshot (a reader called from netrom_snapshot)
+    were each added to AGWPE only, which would crash a station with a TCP transport."""
     import re, inspect
     from bbs.core import engine as engine_mod
     src = inspect.getsource(engine_mod)
-    called = set(re.findall(r"\bt\.(set_netrom_[a-z_]+)\s*\(", src))
+    called = set(re.findall(r"\bt\.((?:set_)?netrom_[a-z_]+)\s*\(", src))
     assert called  # sanity: we actually found some
     missing = sorted(m for m in called if not hasattr(Transport, m))
-    assert not missing, f"base Transport missing engine-called setters: {missing}"
+    assert not missing, f"base Transport missing engine-called methods: {missing}"

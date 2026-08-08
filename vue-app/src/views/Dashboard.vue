@@ -24,6 +24,15 @@ const nodeSessionHeaders = [
   { title: 'Idle',         key: 'idle_s'      },
 ]
 
+const circuitHeaders = [
+  { title: 'User',    key: 'user'           },
+  { title: 'Dest',    key: 'dest'           },
+  { title: 'Via',     key: 'via'            },
+  { title: 'State',   key: 'state'          },
+  { title: 'Circuit', key: 'local_circuit'  },
+]
+const circuits = computed(() => node.value.circuits || [])
+
 const gwColor = computed(() => {
   const g = node.value.gateway
   if (!g) return undefined
@@ -217,6 +226,30 @@ onUnmounted(() => {
                 <div v-else class="text-caption text-disabled">None.</div>
               </v-col>
             </v-row>
+
+            <!-- Live L4 circuits — surfaced separately from node sessions so a
+                 circuit that outlives its session (e.g. a DISC awaiting ACK)
+                 is visible instead of only showing up in the logs. -->
+            <div class="text-caption text-medium-emphasis mt-4 mb-1">
+              Live circuits ({{ circuits.length }})
+            </div>
+            <v-data-table
+              :headers="circuitHeaders"
+              :items="circuits"
+              :items-per-page="10"
+              density="compact"
+              no-data-text="No open circuits."
+            >
+              <template #item.via="{ item }">{{ item.via || '—' }}</template>
+              <template #item.state="{ item }">
+                <v-chip
+                  label size="x-small"
+                  :color="item.state === 'CONNECTED' ? 'success'
+                          : item.state === 'DISCONNECTING' ? 'warning'
+                          : undefined"
+                >{{ item.state }}</v-chip>
+              </template>
+            </v-data-table>
           </v-card-text>
         </v-card>
       </v-col>

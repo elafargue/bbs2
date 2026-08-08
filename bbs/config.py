@@ -51,10 +51,9 @@ class BBSConfig:
         Setting it opts this station into a first-class NET/ROM node identity
         (N3): a user connecting to ``<callsign>-<node_ssid>`` lands natively at
         the node ``=>`` prompt and the BBS SSID becomes just one of the node's
-        applications.  Returns None — i.e. the node runs on the BBS SSID, which
-        is today's behavior — when the value is absent, outside the 0-15 AX.25
-        range, or equal to ``bbs.ssid`` (a single role can't be both the node
-        and the BBS)."""
+        applications.  Returns None — i.e. the node runs on the BBS SSID — when
+        the value is absent, outside the 0-15 AX.25 range, or equal to
+        ``bbs.ssid`` (a single role can't be both the node and the BBS)."""
         raw = self.netrom.get("node_ssid")
         if raw is None:
             return None
@@ -69,7 +68,7 @@ class BBSConfig:
     @property
     def netrom_node_call(self) -> Optional[str]:
         """Full node callsign ``CALL-SSID`` when a distinct node SSID is set
-        (N3); None when the node runs on the BBS callsign (today's behavior).
+        (N3); None when the node runs on the BBS callsign.
 
         This is the opt-in switch for the native node landing: the engine only
         routes inbound connects to the ``=>`` prompt when this is non-None."""

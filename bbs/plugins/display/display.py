@@ -2,7 +2,7 @@
 bbs/plugins/display/display.py — Framebuffer status display plugin.
 
 Runs a background asyncio task that renders the BBS status to a small
-framebuffer screen (default: 480×320 @ /dev/fb0).
+framebuffer screen (default: 480x320 @ /dev/fb0).
 
 Subscribes to the plugin event bus:
   heard.station         — updates the scrolling RF log
@@ -20,7 +20,7 @@ Configuration (bbs.yaml plugins.display section or web panel)
   refresh_interval   : 1.0        # seconds between renders
   idle_dim_minutes   : 5          # dim after N minutes idle (0 = never)
   idle_off_minutes   : 30         # blank after N minutes idle (0 = never)
-  dim_level          : 20         # brightness % when dimmed (1–100)
+  dim_level          : 20         # brightness % when dimmed (1-100)
   backlight_path     :            # /sys/class/backlight/.../brightness (optional)
   backlight_max      : 255        # max value written to backlight_path
   font_path          :            # path to TTF/TTC font (empty = auto-detect)
