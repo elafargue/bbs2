@@ -38,15 +38,25 @@ async function loadPluginNav() {
   if (res.ok) pluginList.value = await res.json()
 }
 
+// Enter the authenticated state: reveal the app-bar + drawer and wire up the
+// live feeds.  Called both when a fresh page load finds a valid session and
+// when Login.vue signals a successful login (App.vue does not re-mount on the
+// in-app navigation from /login → /, so without the event the chrome would
+// stay hidden until a manual page reload).
+async function enterAuthenticated() {
+  isSysop.value = true
+  drawer.value = !mobile.value
+  socket.connect()
+  socket.emit('join_admin', {})
+  await loadPluginNav()
+}
+
 onMounted(async () => {
+  window.addEventListener('plugins-updated', loadPluginNav)
+  window.addEventListener('admin-authenticated', enterAuthenticated)
   const res = await fetch('/api/admin/me')
   if (res.ok) {
-    isSysop.value = true
-    drawer.value = !mobile.value
-    socket.connect()
-    socket.emit('join_admin', {})
-    await loadPluginNav()
-    window.addEventListener('plugins-updated', loadPluginNav)
+    await enterAuthenticated()
   } else {
     router.push('/login')
   }
@@ -54,6 +64,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('plugins-updated', loadPluginNav)
+  window.removeEventListener('admin-authenticated', enterAuthenticated)
 })
 
 async function logout() {

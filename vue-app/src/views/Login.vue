@@ -1,7 +1,6 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import socket from '../socket.js'
 
 const router = useRouter()
 const password = ref('')
@@ -19,8 +18,11 @@ async function login() {
       body: JSON.stringify({ password: password.value }),
     })
     if (res.ok) {
-      socket.connect()
-      socket.emit('join_admin', {})
+      // App.vue owns the authenticated chrome (app-bar + drawer) and the
+      // socket wiring, but it doesn't re-mount on this in-app navigation, so
+      // signal it to enter the authenticated state — otherwise the hamburger
+      // and side menu stay hidden until a manual page reload.
+      window.dispatchEvent(new Event('admin-authenticated'))
       router.push('/')
     } else {
       const data = await res.json()
