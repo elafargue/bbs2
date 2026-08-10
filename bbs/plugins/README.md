@@ -62,6 +62,17 @@ class MyPlugin(BBSPlugin):
     async def shutdown(self) -> None:
         """Called on graceful BBS shutdown.  Release external resources here."""
 
+    # ── Login notice (optional) ───────────────────────────────────────────
+    async def pending_notice(self, session: "BBSSession") -> Optional[str]:
+        """
+        Return a one-line "you have something waiting" notice, printed once
+        above the first main menu after login, or None for nothing to say.
+        Keep it short and name the menu key to act on — it goes out ahead of
+        the menu on 1200 bps links.
+        """
+        n = await self._count_waiting(session.auth.callsign)
+        return f"You have {n} item(s) waiting — {self.menu_key} to read." if n else None
+
     # ── Web dashboard stats (optional) ────────────────────────────────────
     def get_stats(self) -> dict[str, Any]:
         """
@@ -274,6 +285,7 @@ The compiled assets land in `static/assets/` and are served by Flask.
 - [ ] `handle_session()` returns (does not loop forever without an exit path)
 - [ ] Config section added to `config/bbs.yaml.example` under `plugins:`
 - [ ] (optional) `get_stats()` returns extra fields for the dashboard
+- [ ] (optional) `pending_notice()` if the plugin can hold items for a user
 - [ ] (optional) REST routes in `server/routes/myplugin.py`
 - [ ] (optional) Vue config component + Plugins.vue wiring
 - [ ] (optional) Tests in `tests/test_myplugin.py`

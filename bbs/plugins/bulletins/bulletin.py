@@ -848,6 +848,130 @@ class BulletinsPlugin(BBSPlugin):
                 "timestamp": __import__("time").time(),
             })
 
+    async def pending_notice(self, session: "BBSSession") -> Optional[str]:
+        """Report unread messages addressed to this user by callsign.
+
+        Only personal mail is counted — unread public bulletins are already
+        shown as the '(N New)' count on the plugin's own menu, and would drown
+        out the signal here.
+        """
+        call = session.auth.callsign
+        if not call:
+            return None
+        db = session.db
+        user_id = session.auth.user_id
+        try:
+            if user_id:
+                sql = """SELECT COUNT(*) FROM bulletin_messages m
+                         LEFT JOIN read_receipts r
+                                ON r.message_id=m.id AND r.user_id=?
+                         WHERE m.deleted=0
+                           AND m.to_call=? COLLATE NOCASE
+                           AND m.from_call!=? COLLATE NOCASE
+                           AND r.message_id IS NULL"""
+                args: tuple = (user_id, call, call)
+            else:
+                sql = """SELECT COUNT(*) FROM bulletin_messages
+                         WHERE deleted=0
+                           AND to_call=? COLLATE NOCASE
+                           AND from_call!=? COLLATE NOCASE"""
+                args = (call, call)
+            async with db.execute(sql, args) as cur:
+                row = await cur.fetchone()
+        except Exception:
+            return None
+        count = int(row[0]) if row else 0
+        if not count:
+            return None
+        plural = "s" if count != 1 else ""
+        return f"You have {count} unread message{plural} — {self.menu_key} to read."
+
+    # ── Cross-plugin posting API ──────────────────────────────────────────────
+
+    async def post_private_message(
+        self,
+        db: aiosqlite.Connection,
+        from_call: str,
+        to_call: str,
+        subject: str,
+        body: str,
+        *,
+        area_name: Optional[str] = None,
+        authenticated: bool = False,
+    ) -> Optional[tuple[int, str]]:
+        """Post a message addressed to *to_call* on behalf of another plugin.
+
+        Used by the chat plugin when a /MSG recipient is not online — the
+        whisper becomes a private bulletin instead of evaporating.  There is no
+        terminal interaction here: callers own their own UI.
+
+        *area_name* picks the destination area; when omitted (or unknown) the
+        default area is used, falling back to the first area that exists.
+
+        Returns ``(msg_number, area_name)``, or None when the board has no
+        areas at all and nothing could be posted.
+        """
+        area = await self._resolve_area_for_post(db, area_name)
+        if area is None:
+            return None
+        area_id, resolved_name = area
+
+        db.row_factory = aiosqlite.Row
+        # Same atomic msg_number computation as _post_message()
+        cur = await db.execute(
+            """INSERT INTO bulletin_messages
+               (area_id, msg_number, subject, from_call, to_call, body, authenticated)
+               VALUES (?,
+                       (SELECT COALESCE(MAX(msg_number),0)+1
+                        FROM bulletin_messages WHERE area_id=?),
+                       ?,?,?,?,?)""",
+            (area_id, area_id, subject, from_call.upper(), to_call.upper(), body,
+             1 if authenticated else 0),
+        )
+        rowid = cur.lastrowid
+        await db.commit()
+        async with db.execute(
+            "SELECT msg_number FROM bulletin_messages WHERE rowid=?", (rowid,)
+        ) as sel:
+            row = await sel.fetchone()
+        msg_number = int(row["msg_number"]) if row else 0
+
+        if self._bus is not None:
+            await self._bus.publish("bulletin.new_message", {
+                "area":      resolved_name,
+                "from_call": from_call.upper(),
+                "to_call":   to_call.upper(),
+                "subject":   subject,
+                "msg_id":    msg_number,
+                "timestamp": time.time(),
+            })
+        return msg_number, resolved_name
+
+    async def _resolve_area_for_post(
+        self, db: aiosqlite.Connection, area_name: Optional[str]
+    ) -> Optional[tuple[int, str]]:
+        """Resolve *area_name* → (id, name), falling back to the default area
+        and then to the first area on the board.  None if there are no areas."""
+        db.row_factory = aiosqlite.Row
+        if area_name:
+            async with db.execute(
+                "SELECT id, name FROM bulletin_areas WHERE name=? COLLATE NOCASE",
+                (area_name,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                return int(row["id"]), str(row["name"])
+        area_id, resolved = await self._resolve_default_area(db)
+        if area_id:
+            return area_id, resolved
+        async with db.execute(
+            "SELECT id, name FROM bulletin_areas ORDER BY name LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            return int(row["id"]), str(row["name"])
+        return None
+
     # ── Delete message ────────────────────────────────────────────────────────
 
     async def _delete_message(

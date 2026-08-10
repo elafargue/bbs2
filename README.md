@@ -382,11 +382,36 @@ Multi-room real-time chat. Maximum message length is 160 characters (tuned for 1
 |---|---|
 | `/WHO` | List users in the current room |
 | `/MSG <call> <text>` | Send a private message |
+| `/R <text>` | Reply to whoever messaged you last |
 | `/JOIN <room>` | Switch to another room |
 | `/ROOMS` | List available rooms |
 | `/QUIT` | Exit chat |
 
-Each room maintains a scrollback buffer (default 50 lines) shown to users on join.
+Each room maintains a scrollback buffer (default 50 lines), replayed both when
+you enter chat and when you `/JOIN` another room (nothing is printed for a room
+with no traffic yet).
+In that scrollback, runs of join/leave notices between two actual messages are
+collapsed into a single `*** visited: W1ABC, W1XYZ ***` line — a busy room would
+otherwise spend most of the replay on churn. Live join/leave notices are still
+shown as they happen, and the sysop's `/HIST` still lists every line with its ID.
+
+`/MSG` is delivered live to the recipient wherever they are in chat — they do not
+have to be in the sender's room. When they are not in chat at all the message is
+kept rather than dropped:
+
+- If the bulletins plugin is enabled, it is posted there as a private message
+  addressed to the recipient, in the area set by `plugins.chat.msg_area`
+  (default: the default area). They read it with `BU`.
+- Otherwise it is held in the chat database and shown to the recipient the next
+  time they enter chat.
+
+Either way the sender is told what happened. A `/MSG` to a callsign with no user
+record on this BBS is refused rather than stored. Anything waiting for a user is
+announced on the main menu as soon as they log in, so they do not have to go
+looking for it.
+
+Rooms created with `/JOIN` persist across a restart as long as they still have
+history; a room nobody ever spoke in is forgotten.
 
 ### Last Connections (`LC`)
 

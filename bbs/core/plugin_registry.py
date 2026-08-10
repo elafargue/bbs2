@@ -87,6 +87,16 @@ class BBSPlugin(ABC):
         Must return control to the main menu when done.
         """
 
+    async def pending_notice(self, session: "BBSSession") -> Optional[str]:
+        """
+        Return a one-line "you have something waiting" notice, shown once above
+        the first main menu after login, or None when there is nothing to say.
+
+        Keep it short and name the menu key to act on — it goes out ahead of the
+        menu on 1200 bps links.
+        """
+        return None
+
     def set_event_bus(self, bus: "PluginEventBus") -> None:
         """
         Called by PluginRegistry after initialize() to inject the shared

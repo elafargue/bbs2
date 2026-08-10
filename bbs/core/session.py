@@ -213,6 +213,7 @@ class BBSSession:
                     )
                 if self.state != SessionState.DISCONNECTED:
                     self.state = SessionState.ACTIVE
+                    await self._show_pending_notices()
                     await self._main_loop()
             except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
                 pass
@@ -376,6 +377,27 @@ class BBSSession:
             await self.term.sendln()
 
     # ── Main menu loop ────────────────────────────────────────────────────────
+
+    async def _show_pending_notices(self) -> None:
+        """Print each plugin's "waiting for you" line, once, above the menu.
+
+        Without this a user has to go looking: a private message only shows up
+        after entering the plugin that holds it.
+        """
+        if not self.auth.callsign:
+            return
+        for plugin in self.plugin_registry:
+            if not plugin.enabled:
+                continue
+            try:
+                notice = await plugin.pending_notice(self)
+            except Exception:
+                logger.exception(
+                    "Plugin %s failed to report pending items", plugin.name
+                )
+                continue
+            if notice:
+                await self.term.sendln(self.term.style(notice, "warning", bold=True))
 
     async def _main_loop(self) -> None:
         idle_timeout = self.cfg.idle_timeout or None

@@ -144,6 +144,11 @@ plugins:
     # Default rooms created on first run
     default_rooms:
       - { name: "main", description: "Main chat room" }
+    # Where a /MSG goes when the recipient is not in chat: it is posted to
+    # this bulletin area, addressed to them.  Empty = the default area.
+    # If the bulletins plugin is disabled the whisper is instead held in chat
+    # and shown to the recipient the next time they enter.
+    msg_area: ""
 
   lastconn:
     enabled: true
